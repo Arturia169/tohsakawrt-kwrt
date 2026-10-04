@@ -13,9 +13,9 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Build target'
+        description: 'Build target (device dir name, e.g. mediatek_filogic)'
         required: true
-        default: 'mediatek/filogic'
+        default: 'mediatek_filogic'
 
 permissions:
   contents: write
