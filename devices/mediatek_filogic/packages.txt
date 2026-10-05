@@ -405,3 +405,4 @@ xz-utils
 zlib
 zram-swap
 luci-app-sms-tool-js
+luci-app-sms-manager

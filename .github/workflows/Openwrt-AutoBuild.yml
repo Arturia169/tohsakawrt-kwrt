@@ -66,6 +66,18 @@ jobs:
           echo "=== overlay 内容 ==="
           find /tmp/ov -type f | sort
 
+      - name: Add local packages
+        run: |
+          set -euo pipefail
+          local_packages_dir="$GITHUB_WORKSPACE/devices/${{ inputs.target }}/local-packages"
+          if [ -d "$local_packages_dir" ]; then
+            shopt -s nullglob
+            ipks=("$local_packages_dir"/*.ipk)
+            if ((${#ipks[@]})); then
+              cp -f "${ipks[@]}" "$IB_NAME/packages/"
+            fi
+          fi
+
       - name: Build image
         run: |
           cd "$IB_NAME"
