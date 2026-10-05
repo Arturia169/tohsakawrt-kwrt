@@ -1,0 +1,1296 @@
+#!/bin/sh
+
+CONFIG="tohsakawrt-tgbot.main"
+
+TOKEN="$(uci -q get ${CONFIG}.token)"
+CHAT_ID="$(uci -q get ${CONFIG}.chat_id)"
+ENABLED="$(uci -q get ${CONFIG}.enabled)"
+
+[ "$ENABLED" = "1" ] || exit 0
+[ -n "$TOKEN" ] || exit 1
+[ -n "$CHAT_ID" ] || exit 1
+
+. /lib/functions/network.sh 2>/dev/null
+
+API="https://api.telegram.org/bot${TOKEN}"
+STATE_DIR="/tmp/tohsakawrt-tgbot"
+OFFSET_FILE="${STATE_DIR}/offset"
+ALIAS_FILE="/etc/tohsakawrt-aliases"
+
+mkdir -p "$STATE_DIR"
+touch "$ALIAS_FILE" 2>/dev/null
+
+DEFAULT_KEYBOARD='{"keyboard":[[{"text":"📊 系统状态"},{"text":"🧭 节点分流"}],[{"text":"👥 在线设备"},{"text":"🌐 外网详情"}],[{"text":"🔀 分流模式"},{"text":"🎯 直连白名单"}],[{"text":"🌡️ 实时温度"},{"text":"🩺 双向体检"}]],"resize_keyboard":true}'
+
+log() {
+    logger -t Tohsaka-Bot "$*"
+}
+
+html_escape() {
+    sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
+send_msg() {
+    local text="$1"
+    local reply_kb="${2:-$DEFAULT_KEYBOARD}"
+    local inline_kb="$3"
+
+    local markup="$reply_kb"
+    [ -n "$inline_kb" ] && markup="$inline_kb"
+
+    curl -m 15 --connect-timeout 8 -fsS \
+        -X POST \
+        "${API}/sendMessage" \
+        -d "chat_id=${CHAT_ID}" \
+        -d "parse_mode=HTML" \
+        -d "disable_web_page_preview=true" \
+        -d "reply_markup=${markup}" \
+        --data-urlencode "text=${text}" \
+        >/dev/null 2>&1
+}
+
+temp_value() {
+    if [ -r /sys/class/thermal/thermal_zone0/temp ]; then
+        awk '{printf "%.1f°C", $1/1000}' /sys/class/thermal/thermal_zone0/temp
+    else
+        echo "未知"
+    fi
+}
+
+mem_available() {
+    awk '/MemAvailable:/ {printf "%.0f MB", $2/1024}' /proc/meminfo
+}
+
+wan_dev() {
+    local dev
+    network_get_device dev wan 2>/dev/null
+    echo "${dev:-eth0}"
+}
+
+wan_gateway() {
+    local gw
+    network_get_gateway gw wan 2>/dev/null
+    echo "${gw:-无}"
+}
+
+wan_ip() {
+    local ip
+    network_get_ipaddr ip wan 2>/dev/null
+    echo "${ip:-无}"
+}
+
+wan_ip6() {
+    local ip6
+    network_get_ipaddr6 ip6 wan_6 2>/dev/null || network_get_ipaddr6 ip6 wan6 2>/dev/null
+    echo "${ip6:-无}"
+}
+
+format_speed() {
+    local b="${1:-0}"
+    if [ "$b" -ge 1048576 ]; then
+        awk -v b="$b" 'BEGIN {printf "%.2f MB/s", b/1048576}'
+    elif [ "$b" -ge 1024 ]; then
+        awk -v b="$b" 'BEGIN {printf "%.1f KB/s", b/1024}'
+    else
+        echo "${b} B/s"
+    fi
+}
+
+wan_speed() {
+    local dev="${1:-eth0}"
+    local r1 t1 r2 t2
+    r1=$(awk -v d="${dev}:" '$1==d {print $2}' /proc/net/dev 2>/dev/null)
+    t1=$(awk -v d="${dev}:" '$1==d {print $10}' /proc/net/dev 2>/dev/null)
+    sleep 1
+    r2=$(awk -v d="${dev}:" '$1==d {print $2}' /proc/net/dev 2>/dev/null)
+    t2=$(awk -v d="${dev}:" '$1==d {print $10}' /proc/net/dev 2>/dev/null)
+
+    local rx=$((r2 - r1))
+    local tx=$((t2 - t1))
+
+    echo "⬇️ $(format_speed $rx) | ⬆️ $(format_speed $tx)"
+}
+
+public_ip_info() {
+    local ipip
+    ipip="$(curl -s -m 2 http://myip.ipip.net 2>/dev/null)"
+    if [ -n "$ipip" ]; then
+        local ip="$(echo "$ipip" | awk '{print $2}' | sed 's/当前//; s/IP：//')"
+        local loc="$(echo "$ipip" | sed -n 's/.*来自于：//p')"
+        echo "${ip:-未知} (${loc:-未知})"
+    else
+        echo "未获取到"
+    fi
+}
+
+proxy_outbound_ip() {
+    local res
+    res="$(curl -s -m 2 http://ip-api.com/json/?lang=zh-CN 2>/dev/null)"
+    if [ -n "$res" ]; then
+        echo "$res" | lua -e '
+        local j = require "luci.jsonc"
+        local d = j.parse(io.read("*a"))
+        if d and d.query then
+            print(string.format("%s (%s %s)", d.query, d.country or "", d.city or ""))
+        else
+            print("未知")
+        end
+        ' 2>/dev/null
+    else
+        echo "未获取到"
+    fi
+}
+
+internet_status() {
+    if ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 || ping -c 1 -W 2 119.29.29.29 >/dev/null 2>&1; then
+        if nslookup baidu.com 127.0.0.1 >/dev/null 2>&1; then
+            echo "正常"
+        else
+            echo "DNS 异常"
+        fi
+    else
+        echo "断开"
+    fi
+}
+
+clash_status() {
+    if pidof mihomo >/dev/null 2>&1 || pidof clash >/dev/null 2>&1; then
+        local v
+        v="$(curl -sS -m 2 http://127.0.0.1:9090/version 2>/dev/null)"
+        if echo "$v" | grep -q 'version'; then
+            echo "🟢 正常运行 (Mihomo)"
+        else
+            echo "🟡 进程存活 (API 未响应)"
+        fi
+    else
+        echo "🔴 未运行"
+    fi
+}
+
+status_badge() {
+    local val="$1"
+    case "$val" in
+        "正常") echo "🟢 正常" ;;
+        "DNS 异常") echo "🟡 DNS 异常 (IP 可达)" ;;
+        "断开") echo "🔴 外网断开" ;;
+        "未知"|"无") echo "⚪ ${val}" ;;
+        *) echo "🔴 ${val}" ;;
+    esac
+}
+
+cmd_status() {
+    local temp="$(temp_value)"
+    local mem="$(mem_available)"
+    local load="$(cut -d' ' -f1-3 /proc/loadavg)"
+    local dev="$(wan_dev)"
+    local ip="$(wan_ip)"
+    local ip6="$(wan_ip6)"
+    local pub_ip="$(public_ip_info)"
+    local net="$(internet_status)"
+    local clash="$(clash_status)"
+    local uptime="$(uptime | sed 's/.*up //' | sed 's/, *load.*//')"
+    local root="$(df -h /overlay 2>/dev/null | awk 'NR==2 {print $5}')"
+    local speed="$(wan_speed "$dev")"
+    local now="$(date '+%Y-%m-%d %H:%M:%S')"
+    local net_text="$(status_badge "$net")"
+
+    send_msg "📊 <b>TohsakaWrt 系统状态</b>
+
+━━━━━━━━━━━━━━
+📟 <b>设备</b>：Cudy TR3000
+⏱️ <b>运行</b>：${uptime}
+🌡️ <b>温度</b>：${temp}
+🧠 <b>可用内存</b>：${mem}
+📈 <b>系统负载</b>：${load}
+💾 <b>Overlay</b>：${root:-未知}
+━━━━━━━━━━━━━━
+🚀 <b>实时网速</b>：${speed}
+🌐 <b>宽带外网</b>：<code>${pub_ip}</code>
+📡 <b>WAN 接口</b>：<code>${dev} (${ip})</code>
+🏠 <b>IPv6 地址</b>：<code>${ip6}</code>
+🚦 <b>网络连通</b>：${net_text}
+🧩 <b>OpenClash</b>：${clash}
+━━━━━━━━━━━━━━
+🕰️ <i>${now}</i>"
+}
+
+cmd_clients() {
+    local leases="/tmp/dhcp.leases"
+    local total=0
+    local list=""
+
+    if [ -f "$leases" ] && [ -s "$leases" ]; then
+        total=$(wc -l < "$leases" | tr -d ' ')
+        list=$(awk -v alias_file="$ALIAS_FILE" '
+        BEGIN {
+            while ((getline line < alias_file) > 0) {
+                split(line, arr, " ")
+                if (arr[1] != "") {
+                    m = tolower(arr[1])
+                    val = ""
+                    for (i=2; i<=length(arr); i++) val = val (i==2?"":" ") arr[i]
+                    aliases[m] = val
+                }
+            }
+            close(alias_file)
+        }
+        {
+            mac = tolower($2)
+            orig_name = ($4 == "*" || $4 == "") ? "未知设备" : $4
+            display_name = (mac in aliases) ? (aliases[mac] " (" orig_name ")") : orig_name
+            gsub(/&/, "\\&amp;", display_name)
+            gsub(/</, "\\&lt;", display_name)
+            gsub(/>/, "\\&gt;", display_name)
+            printf "• <b>%s</b>\n  ├ IP: <code>%s</code>\n  └ MAC: <code>%s</code>\n", display_name, $3, toupper($2)
+        }' "$leases")
+    else
+        list="暂无在线客户端数据"
+    fi
+
+    local now="$(date '+%Y-%m-%d %H:%M:%S')"
+    send_msg "👥 <b>在线客户端 (${total} 台)</b>
+
+━━━━━━━━━━━━━━
+${list}
+━━━━━━━━━━━━━━
+💡 <i>提示：发送 /alias 查看或为未知设备添加中文备注。</i>
+
+🕰️ <i>${now}</i>"
+}
+
+cmd_alias() {
+    local raw_arg="$1"
+    local sub_cmd="${raw_arg%% *}"
+    local rest="${raw_arg#* }"
+    [ "$rest" = "$raw_arg" ] && rest=""
+
+    touch "$ALIAS_FILE" 2>/dev/null
+
+    if [ -z "$raw_arg" ]; then
+        local list=""
+        if [ -s "$ALIAS_FILE" ]; then
+            list="$(awk '{
+                mac = toupper($1)
+                val = ""
+                for (i=2; i<=NF; i++) val = val (i==2?"":" ") $i
+                printf "• <code>%s</code> : <b>%s</b>\n", mac, val
+            }' "$ALIAS_FILE")"
+        else
+            list="暂无设备备注记录"
+        fi
+        send_msg "🏷️ <b>设备备注管理</b>
+
+━━━━━━━━━━━━━━
+${list}
+━━━━━━━━━━━━━━
+<b>使用说明：</b>
+• <b>添加/修改备注</b>：<code>/alias MAC地址 设备名字</code>
+  <i>例如：/alias 26:e2:0d:d6:08:d2 苹果手表S8</i>
+• <b>删除备注</b>：<code>/alias del MAC地址</code>"
+        return
+    fi
+
+    if [ "$sub_cmd" = "del" ] || [ "$sub_cmd" = "rm" ]; then
+        local target_mac="$(echo "$rest" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+        if [ -n "$target_mac" ]; then
+            grep -v "^${target_mac} " "$ALIAS_FILE" > "${ALIAS_FILE}.tmp" 2>/dev/null && mv "${ALIAS_FILE}.tmp" "$ALIAS_FILE"
+            send_msg "🗑️ 已删除 MAC <code>${target_mac}</code> 的设备备注。"
+        else
+            send_msg "⚠️ 请提供要删除的 MAC 地址，例如：<code>/alias del 26:e2:0d:d6:08:d2</code>"
+        fi
+        return
+    fi
+
+    local set_mac="$(echo "$sub_cmd" | tr '[:upper:]' '[:lower:]')"
+    local set_name="$rest"
+
+    if [ -z "$set_name" ]; then
+        send_msg "⚠️ 缺少设备名字。\n格式：<code>/alias MAC地址 设备名字</code>\n例如：<code>/alias 26:e2:0d:d6:08:d2 客厅电视</code>"
+        return
+    fi
+
+    grep -v "^${set_mac} " "$ALIAS_FILE" > "${ALIAS_FILE}.tmp" 2>/dev/null && mv "${ALIAS_FILE}.tmp" "$ALIAS_FILE"
+    echo "${set_mac} ${set_name}" >> "$ALIAS_FILE"
+    send_msg "✅ <b>设备备注已保存</b>
+
+━━━━━━━━━━━━━━
+🔑 <b>MAC</b>：<code>$(echo "$set_mac" | tr '[:lower:]' '[:upper:]')</code>
+🏷️ <b>备注</b>：<b>${set_name}</b>
+━━━━━━━━━━━━━━
+下次查询在线设备或新设备提醒时将直接展示该备注！"
+}
+
+cmd_temp() {
+    local temp="$(temp_value)"
+    local warn="$(sed -n 's/^WARN_TEMP=\([0-9]*\).*/\1/p' /usr/bin/tohsakawrt-temp-watch 2>/dev/null | head -n1)"
+    local crit="$(sed -n 's/^CRITICAL_TEMP=\([0-9]*\).*/\1/p' /usr/bin/tohsakawrt-temp-watch 2>/dev/null | head -n1)"
+    warn="${warn:-80}"
+    crit="${crit:-90}"
+    local now="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    send_msg "🌡️ <b>TohsakaWrt CPU 温度监控</b>
+
+━━━━━━━━━━━━━━
+🔥 <b>当前温度</b>：<code>${temp}</code>
+⚠️ <b>预警阈值</b>：<code>${warn}°C</code>
+🚨 <b>严重阈值</b>：<code>${crit}°C</code>
+━━━━━━━━━━━━━━
+🛡️ <b>温度守护</b>：正常运行 (Bark/系统日志)
+
+🕰️ <i>${now}</i>"
+}
+
+cmd_wan() {
+    local dev="$(wan_dev)"
+    local gw="$(wan_gateway)"
+    local ip="$(wan_ip)"
+    local ip6="$(wan_ip6)"
+    local pub_ip="$(public_ip_info)"
+    local proxy_ip="$(proxy_outbound_ip)"
+    local net="$(internet_status)"
+    local net_text="$(status_badge "$net")"
+    local routes="$(ip route show default 2>/dev/null | html_escape)"
+    local now="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    send_msg "🌐 <b>TohsakaWrt WAN 网络详情</b>
+
+━━━━━━━━━━━━━━
+🚦 <b>网络连通</b>：${net_text}
+📡 <b>物理接口</b>：<code>${dev}</code>
+🚪 <b>默认网关</b>：<code>${gw}</code>
+━━━━━━━━━━━━━━
+🏠 <b>内网 IPv4</b>：<code>${ip}</code>
+🌐 <b>宽带外网</b>：<code>${pub_ip}</code>
+✈️ <b>代理出口</b>：<code>${proxy_ip}</code>
+🏠 <b>IPv6 地址</b>：<code>${ip6}</code>
+━━━━━━━━━━━━━━
+
+<b>默认路由：</b>
+<pre><code>${routes:-无}</code></pre>
+
+🕰️ <i>${now}</i>"
+}
+
+cmd_clash() {
+    local status pid
+    if pidof mihomo >/dev/null 2>&1; then
+        status="✅ 正常运行 (Mihomo)"
+        pid="$(pidof mihomo)"
+    elif pidof clash >/dev/null 2>&1; then
+        status="✅ 正常运行 (Clash)"
+        pid="$(pidof clash)"
+    else
+        status="❌ 未运行"
+        pid="无"
+    fi
+
+    local enabled="$(uci -q get openclash.@openclash[0].enable)"
+    [ "$enabled" = "1" ] && enabled="已启用" || enabled="未启用"
+
+    local version=""
+    if [ -x /etc/openclash/clash ]; then
+        version="$(/etc/openclash/clash -v 2>/dev/null | head -n1 | html_escape)"
+    fi
+    [ -n "$version" ] || version="未知"
+
+    local ports="$(netstat -tln 2>/dev/null |
+        grep -E ':(7874|7890|7892|7895|9090)[[:space:]]' |
+        awk '{print $4}' |
+        sed 's/.*://' |
+        sort -n |
+        uniq |
+        tr '\n' ' ')"
+    [ -n "$ports" ] || ports="未检测到"
+
+    local now="$(date '+%Y-%m-%d %H:%M:%S')"
+    local inline_kb='{"inline_keyboard":[[{"text":"🔄 重启 OpenClash","callback_data":"restart_clash"},{"text":"⚡ 测速节点","callback_data":"test_nodes"}]]}'
+
+    send_msg "🧩 <b>OpenClash 状态</b>
+
+━━━━━━━━━━━━━━
+⚙️ <b>插件配置</b>：${enabled}
+🏃 <b>核心状态</b>：${status}
+🆔 <b>核心 PID</b>：<code>${pid}</code>
+🔌 <b>监听端口</b>：<code>${ports}</code>
+━━━━━━━━━━━━━━
+<b>核心版本：</b>
+<pre><code>${version}</code></pre>
+
+🕰️ <i>${now}</i>" "$DEFAULT_KEYBOARD" "$inline_kb"
+}
+
+cmd_nodes() {
+    local arg="$1"
+
+    if [ "$arg" = "test" ] || [ "$arg" = "测速" ]; then
+        send_msg "⚡ <b>正在测速分流节点...</b>\n\n请稍候约 2 秒..."
+        curl -s -m 5 "http://127.0.0.1:9090/group/%E2%99%BB%EF%B8%8F%20%E9%A6%99%E6%B8%AF%E8%87%AA%E5%8A%A8/delay?url=http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=2500" >/dev/null 2>&1
+        curl -s -m 5 "http://127.0.0.1:9090/group/%E2%99%BB%EF%B8%8F%20%E7%BE%8E%E5%9B%BD%E8%87%AA%E5%8A%A8/delay?url=http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=2500" >/dev/null 2>&1
+    fi
+
+    local mode="$(curl -s http://127.0.0.1:9090/configs | lua -e 'local j=require "luci.jsonc"; local d=j.parse(io.read("*a")); print(d and d.mode or "未知")')"
+    local output="$(lua -e '
+local json = require "luci.jsonc"
+local f = io.popen("curl -s http://127.0.0.1:9090/proxies")
+local content = f:read("*a")
+f:close()
+local data = json.parse(content)
+if not data or not data.proxies then
+    print("⚠️ 无法获取 OpenClash 代理数据")
+    os.exit(0)
+end
+
+local function escape_html(str)
+    if not str then return "" end
+    return (tostring(str):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local function resolve_node(name, depth)
+    depth = depth or 0
+    if depth > 5 then return name, "" end
+    local p = data.proxies[name]
+    if not p then return name, "" end
+    if (p.type == "Selector" or p.type == "URLTest" or p.type == "Fallback") and p.now and p.now ~= name then
+        return resolve_node(p.now, depth + 1)
+    end
+    local delay_str = ""
+    if p.history and #p.history > 0 then
+        local d = p.history[#p.history].delay
+        if d and d > 0 then delay_str = d .. "ms" end
+    end
+    return name, delay_str
+end
+
+local groups = {"🚀 默认代理", "💎 自建专线", "🍀 Google", "🤖 ChatGPT", "📲 Telegram", "📹 YouTube", "👨🏿‍💻 GitHub"}
+for _, g in ipairs(groups) do
+    local p = data.proxies[g]
+    if p then
+        local real_name, delay = resolve_node(p.now)
+        local d_info = (delay ~= "") and (" (<code>" .. delay .. "</code>)") or ""
+        local safe_g = escape_html(g)
+        local safe_now = escape_html(p.now or "无")
+        local safe_real = escape_html(real_name)
+        print(string.format("• <b>%s</b>\n  ├ 当前策略: <code>%s</code>\n  └ 落地节点: <code>%s</code>%s", safe_g, safe_now, safe_real, d_info))
+    end
+end
+')"
+
+    local now="$(date '+%Y-%m-%d %H:%M:%S')"
+    local inline_kb='{"inline_keyboard":[[{"text":"⚡ 测速并刷新","callback_data":"test_nodes"},{"text":"🔄 重启核心","callback_data":"restart_clash"}]]}'
+
+    send_msg "🧩 <b>OpenClash 分流策略与节点</b>
+
+━━━━━━━━━━━━━━
+🔀 <b>当前分流模式</b>：<code>${mode}</code>
+━━━━━━━━━━━━━━
+${output}
+━━━━━━━━━━━━━━
+💡 <i>提示：点击下方按钮直接测速或重启。</i>
+
+🕰️ <i>${now}</i>" "$DEFAULT_KEYBOARD" "$inline_kb"
+}
+
+cmd_mode() {
+    local target="$1"
+    local cur="$(curl -s http://127.0.0.1:9090/configs | lua -e 'local j=require "luci.jsonc"; local d=j.parse(io.read("*a")); print(d and d.mode or "未知")')"
+    local inline_kb='{"inline_keyboard":[[{"text":"📐 规则分流","callback_data":"set_mode:rule"},{"text":"🌐 全局代理","callback_data":"set_mode:global"},{"text":"⚡ 全局直连","callback_data":"set_mode:direct"}]]}'
+
+    if [ -z "$target" ]; then
+        local mode_desc=""
+        case "$cur" in
+            rule) mode_desc="规则分流 (国内直连 国外代理)" ;;
+            global) mode_desc="全局代理 (全部流量走代理节点)" ;;
+            direct) mode_desc="全局直连 (全部流量绕过代理)" ;;
+            *) mode_desc="$cur" ;;
+        esac
+
+        send_msg "🔀 <b>OpenClash 分流模式管理</b>
+
+━━━━━━━━━━━━━━
+当前模式：<code>${mode_desc}</code>
+━━━━━━━━━━━━━━
+👇 <b>点击下方按钮一键切换：</b>" "$DEFAULT_KEYBOARD" "$inline_kb"
+        return
+    fi
+
+    case "$target" in
+        rule|Rule|规则) target="rule" ;;
+        global|Global|全局) target="global" ;;
+        direct|Direct|直连) target="direct" ;;
+        *) send_msg "⚠️ 无效模式，仅支持 <code>rule</code> / <code>global</code> / <code>direct</code>"; return ;;
+    esac
+
+    curl -s -X PATCH -H "Content-Type: application/json" -d "{\"mode\":\"${target}\"}" http://127.0.0.1:9090/configs >/dev/null 2>&1
+    send_msg "✅ <b>OpenClash 模式切换成功</b>\n\n当前模式已变更为：<code>${target}</code>"
+}
+
+cmd_clash_restart() {
+    send_msg "🔄 <b>正在平滑重启核心...</b>\n\n预计耗时 3~5 秒，重启后核心会自动重新接管流量。"
+    if [ -x /etc/init.d/openclash ]; then
+        (/etc/init.d/openclash restart >/dev/null 2>&1) &
+    fi
+}
+
+cmd_direct() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        send_msg "🎯 <b>添加 OpenClash 直连白名单</b>
+
+━━━━━━━━━━━━━━
+<b>用法：</b>
+<code>/direct &lt;域名或IP&gt;</code>
+
+<b>示例：</b>
+• 域名：<code>/direct mysite.com</code>
+• 网址：<code>/direct https://api.mysite.com:8443/test</code>
+• IP地址：<code>/direct 123.45.67.89</code>
+• 网段：<code>/direct 10.0.0.0/8</code>
+
+💡 <i>添加后规则自动写入顶部并毫秒级热重载，无需重启核心！</i>"
+        return
+    fi
+
+    local res
+    res="$(/usr/bin/tohsaka-direct add "$target" 2>/dev/null)"
+
+    case "$res" in
+        ADDED:*)
+            local cleaned="${res#ADDED:}"
+            send_msg "✅ <b>已成功加入直连白名单</b>
+
+━━━━━━━━━━━━━━
+🎯 <b>目标条目</b>：<code>${cleaned}</code>
+⚡ <b>生效状态</b>：规则已毫秒级热重载 (Direct)
+━━━━━━━━━━━━━━
+💡 <i>如需移除，可发送：<code>/undirect ${cleaned}</code></i>"
+            ;;
+        EXISTS:*)
+            local cleaned="${res#EXISTS:}"
+            send_msg "ℹ️ <b>条目已在直连白名单中</b>
+
+目标 <code>${cleaned}</code> 此前已添加，当前正处于直连状态。"
+            ;;
+        *)
+            send_msg "⚠️ <b>添加失败</b>：输入的目标无效或解析为空。"
+            ;;
+    esac
+}
+
+cmd_undirect() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        send_msg "🗑️ <b>移除直连白名单</b>
+
+━━━━━━━━━━━━━━
+<b>用法：</b>
+<code>/undirect &lt;序号 或 域名/IP&gt;</code>
+
+<b>示例：</b>
+• 按序号移除：<code>/undirect 1</code>
+• 按域名移除：<code>/undirect mysite.com</code>
+
+💡 <i>可点击下方【🎯 直连白名单】或发送 /direct_list 查看当前序号。</i>"
+        return
+    fi
+
+    local res
+    res="$(/usr/bin/tohsaka-direct del "$target" 2>/dev/null)"
+
+    case "$res" in
+        DELETED:*)
+            local cleaned="${res#DELETED:}"
+            send_msg "🗑️ <b>已从直连白名单中移除</b>
+
+━━━━━━━━━━━━━━
+🎯 <b>目标条目</b>：<code>${cleaned}</code>
+⚡ <b>生效状态</b>：规则已热重载生效
+━━━━━━━━━━━━━━"
+            ;;
+        ERROR:out_of_range)
+            send_msg "⚠️ <b>移除失败</b>：序号超出范围，请发送 /direct_list 查看当前有效序号。"
+            ;;
+        ERROR:not_found)
+            send_msg "⚠️ <b>移除失败</b>：在直连白名单中未找到 <code>${target}</code>。"
+            ;;
+        *)
+            send_msg "⚠️ <b>移除失败</b>：参数错误。"
+            ;;
+    esac
+}
+
+cmd_direct_list() {
+    local raw_list
+    raw_list="$(/usr/bin/tohsaka-direct list 2>/dev/null)"
+
+    local inline_kb='{"inline_keyboard":[[{"text":"🔄 刷新列表","callback_data":"refresh_direct"}]]}'
+
+    if [ "$raw_list" = "EMPTY" ] || [ -z "$raw_list" ]; then
+        send_msg "🎯 <b>OpenClash 直连白名单</b>
+
+━━━━━━━━━━━━━━
+当前没有任何自定义直连条目。
+━━━━━━━━━━━━━━
+
+💡 <b>如何添加？</b>
+发送：<code>/direct 域名或IP</code>
+<i>例如：<code>/direct mysite.com</code> 或 <code>/direct 123.45.67.89</code></i>" "$DEFAULT_KEYBOARD" "$inline_kb"
+        return
+    fi
+
+    local formatted
+    formatted="$(echo "$raw_list" | awk -F'|' '
+    {
+        idx = $1
+        item = $2
+        icon = "🌐"
+        if (item ~ /^[0-9\.\/]+$/ || item ~ /:/) {
+            icon = "🖥️"
+        }
+        printf "%s <b>%d.</b> <code>%s</code>\n", icon, idx, item
+    }')"
+
+    local total="$(echo "$raw_list" | grep -c '|' 2>/dev/null || echo 0)"
+    local now="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    send_msg "🎯 <b>OpenClash 自定义直连白名单</b>
+
+━━━━━━━━━━━━━━
+${formatted}
+━━━━━━━━━━━━━━
+📊 <b>共计</b>：<code>${total}</code> 个自定义直连规则
+
+💡 <b>快捷操作提示：</b>
+• 添加：发送 <code>/direct 域名或IP</code>
+• 移除：发送 <code>/undirect 序号</code> (如 <code>/undirect 1</code>)
+
+🕰️ <i>${now}</i>" "$DEFAULT_KEYBOARD" "$inline_kb"
+}
+
+
+cmd_storage() {
+    local storage="$(df -h 2>/dev/null | grep -E '(/overlay$| /$| /tmp$|/mnt/)' | html_escape)"
+    local block="$(block info 2>/dev/null | html_escape)"
+    local now="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    send_msg "💾 <b>TohsakaWrt 存储状态</b>
+
+<pre><code>${storage:-未获取到存储空间}</code></pre>
+
+<b>块设备：</b>
+<pre><code>${block:-未获取到块设备}</code></pre>
+
+🕰️ <i>${now}</i>"
+}
+
+cmd_usb() {
+    local usb="$(lsusb -t 2>/dev/null | html_escape)"
+    [ -n "$usb" ] || usb="未检测到 USB 设备拓扑"
+    local now="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    send_msg "🔌 <b>TohsakaWrt USB 拓扑</b>
+
+<pre><code>${usb}</code></pre>
+
+🕰️ <i>${now}</i>"
+}
+
+ping_metric() {
+    local target="$1"
+    local count="${2:-2}"
+    local res
+    res="$(ping -c "$count" -W 1 "$target" 2>&1)"
+    if echo "$res" | grep -q 'round-trip'; then
+        local avg="$(echo "$res" | awk -F'/' '/round-trip/ {print $5}' | awk '{printf "%.1f ms", $1}')"
+        local loss="$(echo "$res" | awk -F',' '/packet loss/ {for(i=1;i<=NF;i++) if($i~/packet loss/) print $i}' | tr -d ' ' | sed 's/packetloss/丢包/')"
+        local icon="🟢"
+        local val="$(echo "$avg" | awk '{print int($1)}')"
+        if [ "$val" -ge 150 ]; then icon="🟠"
+        elif [ "$val" -ge 80 ]; then icon="🟡"
+        fi
+        echo "${icon} <code>${avg}</code> (${loss})"
+    else
+        echo "🔴 <code>超时不可达</code> (100% 丢包)"
+    fi
+}
+
+http_metric() {
+    local url="$1"
+    local sec
+    sec="$(curl -s -w '%{time_total}' -o /dev/null -m 3 "$url" 2>/dev/null)"
+    if [ $? -eq 0 ] && [ -n "$sec" ]; then
+        local ms="$(awk -v s="$sec" 'BEGIN {printf "%.0f ms", s * 1000}')"
+        local val="$(awk -v s="$sec" 'BEGIN {print int(s * 1000)}')"
+        local icon="🟢"
+        if [ "$val" -ge 1000 ]; then icon="🟠"
+        elif [ "$val" -ge 500 ]; then icon="🟡"
+        fi
+        echo "${icon} <code>${ms}</code>"
+    else
+        echo "🔴 <code>请求超时</code>"
+    fi
+}
+
+proxy_node_metric() {
+    local res
+    res="$(curl -s -m 2 'http://127.0.0.1:9090/proxies/%F0%9F%9A%80%20%E9%BB%98%E8%AE%A4%E4%BB%A3%E7%90%86/delay?url=http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=2500' 2>/dev/null)"
+    local delay="$(echo "$res" | lua -e 'local j=require "luci.jsonc"; local d=j.parse(io.read("*a")); print(d and d.delay or "")' 2>/dev/null)"
+
+    local node_name
+    node_name="$(curl -s -m 2 http://127.0.0.1:9090/proxies | lua -e '
+    local j=require "luci.jsonc"; local d=j.parse(io.read("*a"))
+    if not d or not d.proxies then return end
+    local function get_real(name, depth)
+        depth = depth or 0
+        if depth > 5 then return name end
+        local p = d.proxies[name]
+        if not p then return name end
+        if (p.type == "Selector" or p.type == "URLTest" or p.type == "Fallback") and p.now and p.now ~= name then
+            return get_real(p.now, depth + 1)
+        end
+        return name
+    end
+    local real = get_real("🚀 默认代理")
+    real = real:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+    print(real)
+    ' 2>/dev/null)"
+    [ -n "$node_name" ] || node_name="默认节点"
+
+    if [ -n "$delay" ] && [ "$delay" -gt 0 ]; then
+        local icon="🟢"
+        if [ "$delay" -ge 300 ]; then icon="🟠"
+        elif [ "$delay" -ge 200 ]; then icon="🟡"
+        fi
+        echo "${icon} <code>${delay} ms</code> (${node_name})"
+    else
+        echo "⚪ <code>未测到</code> (${node_name})"
+    fi
+}
+
+cmd_ping() {
+    local gw="$(wan_gateway)"
+    [ -n "$gw" ] && [ "$gw" != "无" ] || gw="192.168.1.1"
+
+    local p_gw="$(ping_metric "$gw")"
+    local p_ali="$(ping_metric 223.5.5.5)"
+    local p_cf="$(ping_metric 1.1.1.1)"
+    local h_direct="$(http_metric "http://connectivitycheck.platform.hicloud.com/generate_204")"
+    local p_node="$(proxy_node_metric)"
+    local h_proxy="$(http_metric "http://cp.cloudflare.com/generate_204")"
+
+    local now="$(date '+%Y-%m-%d %H:%M:%S')"
+    local inline_kb='{"inline_keyboard":[[{"text":"🔄 重新体检","callback_data":"re_ping"},{"text":"⚡ 节点测速","callback_data":"test_nodes"}]]}'
+
+    send_msg "🩺 <b>TohsakaWrt 双向网络体检</b>
+
+━━━━━━━━━━━━━━
+<b>一、基础链路 (ICMP 延时与丢包)</b>
+🏠 <b>局域网关</b> (<code>${gw}</code>)：${p_gw}
+🇨🇳 <b>国内骨干</b> (阿里 DNS)：${p_ali}
+🌐 <b>境外直连</b> (CF 1.1.1.1)：${p_cf}
+
+<b>二、业务连通 (真实响应)</b>
+🇨🇳 <b>国内直连</b> (华为 204)：${h_direct}
+🚀 <b>代理节点</b> (核心直测)：${p_node}
+✈️ <b>跨境连通</b> (端到端往返)：${h_proxy}
+━━━━━━━━━━━━━━
+💡 <i>评级：🟢 优良 (&lt;80ms/节点&lt;200ms)  🟡 适中  🟠 偏慢  🔴 丢包</i>
+
+🕰️ <i>${now}</i>" "$DEFAULT_KEYBOARD" "$inline_kb"
+}
+
+cmd_modem() {
+    local modem usb0 ports
+    if [ -e /dev/ttyUSB2 ]; then
+        modem="✅ 已连接"
+    else
+        modem="⚪ 未检测到"
+    fi
+
+    if ip link show usb0 >/dev/null 2>&1; then
+        usb0="$(ip -4 addr show usb0 2>/dev/null | awk '/inet / {print $2;exit}')"
+        [ -n "$usb0" ] || usb0="接口存在 无IPv4"
+    else
+        usb0="接口不存在"
+    fi
+
+    ports="$(ls /dev/ttyUSB* 2>/dev/null | tr '\n' ' ')"
+    [ -n "$ports" ] || ports="无"
+    local now="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    send_msg "📡 <b>TohsakaWrt 5G 模块状态</b>
+
+━━━━━━━━━━━━━━
+📟 <b>RM500Q</b>：${modem}
+📶 <b>数据接口 (usb0)</b>：<code>${usb0}</code>
+🔌 <b>AT 通讯端口</b>：<code>${ports}</code>
+━━━━━━━━━━━━━━
+
+🕰️ <i>${now}</i>"
+}
+
+modem_cellular_info() {
+    local at_port="/dev/ttyUSB2"
+    local modem_at="/usr/share/modem/modem_at.sh"
+    if [ ! -e "$at_port" ] || [ ! -x "$modem_at" ]; then
+        echo "|||未检测到模组"
+        return
+    fi
+
+    local cgpaddr qnwinfo
+    if command -v timeout >/dev/null 2>&1; then
+        cgpaddr="$(timeout 3 sh "$modem_at" "$at_port" 'AT+CGPADDR=1' 2>/dev/null | tr -d '\r' | grep '+CGPADDR:' | head -n 1)"
+        qnwinfo="$(timeout 3 sh "$modem_at" "$at_port" 'AT+QNWINFO' 2>/dev/null | tr -d '\r' | grep '+QNWINFO:' | head -n 1)"
+    else
+        cgpaddr="$(sh "$modem_at" "$at_port" 'AT+CGPADDR=1' 2>/dev/null | tr -d '\r' | grep '+CGPADDR:' | head -n 1)"
+        qnwinfo="$(sh "$modem_at" "$at_port" 'AT+QNWINFO' 2>/dev/null | tr -d '\r' | grep '+QNWINFO:' | head -n 1)"
+    fi
+
+    local sim_ip="$(printf '%s\n' "$cgpaddr" | awk -F'"' '{print $2}' | awk -F',' '{print $1}')"
+    local plmn="$(printf '%s\n' "$qnwinfo" | awk -F'"' '{print $4}')"
+    local band="$(printf '%s\n' "$qnwinfo" | awk -F'"' '{print $6}')"
+    local mode="$(printf '%s\n' "$qnwinfo" | awk -F'"' '{print $2}')"
+
+    local oper
+    case "$plmn" in
+        46001|46006|46009) oper="中国联通" ;;
+        46000|46002|46004|46007|46008) oper="中国移动" ;;
+        46003|46005|46011|46012) oper="中国电信" ;;
+        46015) oper="中国广电" ;;
+        *) oper="${plmn:-未知运营商}" ;;
+    esac
+
+    echo "${sim_ip:-未获取}|${oper}|${band:-未知频段}|${mode:-未知}"
+}
+
+cmd_uplink() {
+    local cur_uplink="$(ip route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)"
+    local cur_name=""
+    local cur_icon=""
+    case "$cur_uplink" in
+        usb0)
+            cur_name="5G 蜂窝网络 (usb0)"
+            cur_icon="📶"
+            ;;
+        eth0)
+            cur_name="有线宽带 (eth0)"
+            cur_icon="🌐"
+            ;;
+        *)
+            cur_name="${cur_uplink:-未知接口}"
+            cur_icon="📡"
+            ;;
+    esac
+
+    local ip_wan="$(wan_ip)"
+    [ -n "$ip_wan" ] || ip_wan="未连接"
+    local ip_5g="$(ip -4 addr show usb0 2>/dev/null | awk '/inet / {print $2}')"
+    [ -n "$ip_5g" ] || ip_5g="未获取到 IP"
+
+    local modem_info="$(modem_cellular_info)"
+    local sim_ip="$(echo "$modem_info" | cut -d'|' -f1)"
+    local cell_oper="$(echo "$modem_info" | cut -d'|' -f2)"
+    local cell_band="$(echo "$modem_info" | cut -d'|' -f3)"
+
+    local pub_ip="$(public_ip_info)"
+    local wan_pub_line=""
+    local cell_pub_line=""
+    local cell_mode_line=""
+
+    if [ "$cur_uplink" = "eth0" ]; then
+        if [ "$pub_ip" != "未获取到" ]; then
+            echo "$pub_ip" > /tmp/last_wan_pubip 2>/dev/null
+        fi
+        local wan_pub="${pub_ip}"
+        [ "$wan_pub" != "未获取到" ] || wan_pub="$(cat /tmp/last_wan_pubip 2>/dev/null || echo "未获取到")"
+        wan_pub_line="└ 公网归属：<code>${wan_pub}</code> 🟢"
+        cell_mode_line="└ 制式频段：<code>${cell_oper} · ${cell_band}</code> ⚪"
+    elif [ "$cur_uplink" = "usb0" ]; then
+        if [ "$pub_ip" != "未获取到" ]; then
+            echo "$pub_ip" > /tmp/last_5g_pubip 2>/dev/null
+        fi
+        local cell_pub="${pub_ip}"
+        [ "$cell_pub" != "未获取到" ] || cell_pub="$(cat /tmp/last_5g_pubip 2>/dev/null || echo "未获取到")"
+        local wan_last="$(cat /tmp/last_wan_pubip 2>/dev/null || echo "备用待命")"
+        wan_pub_line="└ 上次出口：<code>${wan_last}</code> ⚪"
+        cell_mode_line="├ 制式频段：<code>${cell_oper} · ${cell_band}</code>"
+        cell_pub_line="
+└ 公网归属：<code>${cell_pub}</code> 🟢"
+    else
+        wan_pub_line="└ 物理内网：<code>${ip_wan}</code>"
+        cell_mode_line="└ 蜂窝分配：<code>${sim_ip}</code>"
+    fi
+
+    local inline_kb='{"inline_keyboard":[[{"text":"🌐 切换至：有线宽带","callback_data":"set_uplink:wan"},{"text":"📶 切换至：5G模组","callback_data":"set_uplink:5g"}]]}'
+
+    local now="$(date '+%Y-%m-%d %H:%M:%S')"
+    send_msg "🔀 <b>网络主力出口切换</b>
+
+━━━━━━━━━━━━━━
+${cur_icon} <b>当前主力出口</b>：<code>${cur_name}</code>
+━━━━━━━━━━━━━━
+🌐 <b>有线宽带 (eth0)</b>
+├ 物理内网：<code>${ip_wan}</code> (光猫分配)
+${wan_pub_line}
+
+📶 <b>5G 模组 (usb0)</b>
+├ 虚拟网卡：<code>${ip_5g}</code> (模组网关)
+├ 蜂窝分配：<code>${sim_ip}</code>
+${cell_mode_line}${cell_pub_line}
+━━━━━━━━━━━━━━
+💡 <i>说明：光猫/5G网卡为设备内网IP；公网归属/蜂窝为运营商真实出口。</i>
+👇 <b>点击下方按钮平滑倒换主力上网通道：</b>
+
+🕰️ <i>${now}</i>" "$DEFAULT_KEYBOARD" "$inline_kb"
+}
+
+
+
+cmd_help() {
+    send_msg "🤖 <b>TohsakaWrt Telegram Bot</b>
+
+<b>常用监控命令：</b>
+/status - 📊 综合运行状态看板 (带网速/外网IP)
+/nodes - 🧭 OpenClash 策略与落地节点
+/ping - 🩺 双向网络健康度体检 (ICMP + HTTP)
+/clients - 👥 当前在线设备列表
+/alias - 🏷️ 为未知设备添加中文备注
+/wan - 🌐 外网与路由详情 (带公网与代理IP)
+/clash - 🧩 OpenClash 核心与端口
+/temp - 🌡️ CPU 实时温度监控
+/storage - 💾 存储分区与挂载
+/usb - 🔌 USB 设备拓扑
+/modem - 📡 5G 蜂窝模块 (RM500Q)
+
+<b>OpenClash 控制与直连：</b>
+/direct - 🎯 一键添加直连白名单 (域名/IP)
+/undirect - 🗑️ 从直连白名单中移除 (支持序号/域名)
+/direct_list - 📋 查看当前已生效的直连列表
+/mode - 🔀 弹出按钮一键切换分流模式
+/uplink - 🔀 一键切换有线宽带与 5G 模组主力出口
+/nodes test - ⚡ 测速当前节点
+/clash_restart - 🔄 平滑重启 OpenClash 核心
+/help - ℹ️ 显示本帮助菜单
+
+💡 <i>提示：可以直接点击下方快捷按钮或消息内的内联按钮快速操作。</i>"
+}
+
+process_callback() {
+    local cb_id="$1"
+    local msg_id="$2"
+    local cb_data="$3"
+
+    case "$cb_data" in
+        set_mode:*)
+            local target_mode="${cb_data#set_mode:}"
+            curl -s -X PATCH -H "Content-Type: application/json" -d "{\"mode\":\"${target_mode}\"}" http://127.0.0.1:9090/configs >/dev/null 2>&1
+            local mode_name=""
+            case "$target_mode" in
+                rule) mode_name="规则分流 (Rule)" ;;
+                global) mode_name="全局代理 (Global)" ;;
+                direct) mode_name="全局直连 (Direct)" ;;
+                *) mode_name="$target_mode" ;;
+            esac
+
+            curl -m 5 -fsS -X POST "${API}/answerCallbackQuery" \
+                -d "callback_query_id=${cb_id}" \
+                -d "text=已切换为: ${mode_name}" >/dev/null 2>&1
+
+            local now="$(date '+%Y-%m-%d %H:%M:%S')"
+            local new_text="✅ <b>OpenClash 模式切换成功</b>
+
+━━━━━━━━━━━━━━
+🔀 <b>当前模式</b>：<code>${mode_name}</code>
+━━━━━━━━━━━━━━
+👇 点击可再次切换："
+            local inline_kb='{"inline_keyboard":[[{"text":"📐 规则分流","callback_data":"set_mode:rule"},{"text":"🌐 全局代理","callback_data":"set_mode:global"},{"text":"⚡ 全局直连","callback_data":"set_mode:direct"}]]}'
+            curl -m 5 -fsS -X POST "${API}/editMessageText" \
+                -d "chat_id=${CHAT_ID}" \
+                -d "message_id=${msg_id}" \
+                -d "parse_mode=HTML" \
+                -d "reply_markup=${inline_kb}" \
+                --data-urlencode "text=${new_text}" >/dev/null 2>&1
+            ;;
+        test_nodes)
+            curl -m 5 -fsS -X POST "${API}/answerCallbackQuery" \
+                -d "callback_query_id=${cb_id}" \
+                -d "text=⚡ 正在后台测速，请稍候约2秒..." >/dev/null 2>&1
+            curl -s -m 5 "http://127.0.0.1:9090/group/%E2%99%BB%EF%B8%8F%20%E9%A6%99%E6%B8%AF%E8%87%AA%E5%8A%A8/delay?url=http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=2500" >/dev/null 2>&1
+            curl -s -m 5 "http://127.0.0.1:9090/group/%E2%99%BB%EF%B8%8F%20%E7%BE%8E%E5%9B%BD%E8%87%AA%E5%8A%A8/delay?url=http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=2500" >/dev/null 2>&1
+            cmd_nodes
+            ;;
+        restart_clash)
+            curl -m 5 -fsS -X POST "${API}/answerCallbackQuery" \
+                -d "callback_query_id=${cb_id}" \
+                -d "text=🔄 正在重启 OpenClash..." >/dev/null 2>&1
+            cmd_clash_restart
+            ;;
+        re_ping)
+            curl -m 5 -fsS -X POST "${API}/answerCallbackQuery" \
+                -d "callback_query_id=${cb_id}" \
+                -d "text=🩺 正在重新测试网络质量，请稍候约2秒..." >/dev/null 2>&1
+            cmd_ping
+            ;;
+        refresh_direct)
+            curl -m 5 -fsS -X POST "${API}/answerCallbackQuery" \
+                -d "callback_query_id=${cb_id}" \
+                -d "text=🔄 正在刷新直连白名单..." >/dev/null 2>&1
+            cmd_direct_list
+            ;;
+        set_uplink:*)
+            local target_uplink="${cb_data#set_uplink:}"
+            local res=""
+            if [ -x /usr/bin/tohsakawrt-uplink ]; then
+                res="$(/usr/bin/tohsakawrt-uplink set "$target_uplink" 2>/dev/null)"
+            else
+                res="ERROR_NO_TOOL"
+            fi
+
+            local notice_text=""
+            local result_desc=""
+            case "$res" in
+                SUCCESS_WAN|ALREADY_WAN)
+                    notice_text="已切换为主力有线宽带"
+                    result_desc="🌐 <b>当前主力出口</b>：<code>有线光猫宽带 (eth0)</code>
+⚡ <b>状态</b>：平滑倒换完成，网络连接零中断。"
+                    ;;
+                SUCCESS_5G|ALREADY_5G)
+                    notice_text="已切换为主力 5G 模组"
+                    result_desc="📶 <b>当前主力出口</b>：<code>5G 蜂窝模组 (usb0)</code>
+⚡ <b>状态</b>：平滑倒换完成，已进入 5G 模组通道。"
+                    ;;
+                ERROR_5G_NO_IP)
+                    notice_text="切换失败：5G 模组未获取到 IP"
+                    result_desc="⚠️ <b>切换失败</b>：5G 模组 (usb0) 当前未获取到有效 IP，无法作为主力出口。"
+                    ;;
+                *)
+                    notice_text="切换执行完成"
+                    result_desc="ℹ️ 切换返回：<code>${res}</code>"
+                    ;;
+            esac
+
+            curl -m 5 -fsS -X POST "${API}/answerCallbackQuery" \
+                -d "callback_query_id=${cb_id}" \
+                -d "text=${notice_text}" >/dev/null 2>&1
+
+            local inline_kb='{"inline_keyboard":[[{"text":"🌐 切换至：有线宽带","callback_data":"set_uplink:wan"},{"text":"📶 切换至：5G模组","callback_data":"set_uplink:5g"}]]}'
+            local now="$(date '+%Y-%m-%d %H:%M:%S')"
+            local new_text="🔀 <b>网络主力出口切换</b>
+
+━━━━━━━━━━━━━━
+${result_desc}
+━━━━━━━━━━━━━━
+👇 点击下方按钮可再次倒换：
+
+🕰️ <i>${now}</i>"
+
+            curl -m 5 -fsS -X POST "${API}/editMessageText" \
+                -d "chat_id=${CHAT_ID}" \
+                -d "message_id=${msg_id}" \
+                -d "parse_mode=HTML" \
+                -d "reply_markup=${inline_kb}" \
+                --data-urlencode "text=${new_text}" >/dev/null 2>&1
+            ;;
+    esac
+}
+
+process_command() {
+    local raw_cmd="$1"
+    local cmd arg
+
+    if [ "${raw_cmd#/}" != "$raw_cmd" ]; then
+        cmd="${raw_cmd%% *}"
+        arg="${raw_cmd#* }"
+        [ "$arg" = "$raw_cmd" ] && arg=""
+        cmd="${cmd%%@*}"
+    else
+        cmd="$raw_cmd"
+        arg=""
+    fi
+
+    case "$cmd" in
+        /start|/help|/menu|*帮助*)
+            cmd_help
+            ;;
+        /status|*状态*)
+            cmd_status
+            ;;
+        /ping|/check|/test|*体检*|*双向*|*测速*)
+            cmd_ping
+            ;;
+        /nodes|*节点*)
+            cmd_nodes "$arg"
+            ;;
+        /mode|*模式*)
+            cmd_mode "$arg"
+            ;;
+        /uplink|/switch_wan|*出口*|*切网*|*切5G*)
+            cmd_uplink
+            ;;
+        /direct|/bypass|/unproxy|*加直连*)
+            cmd_direct "$arg"
+            ;;
+        /undirect|/del_direct|/redirect|*删直连*)
+            cmd_undirect "$arg"
+            ;;
+        /direct_list|/bypass_list|*直连*|*白名单*)
+            if [ -n "$arg" ]; then
+                cmd_direct "$arg"
+            else
+                cmd_direct_list
+            fi
+            ;;
+        /clash_restart|*重启*|*核心*)
+            cmd_clash_restart
+            ;;
+        /clients|/devices|*设备*|*客户端*)
+            cmd_clients
+            ;;
+        /alias|*备注*)
+            cmd_alias "$arg"
+            ;;
+        /temp|*温度*)
+            cmd_temp
+            ;;
+        /wan|*外网*|*网络*)
+            cmd_wan
+            ;;
+        /clash|*Clash*|*clash*)
+            cmd_clash
+            ;;
+        /storage|*存储*)
+            cmd_storage
+            ;;
+        /usb|*USB*|*usb*)
+            cmd_usb
+            ;;
+        /modem|*5G*|*蜂窝*)
+            cmd_modem
+            ;;
+        *)
+            send_msg "⚠️ <b>未识别的命令</b>：<code>${cmd}</code>\n\n发送 /help 或点击下方键盘查看可用命令。"
+            ;;
+    esac
+}
+
+parse_updates() {
+    lua -e '
+local json = require "luci.jsonc"
+
+local input = io.read("*a")
+local data = json.parse(input)
+
+if not data or not data.result then
+    os.exit(0)
+end
+
+for _, u in ipairs(data.result) do
+    local uid = tostring(u.update_id or "")
+    if u.callback_query then
+        local cq = u.callback_query
+        local chat_id = (cq.message and cq.message.chat) and tostring(cq.message.chat.id) or ""
+        local msg_id = (cq.message) and tostring(cq.message.message_id) or ""
+        local data_str = tostring(cq.data or "")
+        local cq_id = tostring(cq.id or "")
+        io.write(uid, "\t", chat_id, "\t", "CALLBACK:" .. cq_id .. ":" .. msg_id .. ":" .. data_str, "\n")
+    else
+        local m = u.message or u.edited_message
+        if m and m.chat then
+            local text = tostring(m.text or "")
+            text = text:gsub("[\r\n\t]", " ")
+            io.write(uid, "\t", tostring(m.chat.id or ""), "\t", text, "\n")
+        else
+            io.write(uid, "\t\t\n")
+        end
+    end
+end
+'
+}
+
+# 第一次启动丢弃积压命令，同步到最新 offset
+if [ ! -f "$OFFSET_FILE" ]; then
+    INIT="$(
+        curl -m 10 -fsS \
+            "${API}/getUpdates?offset=-1&limit=1&timeout=0" \
+            2>/dev/null
+    )"
+
+    LAST="$(
+        printf '%s' "$INIT" |
+        lua -e '
+local json=require "luci.jsonc"
+local d=json.parse(io.read("*a"))
+if d and d.result and #d.result>0 then
+    print((d.result[#d.result].update_id or 0)+1)
+else
+    print(0)
+end
+'
+    )"
+
+    echo "${LAST:-0}" > "$OFFSET_FILE"
+    log "Telegram Bot started with offset ${LAST:-0}"
+fi
+
+while true; do
+    OFFSET="$(cat "$OFFSET_FILE" 2>/dev/null)"
+    [ -n "$OFFSET" ] || OFFSET=0
+
+    RESPONSE="$(
+        curl -m 35 --connect-timeout 8 -sS \
+            --get "${API}/getUpdates" \
+            --data-urlencode "offset=${OFFSET}" \
+            --data-urlencode "timeout=25" \
+            --data-urlencode 'allowed_updates=["message","edited_message","callback_query"]' \
+            2>/dev/null
+    )"
+
+    # 如果返回包含 "ok":true，说明与 TG 服务器通讯正常
+    if echo "$RESPONSE" | grep -q '"ok":true'; then
+        BACKOFF=0
+
+        printf '%s' "$RESPONSE" |
+        parse_updates |
+        while IFS="$(printf '\t')" read -r UPDATE_ID MSG_CHAT MSG_TEXT
+        do
+            [ -n "$UPDATE_ID" ] || continue
+
+            NEXT=$((UPDATE_ID + 1))
+            echo "$NEXT" > "$OFFSET_FILE"
+
+            [ -n "$MSG_TEXT" ] || continue
+
+            if [ "$MSG_CHAT" != "$CHAT_ID" ]; then
+                log "Ignored unauthorized chat ${MSG_CHAT}"
+                continue
+            fi
+
+            case "$MSG_TEXT" in
+                CALLBACK:*)
+                    cb_full="${MSG_TEXT#CALLBACK:}"
+                    cb_id="${cb_full%%:*}"
+                    rest="${cb_full#*:}"
+                    msg_id="${rest%%:*}"
+                    cb_data="${rest#*:}"
+                    log "Callback: ${cb_data}"
+                    process_callback "$cb_id" "$msg_id" "$cb_data"
+                    ;;
+                *)
+                    log "Command: ${MSG_TEXT}"
+                    process_command "$MSG_TEXT"
+                    ;;
+            esac
+        done
+        continue
+    fi
+
+    # 仅在真正网络断开时做短时等待 (最多 5 秒)
+    if [ "$BACKOFF" -eq 0 ]; then
+        BACKOFF=2
+    else
+        BACKOFF=$((BACKOFF + 1))
+        [ "$BACKOFF" -gt 5 ] && BACKOFF=5
+    fi
+
+    log "Poll reconnecting in ${BACKOFF}s"
+    sleep "$BACKOFF"
+done

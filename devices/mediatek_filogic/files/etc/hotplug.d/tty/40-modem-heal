@@ -1,0 +1,5 @@
+#!/bin/sh
+
+[ "$ACTION" = "add" ] && [ "$DEVICENAME" = "ttyUSB2" ] || exit 0
+( sleep 2; /usr/bin/tohsakawrt-modem-heal ) &
+exit 0

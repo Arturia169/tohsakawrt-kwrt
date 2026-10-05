@@ -1,0 +1,543 @@
+#!/bin/sh
+
+BARK_KEY="$(uci -q get tohsakawrt-tgbot.main.bark_key)"
+[ -n "$BARK_KEY" ] || BARK_KEY="42JwJVL6Zougn6wcFnoqtb"
+BARK_API="https://api.day.app/push"
+
+STATE_DIR="/tmp/tohsakawrt-watch"
+LOCK_DIR="/tmp/tohsakawrt-service-watch.lock"
+WAN_STATE_FILE="$STATE_DIR/wan_state"
+WAN_FAIL_FILE="$STATE_DIR/wan_fail"
+WAN_DOWN_SINCE="$STATE_DIR/wan_down_since"
+
+NIKKI_STATE_FILE="$STATE_DIR/nikki_state"
+NIKKI_DOWN_SINCE="$STATE_DIR/nikki_down_since"
+NIKKI_ALERTED="$STATE_DIR/nikki_alerted"
+
+BOOT_SENT="$STATE_DIR/boot_sent"
+
+[ -r /usr/lib/tohsakawrt/common.sh ] && . /usr/lib/tohsakawrt/common.sh
+
+mkdir -p "$STATE_DIR"
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+    case "$LOCK_PID" in
+        ''|*[!0-9]*)
+            logger -t TohsakaWrt-Watch "Previous run still active, skip"
+            exit 0
+            ;;
+    esac
+    if kill -0 "$LOCK_PID" 2>/dev/null; then
+        logger -t TohsakaWrt-Watch "Previous run still active, skip"
+        exit 0
+    fi
+    rm -f "$LOCK_DIR/pid" 2>/dev/null
+    rmdir "$LOCK_DIR" 2>/dev/null || exit 0
+    mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+fi
+echo "$$" > "$LOCK_DIR/pid"
+trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM
+
+NOW="$(date '+%m-%d %H:%M:%S')"
+
+internet_ok() {
+    ip route show default 2>/dev/null | grep -q '^default ' || return 1
+
+    ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 && return 0
+    ping -c 1 -W 2 119.29.29.29 >/dev/null 2>&1 && return 0
+    ping -c 1 -W 2 180.76.76.76 >/dev/null 2>&1 && return 0
+
+    return 1
+}
+
+WAN_DEV="$(ip route show default 2>/dev/null | awk '
+NR == 1 {
+    for (i=1; i<=NF; i++) {
+        if ($i == "dev") {
+            print $(i+1)
+            exit
+        }
+    }
+}')"
+
+[ -n "$WAN_DEV" ] || WAN_DEV="未知"
+
+TEMP="未知"
+if [ -r /sys/class/thermal/thermal_zone0/temp ]; then
+    TEMP="$(awk '{printf "%.1f°C",$1/1000}' /sys/class/thermal/thermal_zone0/temp)"
+fi
+
+MEM="未知"
+if [ -r /proc/meminfo ]; then
+    MEM="$(awk '/MemAvailable:/ {printf "%.0f MB",$2/1024}' /proc/meminfo)"
+fi
+
+UPTIME_SEC="$(cut -d. -f1 /proc/uptime 2>/dev/null)"
+[ -n "$UPTIME_SEC" ] || UPTIME_SEC=0
+UPTIME_TEXT="$(format_duration "$UPTIME_SEC")"
+
+NIKKI_INIT="/etc/init.d/openclash"
+NIKKI_ENABLED="$(uci -q get openclash.@openclash[0].enable)"
+NIKKI_RUNNING=0
+if [ "$NIKKI_ENABLED" = "1" ] && [ -x "$NIKKI_INIT" ] && \
+   "$NIKKI_INIT" status >/dev/null 2>&1 && \
+   (pidof clash >/dev/null 2>&1 || pidof mihomo >/dev/null 2>&1) && \
+   curl -sS -m 3 http://127.0.0.1:9090/version 2>/dev/null | grep -q 'version'; then
+    NIKKI_RUNNING=1
+fi
+
+if internet_ok; then
+    WAN_UP=1
+else
+    WAN_UP=0
+fi
+
+
+# ==========================================================
+# WAN 状态监控
+# ==========================================================
+
+WAN_STATE="$(cat "$WAN_STATE_FILE" 2>/dev/null)"
+WAN_FAIL="$(cat "$WAN_FAIL_FILE" 2>/dev/null)"
+[ -n "$WAN_FAIL" ] || WAN_FAIL=0
+
+if [ "$WAN_UP" -eq 1 ]; then
+
+    echo 0 > "$WAN_FAIL_FILE"
+
+    if [ "$WAN_STATE" = "down" ]; then
+
+        DOWN_AT="$(cat "$WAN_DOWN_SINCE" 2>/dev/null)"
+        [ -n "$DOWN_AT" ] || DOWN_AT="$(date +%s)"
+
+        DURATION=$(($(date +%s) - DOWN_AT))
+        DURATION_TEXT="$(format_duration "$DURATION")"
+
+        BODY="✅ TohsakaWrt 网络已恢复\n\n━━━━━━━━━━━━━━\n📡 接口：${WAN_DEV}\n🟢 状态：网络可用\n⏱️ 离线：${DURATION_TEXT}\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n外网连接已恢复正常。"
+
+        push_bark \
+            "✅ TohsakaWrt 网络已恢复" \
+            "$BODY" \
+            "active" \
+            "glass"
+        send_tg "$BODY" HTML
+        echo "up" > "$WAN_STATE_FILE"
+        rm -f "$WAN_DOWN_SINCE"
+
+        logger -t TohsakaWrt-Watch \
+            "WAN recovered after ${DURATION_TEXT}"
+
+    elif [ -z "$WAN_STATE" ]; then
+        echo "up" > "$WAN_STATE_FILE"
+    fi
+
+else
+
+    WAN_FAIL=$((WAN_FAIL + 1))
+    echo "$WAN_FAIL" > "$WAN_FAIL_FILE"
+
+    if [ "$WAN_FAIL" -ge 3 ] && [ "$WAN_STATE" != "down" ]; then
+
+        echo "down" > "$WAN_STATE_FILE"
+        date +%s > "$WAN_DOWN_SINCE"
+
+        logger -t TohsakaWrt-Watch \
+            "WAN offline after 3 consecutive checks"
+
+        BODY="🌐 TohsakaWrt 网络异常\n\n━━━━━━━━━━━━━━\n📡 接口：${WAN_DEV}\n🔴 状态：外网不可达\n📊 检测：连续 3 次失败\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n已记录离线开始时间。恢复后会自动推送离线时长。"
+
+        push_bark \
+            "🌐 TohsakaWrt 网络异常" \
+            "$BODY" \
+            "timeSensitive" \
+            "alarm" || true
+
+        send_tg "$BODY" HTML
+    fi
+fi
+
+
+# ==========================================================
+# WAN IP 变动监控
+# ==========================================================
+
+WAN_IP_FILE="$STATE_DIR/wan_ip"
+WAN_IP6_FILE="$STATE_DIR/wan_ip6"
+
+. /lib/functions/network.sh 2>/dev/null
+CUR_IP=""
+CUR_IP6=""
+network_get_ipaddr CUR_IP wan 2>/dev/null
+network_get_ipaddr6 CUR_IP6 wan_6 2>/dev/null || network_get_ipaddr6 CUR_IP6 wan6 2>/dev/null
+
+if [ -n "$CUR_IP" ] && [ "$WAN_UP" -eq 1 ]; then
+    OLD_IP="$(cat "$WAN_IP_FILE" 2>/dev/null)"
+    if [ -n "$OLD_IP" ] && [ "$OLD_IP" != "$CUR_IP" ]; then
+        IP_BODY="🌐 TohsakaWrt WAN IP 变动\n\n━━━━━━━━━━━━━━\n📡 接口：${WAN_DEV}\n🔻 原 IPv4：${OLD_IP}\n🔺 新 IPv4：${CUR_IP}\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━"
+        push_bark "🌐 WAN IP 变动提醒" "$IP_BODY" "active" "bell"
+        send_tg "$IP_BODY" HTML
+        logger -t TohsakaWrt-Watch "WAN IP changed: ${OLD_IP} -> ${CUR_IP}"
+    fi
+    echo "$CUR_IP" > "$WAN_IP_FILE"
+fi
+
+if [ -n "$CUR_IP6" ] && [ "$WAN_UP" -eq 1 ]; then
+    OLD_IP6="$(cat "$WAN_IP6_FILE" 2>/dev/null)"
+    if [ -n "$OLD_IP6" ] && [ "$OLD_IP6" != "$CUR_IP6" ]; then
+        IP6_BODY="🌐 TohsakaWrt IPv6 变动\n\n━━━━━━━━━━━━━━\n📡 接口：${WAN_DEV}\n🔻 原 IPv6：${OLD_IP6}\n🔺 新 IPv6：${CUR_IP6}\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━"
+        push_bark "🌐 IPv6 变动提醒" "$IP6_BODY" "active" "bell"
+        send_tg "$IP6_BODY" HTML
+        logger -t TohsakaWrt-Watch "WAN IPv6 changed"
+    fi
+    echo "$CUR_IP6" > "$WAN_IP6_FILE"
+fi
+
+
+# ==========================================================
+# OpenClash 状态监控
+# ==========================================================
+
+NIKKI_STATE="$(cat "$NIKKI_STATE_FILE" 2>/dev/null)"
+
+if [ "$NIKKI_ENABLED" != "1" ]; then
+
+    echo "disabled" > "$NIKKI_STATE_FILE"
+    rm -f "$NIKKI_DOWN_SINCE" "$NIKKI_ALERTED"
+
+elif [ "$NIKKI_RUNNING" -eq 1 ]; then
+
+    if [ "$NIKKI_STATE" = "stopped" ]; then
+
+        DOWN_AT="$(cat "$NIKKI_DOWN_SINCE" 2>/dev/null)"
+        [ -n "$DOWN_AT" ] || DOWN_AT="$(date +%s)"
+
+        DURATION=$(($(date +%s) - DOWN_AT))
+        DURATION_TEXT="$(format_duration "$DURATION")"
+
+        BODY="✅ OpenClash 已恢复\n\n━━━━━━━━━━━━━━\n🟢 核心：Clash API 正常\n🌐 外网：$([ "$WAN_UP" -eq 1 ] && echo 正常 || echo 异常)\n⏱️ 故障：${DURATION_TEXT}\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\nOpenClash 核心已重新响应。"
+
+        push_bark \
+            "✅ OpenClash 已恢复" \
+            "$BODY" \
+            "active" \
+            "glass"
+        send_tg "$BODY" HTML
+        echo "running" > "$NIKKI_STATE_FILE"
+        rm -f "$NIKKI_DOWN_SINCE" "$NIKKI_ALERTED"
+
+        logger -t TohsakaWrt-Watch \
+            "OpenClash recovered after ${DURATION_TEXT}"
+
+    else
+        echo "running" > "$NIKKI_STATE_FILE"
+    fi
+
+else
+
+    if [ "$NIKKI_STATE" != "stopped" ]; then
+
+        echo "stopped" > "$NIKKI_STATE_FILE"
+        date +%s > "$NIKKI_DOWN_SINCE"
+        rm -f "$NIKKI_ALERTED"
+
+        logger -t TohsakaWrt-Watch \
+            "OpenClash core process disappeared"
+    fi
+
+    if [ "$WAN_UP" -eq 1 ] && [ ! -f "$NIKKI_ALERTED" ]; then
+
+        BODY="🧩 OpenClash 运行异常\n\n━━━━━━━━━━━━━━\n📦 插件：已启用\n🔴 核心：Clash 未响应\n🌐 外网：正常\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n请检查 OpenClash 核心状态或最近的节点配置。"
+
+        push_bark \
+            "🧩 OpenClash 运行异常" \
+            "$BODY" \
+            "timeSensitive" \
+            "alarm"
+        send_tg "$BODY" HTML
+        touch "$NIKKI_ALERTED"
+    fi
+fi
+
+
+# ==========================================================
+
+# ==========================================================
+# RM500Q 5G / 4G 状态监控
+# ==========================================================
+
+MOBILE_STATE_FILE="${STATE_DIR}/mobile_state"
+AT_PORT="/dev/ttyUSB2"
+MODEM_AT="/usr/share/modem/modem_at.sh"
+MOBILE_HISTORY_FILE="/root/tohsakawrt-logs/5g-history.log"
+mkdir -p /root/tohsakawrt-logs
+
+[ -e "$AT_PORT" ] || rm -f "$MOBILE_STATE_FILE"
+if [ -e "$AT_PORT" ] && [ -x "$MODEM_AT" ]; then
+
+    if command -v timeout >/dev/null 2>&1; then
+        QNWINFO="$(
+            timeout 8 sh "$MODEM_AT" "$AT_PORT" 'AT+QNWINFO' 2>/dev/null |
+            tr -d '\r' |
+            grep '+QNWINFO:' |
+            head -n 1
+        )"
+    else
+        QNWINFO="$(
+            sh "$MODEM_AT" "$AT_PORT" 'AT+QNWINFO' 2>/dev/null |
+            tr -d '\r' |
+            grep '+QNWINFO:' |
+            head -n 1
+        )"
+    fi
+
+    if [ -n "$QNWINFO" ]; then
+
+        MOBILE_MODE="$(printf '%s\n' "$QNWINFO" | awk -F'"' '{print $2}')"
+        MOBILE_PLMN="$(printf '%s\n' "$QNWINFO" | awk -F'"' '{print $4}')"
+        MOBILE_BAND="$(printf '%s\n' "$QNWINFO" | awk -F'"' '{print $6}')"
+
+        case "$MOBILE_PLMN" in
+            46001|46006|46009)
+                MOBILE_OPERATOR="中国联通"
+                ;;
+            46000|46002|46004|46007|46008)
+                MOBILE_OPERATOR="中国移动"
+                ;;
+            46003|46005|46011|46012)
+                MOBILE_OPERATOR="中国电信"
+                ;;
+            46015)
+                MOBILE_OPERATOR="中国广电"
+                ;;
+            *)
+                MOBILE_OPERATOR="${MOBILE_PLMN:-未知}"
+                ;;
+        esac
+
+        case "$MOBILE_MODE" in
+            *NR5G*|*5G*)
+                MOBILE_STATE="5g"
+                ;;
+            *LTE*)
+                MOBILE_STATE="4g"
+                ;;
+            *)
+                MOBILE_STATE="unknown"
+                ;;
+        esac
+
+        OLD_MOBILE_STATE="$(cat "$MOBILE_STATE_FILE" 2>/dev/null)"
+
+        # 第一次检测只记录，不通知
+        if [ "$MOBILE_STATE" != "unknown" ] && [ -z "$OLD_MOBILE_STATE" ]; then
+
+            echo "$MOBILE_STATE" > "$MOBILE_STATE_FILE"
+
+            logger -t TohsakaWrt-Watch \
+                "Mobile initial state ${MOBILE_STATE}: ${MOBILE_MODE} ${MOBILE_BAND}"
+            printf '%s | INITIAL_%s | %s | %s | %s\n' "$NOW" "$MOBILE_STATE" "$MOBILE_OPERATOR" "$MOBILE_MODE" "$MOBILE_BAND" >> "$MOBILE_HISTORY_FILE"
+
+        elif [ "$MOBILE_STATE" = "4g" ] && [ "$OLD_MOBILE_STATE" = "5g" ]; then
+
+            MOBILE_BODY="📶 TohsakaWrt 5G 已降级\n\n━━━━━━━━━━━━━━\n📡 运营商：${MOBILE_OPERATOR}\n📶 当前：${MOBILE_MODE}\n📻 频段：${MOBILE_BAND}\n🔻 变化：5G → 4G\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n可能是附近 5G 小区暂时不可用。恢复 5G 后会自动通知。"
+
+            push_bark \
+                "📶 TohsakaWrt 5G 已降级" \
+                "$MOBILE_BODY" \
+                "timeSensitive" \
+                "bell"
+
+            send_tg "$MOBILE_BODY" HTML
+
+            echo "4g" > "$MOBILE_STATE_FILE"
+
+            logger -t TohsakaWrt-Watch \
+                "5G degraded to 4G: ${MOBILE_MODE} ${MOBILE_BAND}"
+            printf '%s | 5G_TO_4G | %s | %s | %s\n' "$NOW" "$MOBILE_OPERATOR" "$MOBILE_MODE" "$MOBILE_BAND" >> "$MOBILE_HISTORY_FILE"
+            rotate_log "$MOBILE_HISTORY_FILE" 200
+
+        elif [ "$MOBILE_STATE" = "5g" ] && [ "$OLD_MOBILE_STATE" = "4g" ]; then
+
+            MOBILE_BODY="📡 TohsakaWrt 5G 已恢复\n\n━━━━━━━━━━━━━━\n📡 运营商：${MOBILE_OPERATOR}\n📶 当前：${MOBILE_MODE}\n📻 频段：${MOBILE_BAND}\n🔺 变化：4G → 5G\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n移动网络已重新接入 5G。"
+
+            push_bark \
+                "📡 TohsakaWrt 5G 已恢复" \
+                "$MOBILE_BODY" \
+                "active" \
+                "glass"
+
+            send_tg "$MOBILE_BODY" HTML
+
+            echo "5g" > "$MOBILE_STATE_FILE"
+
+            logger -t TohsakaWrt-Watch \
+                "5G recovered: ${MOBILE_MODE} ${MOBILE_BAND}"
+            printf '%s | 4G_TO_5G | %s | %s | %s\n' "$NOW" "$MOBILE_OPERATOR" "$MOBILE_MODE" "$MOBILE_BAND" >> "$MOBILE_HISTORY_FILE"
+            rotate_log "$MOBILE_HISTORY_FILE" 200
+
+        fi
+    fi
+fi
+
+# 开机上线通知
+# ==========================================================
+
+if [ "$WAN_UP" -eq 1 ] && [ ! -f "$BOOT_SENT" ]; then
+
+    if [ "$NIKKI_ENABLED" != "1" ]; then
+        NIKKI_TEXT="未启用"
+    elif [ "$NIKKI_RUNNING" -eq 1 ]; then
+        NIKKI_TEXT="正常运行"
+    else
+        NIKKI_TEXT="运行异常"
+    fi
+
+    BODY="✅ TohsakaWrt 已上线\n\n━━━━━━━━━━━━━━\n📟 设备：Cudy TR3000\n⏱️ 运行：${UPTIME_TEXT}\n🌡️ 温度：${TEMP}\n🧠 可用内存：${MEM}\n📡 上网接口：${WAN_DEV}\n🧩 OpenClash：${NIKKI_TEXT}\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n启动自检完成。"
+
+    push_bark \
+        "✅ TohsakaWrt 已上线" \
+        "$BODY" \
+        "active" \
+        "glass"
+    send_tg "$BODY" HTML
+    touch "$BOOT_SENT"
+
+    logger -t TohsakaWrt-Watch \
+        "Boot notification processed"
+fi
+
+
+# ==========================================================
+# 局域网新设备接入检测
+# ==========================================================
+
+KNOWN_MACS_FILE="/etc/tohsakawrt-known-macs"
+DHCP_LEASES="/tmp/dhcp.leases"
+
+ALIAS_FILE="/etc/tohsakawrt-aliases"
+
+if [ -f "$DHCP_LEASES" ]; then
+    if [ ! -f "$KNOWN_MACS_FILE" ]; then
+        awk '{print tolower($2)}' "$DHCP_LEASES" | sort -u > "$KNOWN_MACS_FILE"
+        logger -t TohsakaWrt-Watch "Initialized known MACs database"
+    else
+        while read -r _ts mac ip host _cid; do
+            [ -n "$mac" ] || continue
+            mac_lower="$(echo "$mac" | tr '[:upper:]' '[:lower:]')"
+            if ! grep -q "^${mac_lower}$" "$KNOWN_MACS_FILE" 2>/dev/null; then
+                echo "$mac_lower" >> "$KNOWN_MACS_FILE"
+                device_name="${host:-未知设备}"
+                [ "$device_name" = "*" ] && device_name="未知设备"
+
+                alias_name=""
+                if [ -f "$ALIAS_FILE" ]; then
+                    alias_name="$(awk -v m="$mac_lower" '$1==m {for(i=2;i<=NF;i++) printf "%s%s", $i, (i==NF?"":" "); exit}' "$ALIAS_FILE" 2>/dev/null)"
+                fi
+                [ -n "$alias_name" ] && device_name="${alias_name} (${device_name})"
+
+                DEV_BODY="🔔 新设备接入局域网\n\n━━━━━━━━━━━━━━\n📱 设备：${device_name}\n🏠 分配 IP：${ip}\n🔑 MAC：$(echo "$mac" | tr '[:lower:]' '[:upper:]')\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n如非本人设备请留意网络安全。"
+
+                push_bark "🔔 新设备接入" "$DEV_BODY" "timeSensitive" "bell"
+                send_tg "$DEV_BODY" HTML
+                logger -t TohsakaWrt-Watch "New device detected: ${device_name} (${ip} / ${mac})"
+            fi
+        done < "$DHCP_LEASES"
+    fi
+fi
+
+
+# ==========================================================
+# 持续高带宽下载流量监控 (阈值: 10 MB/s, 约 80~100 Mbps)
+# ==========================================================
+
+TRAFFIC_STATE_FILE="/tmp/tohsakawrt-traffic-state"
+TRAFFIC_THRESHOLD_BYTES=10485760 # 10 MB/s
+MAX_PHYSICAL_BYTES=157286400     # 150 MB/s (~1200 Mbps) 千兆物理上限熔断；本机光猫口实测 1Gbps
+TRAFFIC_PROC_FILE="${TRAFFIC_PROC_FILE:-/proc/net/dev}"
+
+if [ -n "$WAN_DEV" ] && [ "$WAN_DEV" != "未知" ]; then
+    CURR_RX="$(awk -v d="${WAN_DEV}:" '$1==d {print $2}' "$TRAFFIC_PROC_FILE" 2>/dev/null)"
+    NOW_TS="$(date +%s)"
+
+    if [ -n "$CURR_RX" ] && [ "$CURR_RX" -gt 0 ] 2>/dev/null; then
+        if [ -f "$TRAFFIC_STATE_FILE" ]; then
+            LAST_TS="" LAST_RX="" LAST_DEV="" ALERT_ACTIVE=0 ALERT_START_TS=0 ALERT_START_RX=0 PEAK_SPEED=0
+            . "$TRAFFIC_STATE_FILE" 2>/dev/null
+
+            # 防御 1: 接口切换保护（宽带与 5G 切换时，不同网卡绝不交叉相减）
+            if [ "${LAST_DEV:-}" != "$WAN_DEV" ]; then
+                logger -t TohsakaWrt-Watch "WAN interface switched (${LAST_DEV:-none} -> ${WAN_DEV}), reset traffic baseline"
+                ALERT_ACTIVE=0
+                LAST_RX=""
+            fi
+
+            DT=$((NOW_TS - LAST_TS))
+            if [ "$DT" -ge 40 ] && [ "$DT" -le 180 ] && [ -n "$LAST_RX" ]; then
+                DELTA_RX=$((CURR_RX - LAST_RX))
+                if [ "$DELTA_RX" -ge 0 ]; then
+                    SPEED_BPS=$((DELTA_RX / DT))
+
+                    # 防御 3: 物理端口速率熔断（千兆口均速不可能超过 150 MB/s，超标必是跳变脏数据）
+                    if [ "$SPEED_BPS" -gt "$MAX_PHYSICAL_BYTES" ]; then
+                        logger -t TohsakaWrt-Watch "Spurious traffic jump detected (${SPEED_BPS} B/s > max limit), reset baseline"
+                        ALERT_ACTIVE=0
+                    elif [ "$SPEED_BPS" -ge "$TRAFFIC_THRESHOLD_BYTES" ]; then
+                        if [ "${ALERT_ACTIVE:-0}" -ne 1 ]; then
+                            ALERT_ACTIVE=1
+                            ALERT_START_TS="$LAST_TS"
+                            ALERT_START_RX="$LAST_RX"
+                            PEAK_SPEED="$SPEED_BPS"
+
+                            SPEED_STR="$(format_traffic_speed "$SPEED_BPS")"
+                            ALERT_BODY="🚀 <b>检测到持续高带宽下载</b>\n\n━━━━━━━━━━━━━━\n⬇️ <b>过去1分钟均速</b>：<code>${SPEED_STR}</code>\n⏱️ <b>持续时间</b>：已持续 &gt; 1 分钟\n📡 <b>监控接口</b>：<code>${WAN_DEV}</code>\n🕰️ <b>触发时间</b>：${NOW}\n━━━━━━━━━━━━━━\n\n💡 <i>大流量监测中，结束后自动推送汇总。</i>"
+
+                            push_bark "🚀 持续高带宽下载" "$(echo -e "$ALERT_BODY" | sed 's/<[^>]*>//g')" "timeSensitive" "minuet"
+                            send_tg "$ALERT_BODY" HTML
+                            logger -t TohsakaWrt-Watch "High traffic alert triggered: ${SPEED_STR} on ${WAN_DEV}"
+                        else
+                            [ "$SPEED_BPS" -gt "$PEAK_SPEED" ] && PEAK_SPEED="$SPEED_BPS"
+                        fi
+                    else
+                        if [ "${ALERT_ACTIVE:-0}" -eq 1 ]; then
+                            TOTAL_SEC=$((NOW_TS - ALERT_START_TS))
+                            TOTAL_BYTES=$((CURR_RX - ALERT_START_RX))
+                            [ "$TOTAL_SEC" -le 0 ] && TOTAL_SEC=1
+                            AVG_SPEED=$((TOTAL_BYTES / TOTAL_SEC))
+
+                            if [ "$TOTAL_BYTES" -ge 0 ] && [ "$AVG_SPEED" -le "$MAX_PHYSICAL_BYTES" ]; then
+                                TOTAL_DUR="$(format_duration "$TOTAL_SEC")"
+                                TOTAL_SIZE="$(format_traffic_bytes "$TOTAL_BYTES")"
+                                PEAK_STR="$(awk -v s="$PEAK_SPEED" 'BEGIN {printf "%.1f MB/s", s/1048576}')"
+                                AVG_STR="$(format_traffic_speed "$AVG_SPEED")"
+
+                                REPORT_BODY="🏁 <b>高带宽下载已结束</b>\n\n━━━━━━━━━━━━━━\n⏱️ <b>总持续时长</b>：<code>${TOTAL_DUR}</code>\n⚡ <b>最高峰值</b>：<code>${PEAK_STR}</code>\n📊 <b>全程均速</b>：<code>${AVG_STR}</code>\n💾 <b>总计消耗</b>：<code>${TOTAL_SIZE}</code>\n📡 <b>监控接口</b>：<code>${WAN_DEV}</code>\n🕰️ <b>结束时间</b>：${NOW}\n━━━━━━━━━━━━━━\n\n<i>带宽已恢复至日常水平。</i>"
+
+                                push_bark "🏁 高带宽下载已结束" "$(echo -e "$REPORT_BODY" | sed 's/<[^>]*>//g')" "active" "glass"
+                                send_tg "$REPORT_BODY" HTML
+                                logger -t TohsakaWrt-Watch "High traffic finished: ${TOTAL_SIZE} in ${TOTAL_DUR}"
+                            fi
+
+                            ALERT_ACTIVE=0
+                            ALERT_START_TS=0
+                            ALERT_START_RX=0
+                            PEAK_SPEED=0
+                        fi
+                    fi
+                fi
+            fi
+        fi
+
+        cat > "$TRAFFIC_STATE_FILE" << EOF
+LAST_TS=${NOW_TS}
+LAST_RX=${CURR_RX}
+LAST_DEV=${WAN_DEV}
+ALERT_ACTIVE=${ALERT_ACTIVE:-0}
+ALERT_START_TS=${ALERT_START_TS:-0}
+ALERT_START_RX=${ALERT_START_RX:-0}
+PEAK_SPEED=${PEAK_SPEED:-0}
+EOF
+    fi
+fi
+
+exit 0

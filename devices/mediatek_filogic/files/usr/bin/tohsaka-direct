@@ -1,0 +1,183 @@
+#!/bin/sh
+# Tohsaka-Direct: OpenClash 直连白名单管理工具
+# 支持 Telegram Bot 及 Shell CLI 快速增删查与热重载
+
+LIST_FILE="/etc/openclash/tg_direct_rules.list"
+RUN_YAML="/etc/openclash/config.yaml"
+BAK_YAML="/etc/openclash/config/config.yaml"
+API_URL="http://127.0.0.1:9090/configs?force=true"
+
+mkdir -p /etc/openclash 2>/dev/null
+touch "$LIST_FILE" 2>/dev/null
+
+sync_rules_to_yaml() {
+    local target_yaml="$1"
+    [ -f "$target_yaml" ] || return 0
+
+    lua - "$LIST_FILE" "$target_yaml" << 'EOF'
+local list_file, yaml_file = arg[1], arg[2]
+
+local targets = {}
+local f = io.open(list_file, "r")
+if f then
+    for line in f:lines() do
+        line = line:match("^%s*(.-)%s*$")
+        if line ~= "" and not line:match("^#") then
+            table.insert(targets, line)
+        end
+    end
+    f:close()
+end
+
+local function make_rule(cleaned)
+    local direct_str = "\231\155\180\232\191\158"
+    local _, colon_cnt = cleaned:gsub(":", "")
+    if cleaned:match("^%d+%.%d+%.%d+%.%d+/%d+$") then
+        return string.format("  - IP-CIDR,%s,%s,no-resolve", cleaned, direct_str)
+    elseif cleaned:match("^%d+%.%d+%.%d+%.%d+$") then
+        return string.format("  - IP-CIDR,%s/32,%s,no-resolve", cleaned, direct_str)
+    elseif colon_cnt > 1 then
+        return string.format("  - IP-CIDR6,%s/128,%s,no-resolve", cleaned, direct_str)
+    else
+        return string.format("  - DOMAIN-SUFFIX,%s,%s", cleaned, direct_str)
+    end
+end
+
+local yf = io.open(yaml_file, "r")
+if not yf then return end
+local content = yf:read("*a")
+yf:close()
+
+local start_tag = "# === TG_DIRECT_RULES_START ==="
+local end_tag = "# === TG_DIRECT_RULES_END ==="
+
+local block = { start_tag }
+for _, t in ipairs(targets) do
+    table.insert(block, make_rule(t))
+end
+table.insert(block, end_tag)
+local block_str = table.concat(block, "\n")
+
+local s_idx, e_idx = content:find(start_tag, 1, true)
+if s_idx then
+    local s_end, e_end = content:find(end_tag, e_idx, true)
+    if e_end then
+        content = content:sub(1, s_idx - 1) .. block_str .. content:sub(e_end + 1)
+    end
+else
+    local r_start, r_end = content:find("rules:%s*\r?\n")
+    if r_end then
+        content = content:sub(1, r_end) .. block_str .. "\n" .. content:sub(r_end + 1)
+    end
+end
+
+local out = io.open(yaml_file, "w")
+if out then
+    out:write(content)
+    out:close()
+end
+EOF
+}
+
+reload_clash() {
+    curl -s -m 3 -X PUT "$API_URL" -H "Content-Type: application/json" -d "{\"path\": \"$RUN_YAML\"}" >/dev/null 2>&1
+}
+
+clean_input() {
+    echo "$1" | lua -e '
+    local raw = io.read("*l") or ""
+    raw = raw:match("^%s*(.-)%s*$")
+    raw = raw:gsub("^https?://", "")
+    raw = raw:gsub("/.*$", "")
+    local _, colon_cnt = raw:gsub(":", "")
+    if colon_cnt == 1 and raw:find(":%d+$") then
+        raw = raw:gsub(":%d+$", "")
+    end
+    print(raw)
+    '
+}
+
+case "$1" in
+    add)
+        target="$(clean_input "$2")"
+        if [ -z "$target" ]; then
+            echo "ERROR:empty_target"
+            exit 1
+        fi
+
+        if grep -Fxq "$target" "$LIST_FILE" 2>/dev/null; then
+            echo "EXISTS:$target"
+            exit 0
+        fi
+
+        echo "$target" >> "$LIST_FILE"
+        sync_rules_to_yaml "$RUN_YAML"
+        sync_rules_to_yaml "$BAK_YAML"
+        reload_clash
+        echo "ADDED:$target"
+        ;;
+
+    del)
+        arg="$2"
+        if [ -z "$arg" ]; then
+            echo "ERROR:empty_arg"
+            exit 1
+        fi
+
+        # 判断是否为数字序号
+        if echo "$arg" | grep -Eq '^[0-9]+$'; then
+            total="$(grep -v '^[[:space:]]*$' "$LIST_FILE" 2>/dev/null | grep -vc '^#')"
+            [ -n "$total" ] || total=0
+            if [ "$arg" -lt 1 ] || [ "$arg" -gt "$total" ]; then
+                echo "ERROR:out_of_range"
+                exit 1
+            fi
+            # 找到对应行的内容
+            target="$(awk 'NF && !/^#/ {count++; if(count=='"$arg"') {print; exit}}' "$LIST_FILE")"
+            if [ -n "$target" ]; then
+                grep -Fxv "$target" "$LIST_FILE" > "${LIST_FILE}.tmp" && mv "${LIST_FILE}.tmp" "$LIST_FILE"
+                sync_rules_to_yaml "$RUN_YAML"
+                sync_rules_to_yaml "$BAK_YAML"
+                reload_clash
+                echo "DELETED:$target"
+            else
+                echo "ERROR:not_found"
+                exit 1
+            fi
+        else
+            target="$(clean_input "$arg")"
+            if grep -Fxq "$target" "$LIST_FILE" 2>/dev/null; then
+                grep -Fxv "$target" "$LIST_FILE" > "${LIST_FILE}.tmp" && mv "${LIST_FILE}.tmp" "$LIST_FILE"
+                sync_rules_to_yaml "$RUN_YAML"
+                sync_rules_to_yaml "$BAK_YAML"
+                reload_clash
+                echo "DELETED:$target"
+            else
+                echo "ERROR:not_found"
+                exit 1
+            fi
+        fi
+        ;;
+
+    list)
+        total="$(grep -v '^[[:space:]]*$' "$LIST_FILE" 2>/dev/null | grep -vc '^#')"
+        [ -n "$total" ] || total=0
+        if [ "$total" -eq 0 ]; then
+            echo "EMPTY"
+            exit 0
+        fi
+        awk 'NF && !/^#/ {count++; printf "%d|%s\n", count, $0}' "$LIST_FILE"
+        ;;
+
+    sync)
+        sync_rules_to_yaml "$RUN_YAML"
+        sync_rules_to_yaml "$BAK_YAML"
+        reload_clash
+        echo "SYNCED"
+        ;;
+
+    *)
+        echo "Usage: $0 {add <domain|ip> | del <target|index> | list | sync}"
+        exit 1
+        ;;
+esac

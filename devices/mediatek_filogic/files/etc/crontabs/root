@@ -1,0 +1,4 @@
+3 3 12 12 * /usr/bin/nginx-util 'check_ssl'
+* * * * * /usr/bin/tohsakawrt-temp-watch >/dev/null 2>&1
+* * * * * /usr/bin/tohsakawrt-service-watch >/dev/null 2>&1
+*/2 * * * * /usr/bin/tohsakawrt-modem-heal >/dev/null 2>&1

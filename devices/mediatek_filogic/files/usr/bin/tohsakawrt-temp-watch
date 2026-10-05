@@ -1,0 +1,75 @@
+#!/bin/sh
+
+TEMP_FILE="/sys/class/thermal/thermal_zone0/temp"
+
+WARN_TEMP=80
+CRITICAL_TEMP=90
+RECOVER_TEMP=75
+
+BARK_KEY="$(uci -q get tohsakawrt-tgbot.main.bark_key)"
+[ -n "$BARK_KEY" ] || BARK_KEY="42JwJVL6Zougn6wcFnoqtb"
+BARK_API="https://api.day.app/push"
+
+STATE_FILE="/tmp/tohsakawrt_temp_state"
+
+[ -r /usr/lib/tohsakawrt/common.sh ] && . /usr/lib/tohsakawrt/common.sh
+
+[ -r "$TEMP_FILE" ] || exit 0
+
+RAW_TEMP="$(cat "$TEMP_FILE" 2>/dev/null)"
+[ -n "$RAW_TEMP" ] || exit 0
+
+TEMP=$((RAW_TEMP / 1000))
+NOW="$(date '+%m-%d %H:%M')"
+
+STATE="$(cat "$STATE_FILE" 2>/dev/null)"
+[ -n "$STATE" ] || STATE="normal"
+
+if [ "$TEMP" -ge "$CRITICAL_TEMP" ]; then
+
+    if [ "$STATE" != "critical" ]; then
+
+        BODY="CPU 温度  ${TEMP}°C\n严重阈值  ${CRITICAL_TEMP}°C\n运行状态  高温运行\n\n建议尽快检查散热和设备负载\n${NOW}"
+
+        push_bark             "🚨 TohsakaWrt 高温警报"             "$BODY"             "critical"             "alarm"
+
+        send_tg "🚨 TohsakaWrt 高温警报\n\n${BODY}"
+
+        logger -t TohsakaWrt-Temp             "CRITICAL CPU temperature ${TEMP}C"
+
+        echo "critical" > "$STATE_FILE"
+    fi
+
+elif [ "$TEMP" -ge "$WARN_TEMP" ]; then
+
+    if [ "$STATE" = "normal" ]; then
+
+        BODY="CPU 温度  ${TEMP}°C\n预警阈值  ${WARN_TEMP}°C\n运行状态  温度偏高\n\n请留意设备通风与当前负载\n${NOW}"
+
+        push_bark             "🌡️ TohsakaWrt 温度预警"             "$BODY"             "timeSensitive"             "bell"
+
+        send_tg "🌡️ TohsakaWrt 温度预警\n\n${BODY}"
+
+        logger -t TohsakaWrt-Temp             "WARNING CPU temperature ${TEMP}C"
+
+        echo "warning" > "$STATE_FILE"
+    fi
+
+elif [ "$TEMP" -le "$RECOVER_TEMP" ]; then
+
+    if [ "$STATE" != "normal" ]; then
+
+        BODY="CPU 温度  ${TEMP}°C\n恢复阈值  ${RECOVER_TEMP}°C\n运行状态  已恢复正常\n\n设备温度已回落至安全范围\n${NOW}"
+
+        push_bark             "✅ TohsakaWrt 温度恢复"             "$BODY"             "active"             "glass"
+
+        send_tg "✅ TohsakaWrt 温度恢复\n\n${BODY}"
+
+        logger -t TohsakaWrt-Temp             "CPU temperature recovered to ${TEMP}C"
+
+        echo "normal" > "$STATE_FILE"
+    fi
+
+fi
+
+exit 0

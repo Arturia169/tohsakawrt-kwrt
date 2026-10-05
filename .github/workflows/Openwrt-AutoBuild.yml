@@ -47,18 +47,30 @@ jobs:
       - name: Fix repositories
         run: sed -i 's#file://www/wwwroot/dl.openwrt.ai#https://dl.openwrt.ai#' "$IB_NAME/repositories.conf"
 
-      - name: Rebrand to TohsakaWrt
+      - name: Build overlay (rebrand + custom files)
         run: |
-          mkdir -p /tmp/brand && cd /tmp/brand
+          set -euo pipefail
+          rm -rf /tmp/ov /tmp/brand
+          mkdir -p /tmp/ov /tmp/brand
+          # 1) 品牌：用 ImageBuilder 自带 base-files 包里的原版文件改名，版本号跟随上游不写死
+          cd /tmp/brand
           tar -xf "$GITHUB_WORKSPACE/$IB_NAME"/packages/base-files_*.ipk
           tar -xzf data.tar.gz ./etc/openwrt_release ./etc/banner
           sed -i 's/Kwrt/TohsakaWrt/g' etc/openwrt_release etc/banner
+          cp -a etc/. /tmp/ov/etc/
+          # 2) 仓库自定义文件覆盖（优先级更高：脚本、配置、crontab、banner）
+          files_dir="$GITHUB_WORKSPACE/devices/${{ inputs.target }}/files"
+          test -d "$files_dir"
+          cp -a "$files_dir/." /tmp/ov/
+          chmod +x /tmp/ov/usr/bin/* /tmp/ov/etc/init.d/* /tmp/ov/etc/hotplug.d/tty/* /tmp/ov/etc/uci-defaults/* 2>/dev/null || true
+          echo "=== overlay 内容 ==="
+          find /tmp/ov -type f | sort
 
       - name: Build image
         run: |
           cd "$IB_NAME"
           PKGS=$(grep -vE '^\s*(#|$)' "$GITHUB_WORKSPACE/devices/${{ inputs.target }}/packages.txt" | tr '\n' ' ')
-          make image PROFILE="$PROFILE" PACKAGES="$PKGS" FILES="/tmp/brand"
+          make image PROFILE="$PROFILE" PACKAGES="$PKGS" FILES="/tmp/ov"
 
       - name: Verify manifest
         run: |
@@ -85,6 +97,31 @@ jobs:
             exit 1
           fi
           echo "Manifest verification passed."
+
+      - name: Verify custom files in image
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq squashfs-tools
+          sysupgrade=$(find "$IB_NAME/bin/targets/mediatek/filogic" -maxdepth 1 -name '*sysupgrade.bin' -print -quit)
+          test -n "$sysupgrade"
+          rm -rf /tmp/chk && mkdir -p /tmp/chk && cd /tmp/chk
+          tar -xf "$GITHUB_WORKSPACE/$sysupgrade"
+          root="$(find . -maxdepth 2 -name root -type f -print -quit)"
+          test -n "$root"
+          unsquashfs -q -d rfs "$root" >/dev/null
+          missing=0
+          for f in \
+            usr/bin/tohsakawrt-tgbot usr/bin/tohsakawrt-service-watch usr/bin/tohsakawrt-temp-watch \
+            usr/bin/tohsakawrt-modem-heal usr/bin/tohsakawrt-uplink usr/bin/tohsaka-direct \
+            usr/lib/tohsakawrt/common.sh etc/init.d/tohsakawrt-tgbot \
+            etc/uci-defaults/99-tohsakawrt-setup etc/hotplug.d/tty/40-modem-heal \
+            etc/config/tohsakawrt-tgbot etc/crontabs/root ; do
+            if [ -x "rfs/$f" ] || [ -f "rfs/$f" ]; then echo "  ok  $f"; else echo "  MISSING  $f"; missing=1; fi
+          done
+          grep -q "TohsakaWrt" rfs/etc/openwrt_release && echo "  ok  brand=TohsakaWrt" || { echo "  MISSING brand"; missing=1; }
+          [ "$missing" -eq 0 ] || { echo "自定义文件未进镜像"; exit 1; }
+          echo "自定义文件校验通过。"
 
       - name: Collect firmware
         run: |

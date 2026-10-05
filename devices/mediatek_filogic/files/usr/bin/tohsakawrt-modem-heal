@@ -1,0 +1,115 @@
+#!/bin/sh
+
+AT_PORT="/dev/ttyUSB2"
+MM_INIT="/etc/init.d/modemmanager"
+UCI_NS="sms_manager"
+UCI_SEC="sms_manager.@sms_manager[0]"
+STATE_FILE="/tmp/tohsakawrt-modem-heal.restart"
+LOCK_DIR="/tmp/tohsakawrt-modem-heal.lock"
+WAIT_STEPS=30
+WAIT_INTERVAL=1
+RESTART_MIN_INTERVAL=120
+
+VERBOSE=0
+[ "${1:-}" = "--verbose" ] && VERBOSE=1
+
+[ -r /usr/lib/tohsakawrt/common.sh ] && . /usr/lib/tohsakawrt/common.sh
+
+say() {
+    [ "$VERBOSE" -eq 1 ] && printf '%s\n' "$*"
+    return 0
+}
+
+say "check AT port: $AT_PORT"
+[ -c "$AT_PORT" ] || exit 0
+
+MODEM_NET="$(uci -q get modem.modem0.network 2>/dev/null)"
+[ -n "$MODEM_NET" ] || MODEM_NET="usb0"
+ACTIVE_DEV="$(ip route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)"
+UPLINK_IS_MODEM=0
+[ -n "$ACTIVE_DEV" ] && [ "$MODEM_NET" = "$ACTIVE_DEV" ] && UPLINK_IS_MODEM=1
+say "modem network: $MODEM_NET; active uplink dev: ${ACTIVE_DEV:-<unknown>}; uplink_is_modem: $UPLINK_IS_MODEM"
+
+if [ "$VERBOSE" -eq 0 ]; then
+    mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+    trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT HUP INT TERM
+fi
+
+get_index() {
+    mmcli -L 2>/dev/null | awk '
+        match($0, /\/Modem\/[0-9]+/) {
+            print substr($0, RSTART + 7, RLENGTH - 7)
+            exit
+        }
+    '
+}
+
+INDEX="$(get_index)"
+say "mmcli -L index: ${INDEX:-<none>}"
+ACTIONS=""
+
+if [ -z "$INDEX" ]; then
+    NOW="$(date +%s 2>/dev/null)"
+    LAST="$(cat "$STATE_FILE" 2>/dev/null)"
+    RESTART=0
+    case "$NOW:$LAST" in
+        *[!0-9:]*|:*|*:) RESTART=1 ;;
+        *) [ "$((NOW - LAST))" -ge "$RESTART_MIN_INTERVAL" ] && RESTART=1 ;;
+    esac
+    say "restart timestamp: ${LAST:-<absent>}; now: ${NOW:-<unknown>}; eligible: $RESTART"
+    if [ "$RESTART" -eq 1 ]; then
+        if [ "$UPLINK_IS_MODEM" -eq 1 ]; then
+            logger -t tohsakawrt-modem-heal "skipped ModemManager restart: $MODEM_NET is the active uplink"
+        else
+            "$MM_INIT" restart >/dev/null 2>&1
+            printf '%s\n' "$NOW" > "$STATE_FILE" 2>/dev/null
+            ACTIONS="restarted ModemManager"
+        fi
+    fi
+    STEP=1
+    while [ -z "$INDEX" ] && [ "$STEP" -le "$WAIT_STEPS" ]; do
+        sleep "$WAIT_INTERVAL"
+        INDEX="$(get_index)"
+        say "poll $STEP/$WAIT_STEPS index: ${INDEX:-<none>}"
+        STEP=$((STEP + 1))
+    done
+    if [ -z "$INDEX" ]; then
+        [ "$VERBOSE" -eq 1 ] && say "no modem index found after polling"
+        logger -t tohsakawrt-modem-heal "No modem index found after ModemManager check"
+        exit 0
+    fi
+fi
+
+CANONICAL="/org/freedesktop/ModemManager1/Modem/$INDEX"
+say "canonical modem path: $CANONICAL"
+CONFIG_CHANGED=0
+for OPTION in readport sendport ussdport atport; do
+    VALUE="$(uci -q get "$UCI_SEC.$OPTION" 2>/dev/null)"
+    say "uci $UCI_SEC.$OPTION: ${VALUE:-<empty>}"
+    [ "$VALUE" = "$CANONICAL" ] || CONFIG_CHANGED=1
+done
+if [ "$CONFIG_CHANGED" -eq 1 ]; then
+    for OPTION in readport sendport ussdport atport; do
+        say "uci set $UCI_SEC.$OPTION=$CANONICAL"
+        uci set "$UCI_SEC.$OPTION=$CANONICAL" >/dev/null 2>&1
+    done
+    uci commit "$UCI_NS" >/dev/null 2>&1
+    ACTIONS="${ACTIONS:+$ACTIONS; }updated SMS port paths"
+fi
+
+MODEM_INFO="$(mmcli -m "$INDEX" 2>/dev/null)"
+MODEM_STATE="$(printf '%s\n' "$MODEM_INFO" | sed -n 's/.*state:[[:space:]]*\([[:alpha:]_][[:alpha:]_]*\)[[:space:]]*$/\1/p' | head -n 1)"
+say "mmcli -m $INDEX state: ${MODEM_STATE:-<unknown>}"
+if [ "$MODEM_STATE" = "disabled" ]; then
+    if [ "$UPLINK_IS_MODEM" -eq 1 ]; then
+        say "skipping enable: $MODEM_NET is the active uplink"
+    else
+        mmcli -m "$INDEX" --enable >/dev/null 2>&1
+        ACTIONS="${ACTIONS:+$ACTIONS; }enabled modem"
+    fi
+fi
+
+if [ -n "$ACTIONS" ]; then
+    logger -t tohsakawrt-modem-heal "Modem $INDEX: $ACTIONS"
+fi
+exit 0

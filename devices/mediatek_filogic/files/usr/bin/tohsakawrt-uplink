@@ -1,0 +1,77 @@
+#!/bin/sh
+# TohsakaWrt: 网络主力出口平滑切换工具 (WAN 宽带 eth0 <-> 5G 模组 usb0)
+
+[ -r /usr/lib/tohsakawrt/common.sh ] && . /usr/lib/tohsakawrt/common.sh
+
+get_active_dev() {
+    ip route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1
+}
+
+get_active_uplink() {
+    local dev="$(get_active_dev)"
+    case "$dev" in
+        usb0) echo "5g" ;;
+        eth0) echo "wan" ;;
+        *) echo "${dev:-unknown}" ;;
+    esac
+}
+
+switch_to_wan() {
+    local cur="$(get_active_uplink)"
+    if [ "$cur" = "wan" ]; then
+        echo "ALREADY_WAN"
+        return 0
+    fi
+
+    # 优先将 wan metric 调低 (优先级最高: 10)，5G metric 调高 (20)
+    uci set network.wan.metric=10 2>/dev/null
+    uci set network.5Ga.metric=20 2>/dev/null
+    uci commit network 2>/dev/null
+    ubus call network reload 2>/dev/null
+
+    logger -t TohsakaWrt-Uplink "Uplink switched to WAN (eth0)"
+    echo "SUCCESS_WAN"
+}
+
+switch_to_5g() {
+    local cur="$(get_active_uplink)"
+    if [ "$cur" = "5g" ]; then
+        echo "ALREADY_5G"
+        return 0
+    fi
+
+    # 检查 usb0 接口是否有 IP
+    local ip="$(ip -4 addr show usb0 2>/dev/null | awk '/inet / {print $2}')"
+    if [ -z "$ip" ]; then
+        echo "ERROR_5G_NO_IP"
+        return 1
+    fi
+
+    # 优先将 5G metric 调低 (优先级最高: 5)，wan metric 调高 (20)
+    uci set network.5Ga.metric=5 2>/dev/null
+    uci set network.wan.metric=20 2>/dev/null
+    uci commit network 2>/dev/null
+    ubus call network reload 2>/dev/null
+
+    logger -t TohsakaWrt-Uplink "Uplink switched to 5G (usb0)"
+    echo "SUCCESS_5G"
+}
+
+case "$1" in
+    status)
+        cur="$(get_active_uplink)"
+        dev="$(get_active_dev)"
+        echo "ACTIVE:${cur}|${dev}"
+        ;;
+    set)
+        case "$2" in
+            wan|eth0) switch_to_wan ;;
+            5g|usb0) switch_to_5g ;;
+            *) echo "Usage: $0 set {wan|5g}"; exit 1 ;;
+        esac
+        ;;
+    *)
+        echo "Usage: $0 {status | set wan | set 5g}"
+        exit 1
+        ;;
+esac

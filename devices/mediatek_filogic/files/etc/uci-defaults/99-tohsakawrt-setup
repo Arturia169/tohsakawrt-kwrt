@@ -1,0 +1,109 @@
+#!/bin/sh
+# Tohsaka OS first-boot initialization script
+
+# 1. System & Timezone
+uci set system.@system[0].hostname='TohsakaWrt'
+uci set system.@system[0].zonename='Asia/Shanghai'
+uci set system.@system[0].timezone='CST-8'
+uci -q delete system.ntp.server
+uci add_list system.ntp.server='ntp.aliyun.com'
+uci add_list system.ntp.server='ntp.tencent.com'
+uci add_list system.ntp.server='time.cloudflare.com'
+uci commit system
+
+if [ -f /etc/openwrt_release ]; then
+    sed -i 's/RyanWrt/TohsakaWrt/g' /etc/openwrt_release
+fi
+if [ -f /etc/banner ]; then
+    sed -i 's/RyanWrt/TohsakaWrt/g' /etc/banner
+fi
+if uci -q get dhcp.default_server >/dev/null 2>&1; then
+    uci set dhcp.default_server.name='tohsakawrt'
+    uci commit dhcp
+fi
+if uci -q get nginx.default_server >/dev/null 2>&1; then
+    uci set nginx.default_server.server_name='tohsakawrt'
+    uci commit nginx
+fi
+
+# 2. LAN Network
+uci set network.lan.ipaddr='192.168.100.1'
+uci commit network
+
+# 3. Wi-Fi Configuration (TR3000_5G & TR3000_2G)
+# MediaTek Filogic mt7981 wireless configuration
+if [ -f /etc/config/wireless ]; then
+    # Enable all radios
+    for radio in $(uci show wireless | grep -E '=wifi-device$' | cut -d'.' -f2 | cut -d'=' -f1); do
+        uci set wireless.${radio}.disabled='0'
+        uci set wireless.${radio}.country='CN'
+
+        band="$(uci -q get wireless.${radio}.band)"
+        htmode="$(uci -q get wireless.${radio}.htmode)"
+
+        # Check if 5GHz radio
+        if [ "$band" = "5g" ] || echo "$htmode" | grep -qE 'HE160|VHT160|HE80'; then
+            uci set wireless.${radio}.channel='auto'
+            uci set wireless.${radio}.htmode='HE160'
+            uci set wireless.${radio}.mu_beamformer='1'
+        fi
+    done
+
+    # Configure SSIDs and WPA2/WPA3 Key
+    for iface in $(uci show wireless | grep -E '=wifi-iface$' | cut -d'.' -f2 | cut -d'=' -f1); do
+        device="$(uci -q get wireless.${iface}.device)"
+        band="$(uci -q get wireless.${device}.band)"
+        htmode="$(uci -q get wireless.${device}.htmode)"
+
+        uci set wireless.${iface}.disabled='0'
+        uci set wireless.${iface}.encryption='psk2+ccmp'
+        uci set wireless.${iface}.key='Aa112211.'
+
+        if [ "$band" = "5g" ] || echo "$htmode" | grep -qE 'HE160|VHT160|HE80'; then
+            uci set wireless.${iface}.ssid='TR3000_5G'
+        else
+            uci set wireless.${iface}.ssid='TR3000_2G'
+        fi
+    done
+    uci commit wireless
+fi
+
+# 4. Local DNS Mapping
+grep -q "tohsaka.lan" /etc/hosts || echo "192.168.100.1 tohsaka.lan router.tohsaka.lan" >> /etc/hosts
+grep -q "n100.tohsaka.lan" /etc/hosts || echo "192.168.100.50 n100.tohsaka.lan" >> /etc/hosts
+
+# 5. Kernel & Conntrack Optimizations
+cat << 'EOF' > /etc/sysctl.d/99-tohsakawrt.conf
+net.netfilter.nf_conntrack_max=65535
+net.core.default_qdisc=fq_codel
+net.ipv4.tcp_congestion_control=bbr
+EOF
+sysctl -p /etc/sysctl.d/99-tohsakawrt.conf >/dev/null 2>&1
+
+# Keep destructive/automatic helpers and competing modem dialers inactive.
+for service in watchcat ramfree vlmcsd modemmanager quectel-cm modem; do
+    [ -x "/etc/init.d/$service" ] && "/etc/init.d/$service" disable
+done
+
+# SQM needs queue control. Turn off both software and hardware flow offload
+# only when an SQM queue is explicitly enabled.
+if uci -q show sqm 2>/dev/null | grep -Eq "\.enabled='1'$"; then
+    uci -q set firewall.@defaults[0].flow_offloading='0'
+    uci -q set firewall.@defaults[0].flow_offloading_hw='0'
+    uci commit firewall
+fi
+
+# 6. Ensure Permissions & Services
+chmod +x /usr/bin/tohsakawrt* /etc/init.d/tohsakawrt* 2>/dev/null
+[ -x /etc/init.d/tohsakawrt-tgbot ] && /etc/init.d/tohsakawrt-tgbot enable
+
+# 7. Crontab for Watchdogs
+mkdir -p /etc/crontabs
+if [ -f /etc/crontabs/root ]; then
+    grep -q "tohsakawrt-temp-watch" /etc/crontabs/root || echo "* * * * * /usr/bin/tohsakawrt-temp-watch >/dev/null 2>&1" >> /etc/crontabs/root
+    grep -q "tohsakawrt-service-watch" /etc/crontabs/root || echo "* * * * * /usr/bin/tohsakawrt-service-watch >/dev/null 2>&1" >> /etc/crontabs/root
+fi
+/etc/init.d/cron enable
+/etc/init.d/cron restart >/dev/null 2>&1
+
+exit 0
