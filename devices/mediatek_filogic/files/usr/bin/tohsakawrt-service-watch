@@ -1,7 +1,6 @@
 #!/bin/sh
 
 BARK_KEY="$(uci -q get tohsakawrt-tgbot.main.bark_key)"
-[ -n "$BARK_KEY" ] || BARK_KEY="42JwJVL6Zougn6wcFnoqtb"
 BARK_API="https://api.day.app/push"
 
 STATE_DIR="/tmp/tohsakawrt-watch"

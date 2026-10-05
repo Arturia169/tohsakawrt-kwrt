@@ -7,7 +7,6 @@ CRITICAL_TEMP=90
 RECOVER_TEMP=75
 
 BARK_KEY="$(uci -q get tohsakawrt-tgbot.main.bark_key)"
-[ -n "$BARK_KEY" ] || BARK_KEY="42JwJVL6Zougn6wcFnoqtb"
 BARK_API="https://api.day.app/push"
 
 STATE_FILE="/tmp/tohsakawrt_temp_state"
