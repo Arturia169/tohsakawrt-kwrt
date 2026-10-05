@@ -109,7 +109,7 @@ jobs:
           tar -xf "$GITHUB_WORKSPACE/$sysupgrade"
           root="$(find . -maxdepth 2 -name root -type f -print -quit)"
           test -n "$root"
-          unsquashfs -q -d rfs "$root" >/dev/null
+          unsquashfs -q -no-exit-code -d rfs "$root" >/dev/null
           missing=0
           for f in \
             usr/bin/tohsakawrt-tgbot usr/bin/tohsakawrt-service-watch usr/bin/tohsakawrt-temp-watch \
