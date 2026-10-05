@@ -404,6 +404,5 @@ xz
 xz-utils
 zlib
 zram-swap
-luci-app-sms-tool-js
 luci-app-sms-manager
 luci-i18n-sms-manager-zh-cn
