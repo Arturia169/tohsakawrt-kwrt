@@ -575,11 +575,25 @@ local function handle_callback(cb_id, msg_id, data_str)
     if data_str:find("^set_uplink:") then
         local target = data_str:gsub("^set_uplink:", "")
         local res = sys.switch_uplink(target)
-        local notice = (target == "wan") and "已切换为主力有线宽带" or "已切换为主力 5G 模组"
-        local desc = (target == "wan") and "🌐 <b>当前主力出口</b>：<code>有线光猫宽带 (eth0)</code>\n⚡ <b>状态</b>：平滑倒换完成，网络连接零中断。" or "📶 <b>当前主力出口</b>：<code>5G 蜂窝模组 (usb0)</code>\n⚡ <b>状态</b>：平滑倒换完成，已进入 5G 模组通道。"
-        if res == "ERROR_5G_NO_IP" then
+        local notice, desc
+        if res == "SUCCESS_WAN" then
+            notice = "已切换为主力有线宽带"
+            desc = "🌐 <b>当前主力出口</b>：<code>有线光猫宽带 (eth0)</code>\n⚡ <b>状态</b>：平滑倒换完成，网络连接零中断。"
+        elseif res == "SUCCESS_5G" then
+            notice = "已切换为主力 5G 模组"
+            desc = "📶 <b>当前主力出口</b>：<code>5G 蜂窝模组 (usb0)</code>\n⚡ <b>状态</b>：平滑倒换完成，已进入 5G 模组通道。"
+        elseif res == "ALREADY_WAN" then
+            notice = "当前已是主力有线出口，无需切换"
+            desc = "🌐 <b>当前主力出口</b>：<code>有线光猫宽带 (eth0)</code>\nℹ️ <b>状态</b>：当前已是该出口，无需切换。"
+        elseif res == "ALREADY_5G" then
+            notice = "当前已是主力 5G 模组，无需切换"
+            desc = "📶 <b>当前主力出口</b>：<code>5G 蜂窝模组 (usb0)</code>\nℹ️ <b>状态</b>：当前已是该出口，无需切换。"
+        elseif res == "ERROR_5G_NO_IP" then
             notice = "切换失败：5G 模组未获取到 IP"
             desc = "⚠️ <b>切换失败</b>：5G 模组 (usb0) 当前未获取到有效 IP，无法作为主力出口。"
+        else
+            notice = "切换失败：路由校验未通过，已回滚"
+            desc = "⚠️ <b>切换失败</b>：仍停留在原出口，请稍后重试。诊断返回值：<code>" .. tostring(res) .. "</code>"
         end
 
         tg.answer_callback(cb_id, notice)

@@ -93,6 +93,14 @@ if uci -q show sqm 2>/dev/null | grep -Eq "\.enabled='1'$"; then
     uci commit firewall
 fi
 
+# 4b. 5G 出口也纳入 wan 区域，让 masq/MSS 钳制对 usb0 生效
+if [ -f /etc/config/firewall ]; then
+    _z="$(uci show firewall 2>/dev/null | sed -n "s/^\(firewall\.@zone\[[0-9]*\]\)\.name='wan'$/\1/p" | head -n1)"
+    if [ -n "$_z" ]; then
+        uci -q get "$_z.network" | grep -qw 5Ga || { uci add_list "$_z.network=5Ga"; uci commit firewall; }
+    fi
+fi
+
 # 6. Ensure Permissions & Services
 chmod +x /usr/bin/tohsakawrt* /etc/init.d/tohsakawrt* 2>/dev/null
 [ -x /etc/init.d/tohsakawrt-tgbot ] && /etc/init.d/tohsakawrt-tgbot enable

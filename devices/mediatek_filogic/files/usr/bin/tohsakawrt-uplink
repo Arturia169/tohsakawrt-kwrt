@@ -16,6 +16,19 @@ get_active_uplink() {
     esac
 }
 
+normalize_metrics() {
+    local wan_metric="$(uci -q get network.wan.metric 2>/dev/null)"
+    local modem_metric="$(uci -q get network.5Ga.metric 2>/dev/null)"
+    if [ "$wan_metric" = "20" ] || [ "$modem_metric" = "5" ]; then
+        uci set network.wan.metric=10 2>/dev/null
+        uci set network.5Ga.metric=20 2>/dev/null
+    fi
+}
+
+get_gateway() {
+    ip route show default dev "$1" 2>/dev/null | sed -n 's/.* via \([^ ]*\).*/\1/p' | head -n 1
+}
+
 switch_to_wan() {
     local cur="$(get_active_uplink)"
     if [ "$cur" = "wan" ]; then
@@ -23,12 +36,20 @@ switch_to_wan() {
         return 0
     fi
 
-    # 优先将 wan metric 调低 (优先级最高: 10)，5G metric 调高 (20)
-    uci set network.wan.metric=10 2>/dev/null
-    uci set network.5Ga.metric=20 2>/dev/null
-    uci commit network 2>/dev/null
-    ubus call network reload 2>/dev/null
+    local usb_gw="$(get_gateway usb0)"
+    if [ -n "$usb_gw" ]; then
+        ip route del default via "$usb_gw" dev usb0 metric 1 2>/dev/null || true
+        ip route del default via "$usb_gw" dev usb0 metric 5 2>/dev/null || true
+    fi
+    local active="$(ip route get 8.8.8.8 2>/dev/null)"
+    local active_dev="$(printf '%s\n' "$active" | sed -n 's/.* dev \([^ ]*\).*/\1/p')"
+    if [ "$active_dev" != "eth0" ]; then
+        logger -t TohsakaWrt-Uplink "WAN route validation failed: ${active:-no route to 8.8.8.8}"
+        echo "ERROR_SWITCH_FAILED"
+        return 1
+    fi
 
+    normalize_metrics
     logger -t TohsakaWrt-Uplink "Uplink switched to WAN (eth0)"
     echo "SUCCESS_WAN"
 }
@@ -40,19 +61,33 @@ switch_to_5g() {
         return 0
     fi
 
-    # 检查 usb0 接口是否有 IP
-    local ip="$(ip -4 addr show usb0 2>/dev/null | awk '/inet / {print $2}')"
-    if [ -z "$ip" ]; then
-        echo "ERROR_5G_NO_IP"
+    local ip_addr="$(ip -4 addr show usb0 2>/dev/null | awk '/inet / {print $2}')"
+    local usb_gw="$(get_gateway usb0)"
+    if [ -z "$ip_addr" ] || [ -z "$usb_gw" ]; then
+        echo "ERROR_5G_NO_IP: 5G 接口 usb0 未获取到 IP 或网关"
         return 1
     fi
 
-    # 优先将 5G metric 调低 (优先级最高: 5)，wan metric 调高 (20)
-    uci set network.5Ga.metric=5 2>/dev/null
-    uci set network.wan.metric=20 2>/dev/null
-    uci commit network 2>/dev/null
-    ubus call network reload 2>/dev/null
+    local eth_gw="$(get_gateway eth0)"
+    if [ -n "$eth_gw" ]; then
+        ip route del default via "$eth_gw" dev eth0 metric 1 2>/dev/null || true
+    fi
+    ip route del default via "$usb_gw" dev usb0 metric 5 2>/dev/null || true
+    ip route replace default via "$usb_gw" dev usb0 metric 1 || {
+        echo "ERROR_SWITCH_FAILED: 添加 5G 优先路由失败"
+        return 1
+    }
 
+    local active="$(ip route get 8.8.8.8 2>/dev/null)"
+    local active_dev="$(printf '%s\n' "$active" | sed -n 's/.* dev \([^ ]*\).*/\1/p')"
+    if [ "$active_dev" != "usb0" ]; then
+        ip route del default via "$usb_gw" dev usb0 metric 1 2>/dev/null || true
+        logger -t TohsakaWrt-Uplink "5G route validation failed: ${active:-no route to 8.8.8.8}"
+        echo "ERROR_SWITCH_FAILED"
+        return 1
+    fi
+
+    normalize_metrics
     logger -t TohsakaWrt-Uplink "Uplink switched to 5G (usb0)"
     echo "SUCCESS_5G"
 }
@@ -70,8 +105,10 @@ case "$1" in
             *) echo "Usage: $0 set {wan|5g}"; exit 1 ;;
         esac
         ;;
+    wan|eth0) switch_to_wan ;;
+    5g|usb0) switch_to_5g ;;
     *)
-        echo "Usage: $0 {status | set wan | set 5g}"
+        echo "Usage: $0 {status | wan | 5g}"
         exit 1
         ;;
 esac
