@@ -1,0 +1,181 @@
+#!/bin/sh
+# TohsakaWrt 统一管理控制台 (Unified CLI Tool)
+# 支持子命令：uplink, direct, modem, temp, notify, status, watch
+
+if [ "$1" = "watch" ]; then
+    shift
+    exec /usr/bin/tohsakawrt-watch "$@"
+fi
+
+if [ -f /usr/lib/lua/tohsakawrt/cli.lua ]; then
+    exec lua /usr/lib/lua/tohsakawrt/cli.lua "$@"
+fi
+
+[ -r /usr/lib/tohsakawrt/common.sh ] && . /usr/lib/tohsakawrt/common.sh
+
+sub_uplink() {
+    if [ -x /usr/bin/tohsakawrt-uplink ]; then
+        /usr/bin/tohsakawrt-uplink "$@"
+    else
+        case "$1" in
+            status)
+                local cur="$(get_active_uplink)"
+                local dev="$(get_active_dev)"
+                echo "ACTIVE:${cur}|${dev}"
+                ;;
+            set)
+                case "$2" in
+                    wan|eth0)
+                        uci set network.wan.metric=10 2>/dev/null
+                        uci set network.5Ga.metric=20 2>/dev/null
+                        uci commit network 2>/dev/null
+                        ubus call network reload 2>/dev/null
+                        echo "SUCCESS_WAN"
+                        ;;
+                    5g|usb0)
+                        local ip="$(ip -4 addr show usb0 2>/dev/null | awk '/inet / {print $2}')"
+                        if [ -z "$ip" ]; then echo "ERROR_5G_NO_IP"; return 1; fi
+                        uci set network.5Ga.metric=5 2>/dev/null
+                        uci set network.wan.metric=20 2>/dev/null
+                        uci commit network 2>/dev/null
+                        ubus call network reload 2>/dev/null
+                        echo "SUCCESS_5G"
+                        ;;
+                    *) echo "Usage: tohsakawrt uplink set {wan|5g}"; return 1 ;;
+                esac
+                ;;
+            *)
+                echo "Usage: tohsakawrt uplink {status | set wan | set 5g}"
+                ;;
+        esac
+    fi
+}
+
+sub_direct() {
+    if [ -x /usr/bin/tohsaka-direct ]; then
+        /usr/bin/tohsaka-direct "$@"
+    else
+        echo "Error: tohsaka-direct not found"
+        return 1
+    fi
+}
+
+sub_modem() {
+    case "$1" in
+        heal)
+            shift
+            if [ -x /usr/bin/tohsakawrt-modem-heal ]; then
+                /usr/bin/tohsakawrt-modem-heal "$@"
+            fi
+            ;;
+        at)
+            shift
+            local cmd="$*"
+            if [ -z "$cmd" ]; then echo "Usage: tohsakawrt modem at <command>"; return 1; fi
+            sh /usr/share/modem/modem_at.sh /dev/ttyUSB2 "$cmd" 2>/dev/null
+            ;;
+        status|"")
+            local info="$(get_modem_cellular_info)"
+            local sim_ip="$(echo "$info" | cut -d'|' -f1)"
+            local oper="$(echo "$info" | cut -d'|' -f2)"
+            local band="$(echo "$info" | cut -d'|' -f3)"
+            local mode="$(echo "$info" | cut -d'|' -f4)"
+            echo "Modem: Quectel RM500Q-GL"
+            echo "Port: /dev/ttyUSB2"
+            echo "Operator: ${oper}"
+            echo "Band: ${band}"
+            echo "Mode: ${mode}"
+            echo "Cellular IP: ${sim_ip}"
+            ;;
+        *)
+            echo "Usage: tohsakawrt modem {status | heal | at <cmd>}"
+            ;;
+    esac
+}
+
+sub_temp() {
+    local temp="$(get_cpu_temp)"
+    echo "CPU Temperature: ${temp}"
+}
+
+sub_notify() {
+    local parse_mode=""
+    if [ "$1" = "-m" ]; then
+        parse_mode="$2"
+        shift 2
+    fi
+    local text="$*"
+    if [ -z "$text" ]; then
+        echo "Usage: tohsakawrt notify [-m HTML|Markdown] <text>"
+        return 1
+    fi
+    send_tg "$text" "$parse_mode"
+}
+
+sub_status() {
+    local active_uplink="$(get_active_uplink)"
+    local active_dev="$(get_active_dev)"
+    local temp="$(get_cpu_temp)"
+    local pub_ip="$(get_wan_public_ip)"
+    local wan_ip="$(ip -4 addr show eth0 2>/dev/null | awk '/inet / {print $2}')"
+    local usb_ip="$(ip -4 addr show usb0 2>/dev/null | awk '/inet / {print $2}')"
+    local modem_info="$(get_modem_cellular_info)"
+
+    echo "=========================================="
+    echo "       TohsakaWrt 智能网关系统状态        "
+    echo "=========================================="
+    echo "主力上网出口 : ${active_uplink} (${active_dev})"
+    echo "CPU 实时温度 : ${temp}"
+    echo "外网公网出口 : ${pub_ip}"
+    echo "有线宽带 IP  : ${wan_ip:-未连接}"
+    echo "5G 模组 IP   : ${usb_ip:-未连接}"
+    echo "5G 蜂窝制式  : $(echo "$modem_info" | cut -d'|' -f2) ($(echo "$modem_info" | cut -d'|' -f3))"
+    echo "=========================================="
+}
+
+sub_watch() {
+    case "$1" in
+        temp)
+            shift
+            [ -x /usr/bin/tohsakawrt-temp-watch ] && /usr/bin/tohsakawrt-temp-watch "$@"
+            ;;
+        service)
+            shift
+            [ -x /usr/bin/tohsakawrt-service-watch ] && /usr/bin/tohsakawrt-service-watch "$@"
+            ;;
+        heal)
+            shift
+            [ -x /usr/bin/tohsakawrt-modem-heal ] && /usr/bin/tohsakawrt-modem-heal "$@"
+            ;;
+        all|"")
+            [ -x /usr/bin/tohsakawrt-temp-watch ] && /usr/bin/tohsakawrt-temp-watch >/dev/null 2>&1
+            [ -x /usr/bin/tohsakawrt-service-watch ] && /usr/bin/tohsakawrt-service-watch >/dev/null 2>&1
+            [ -x /usr/bin/tohsakawrt-modem-heal ] && /usr/bin/tohsakawrt-modem-heal >/dev/null 2>&1
+            ;;
+    esac
+}
+
+case "$1" in
+    uplink) shift; sub_uplink "$@" ;;
+    direct) shift; sub_direct "$@" ;;
+    modem) shift; sub_modem "$@" ;;
+    temp) shift; sub_temp "$@" ;;
+    notify) shift; sub_notify "$@" ;;
+    status) shift; sub_status "$@" ;;
+    watch) shift; sub_watch "$@" ;;
+    *)
+        echo "TohsakaWrt 统一管理控制台"
+        echo "用法: $0 <command> [arguments...]"
+        echo ""
+        echo "可用命令："
+        echo "  uplink   [status | set wan | set 5g]   主力上网出口平滑倒换"
+        echo "  direct   [add | del | list | sync]     OpenClash 直连白名单管理"
+        echo "  modem    [status | heal | at <cmd>]    5G 蜂窝模组状态与自愈"
+        echo "  temp     [status]                      CPU 温度查询"
+        echo "  notify   [-m parse_mode] <text>        向 Telegram 发送通知"
+        echo "  status                                 查看系统综合看板"
+        echo "  watch    [all | temp | service | heal] 执行周期巡检看门狗"
+        echo ""
+        exit 0
+        ;;
+esac

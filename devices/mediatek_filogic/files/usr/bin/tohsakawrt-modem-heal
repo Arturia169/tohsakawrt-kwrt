@@ -112,4 +112,80 @@ fi
 if [ -n "$ACTIONS" ]; then
     logger -t tohsakawrt-modem-heal "Modem $INDEX: $ACTIONS"
 fi
+
+heal_cellular_data() {
+    local dev="usb0"
+    [ -d "/sys/class/net/$dev" ] || return 0
+
+    local now="$(date +%s 2>/dev/null)"
+    local fail_count_file="/tmp/tohsakawrt-5g-data.fails"
+    local last_heal_file="/tmp/tohsakawrt-5g-data.lastheal"
+    local ip="$(ip -4 addr show "$dev" 2>/dev/null | awk '/inet / {print $2}')"
+
+    # 1. 检查 IP：如果 usb0 丢失 IP，执行第一阶自愈：重新触发 DHCP
+    if [ -z "$ip" ]; then
+        say "5G $dev has no IP, triggering ifup 5Ga"
+        logger -t tohsakawrt-modem-heal "5G data heal: $dev lost IP, restarting interface 5Ga"
+        ifup 5Ga 2>/dev/null
+        return 0
+    fi
+
+    # 2. 独立链路心跳探测：绑定 usb0 网卡探测阿里 DNS (223.5.5.5) 或腾讯 DNS (119.29.29.29)
+    # 此探测完全走 usb0，不影响主宽带流量，同时能防运营商 PDP 空闲断链
+    local ping_ok=0
+    if ping -c 1 -W 2 -I "$dev" 223.5.5.5 >/dev/null 2>&1 || ping -c 1 -W 2 -I "$dev" 119.29.29.29 >/dev/null 2>&1; then
+        ping_ok=1
+    fi
+
+    if [ "$ping_ok" -eq 1 ]; then
+        # 探测成功，重置失败计数
+        rm -f "$fail_count_file" 2>/dev/null
+        say "5G data keepalive ping OK"
+        return 0
+    fi
+
+    # 3. 探测失败：记录失败计数，执行阶梯式自愈
+    local fails="$(cat "$fail_count_file" 2>/dev/null)"
+    fails=$(( ${fails:-0} + 1 ))
+    echo "$fails" > "$fail_count_file"
+    say "5G data ping failed (count: $fails)"
+
+    local last_heal="$(cat "$last_heal_file" 2>/dev/null)"
+    local heal_interval=$((now - ${last_heal:-0}))
+    # 自愈动作防抖：至少间隔 60 秒
+    if [ "$heal_interval" -lt 60 ]; then
+        say "heal throttled (last heal was ${heal_interval}s ago)"
+        return 0
+    fi
+
+    echo "$now" > "$last_heal_file"
+
+    if [ "$fails" -eq 1 ]; then
+        logger -t tohsakawrt-modem-heal "5G data heal (Stage 1): ping timeout, triggering ifup 5Ga"
+        ifup 5Ga 2>/dev/null
+    elif [ "$fails" -eq 2 ]; then
+        logger -t tohsakawrt-modem-heal "5G data heal (Stage 2): sending AT+QNETDEVCTL=1,1,1"
+        if [ -x /usr/share/modem/modem_at.sh ] && [ -e "$AT_PORT" ]; then
+            sh /usr/share/modem/modem_at.sh "$AT_PORT" 'AT+QNETDEVCTL=1,1,1' >/dev/null 2>&1
+            sleep 2
+            ifup 5Ga 2>/dev/null
+        fi
+    elif [ "$fails" -ge 3 ]; then
+        logger -t tohsakawrt-modem-heal "5G data heal (Stage 3): resetting cellular RF via AT+CFUN=0/1"
+        if [ -x /usr/share/modem/modem_at.sh ] && [ -e "$AT_PORT" ]; then
+            sh /usr/share/modem/modem_at.sh "$AT_PORT" 'AT+CFUN=0' >/dev/null 2>&1
+            sleep 2
+            sh /usr/share/modem/modem_at.sh "$AT_PORT" 'AT+CFUN=1' >/dev/null 2>&1
+            sleep 3
+            ifup 5Ga 2>/dev/null
+        fi
+        if command -v send_tg >/dev/null 2>&1; then
+            send_tg "⚠️ <b>5G 热备链路脱网告警</b>\n\n检测到 5G 模组连续 3 次数据探测超时，已执行射频重注网自愈，请留意模组连接状态。" "HTML"
+        fi
+    fi
+}
+
+heal_cellular_data
+
 exit 0
+

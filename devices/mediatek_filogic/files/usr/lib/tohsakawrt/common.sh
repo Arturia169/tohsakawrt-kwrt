@@ -96,3 +96,75 @@ send_tg() {
             >/dev/null 2>&1
     fi
 }
+
+html_escape() {
+    sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
+get_cpu_temp() {
+    if [ -r /sys/class/thermal/thermal_zone0/temp ]; then
+        awk '{printf "%.1f°C", $1/1000}' /sys/class/thermal/thermal_zone0/temp
+    else
+        echo "未知"
+    fi
+}
+
+get_active_dev() {
+    ip route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1
+}
+
+get_active_uplink() {
+    local dev="$(get_active_dev)"
+    case "$dev" in
+        usb0) echo "5g" ;;
+        eth0) echo "wan" ;;
+        *) echo "${dev:-unknown}" ;;
+    esac
+}
+
+get_modem_cellular_info() {
+    local at_port="${1:-/dev/ttyUSB2}"
+    local modem_at="${2:-/usr/share/modem/modem_at.sh}"
+    if [ ! -e "$at_port" ] || [ ! -x "$modem_at" ]; then
+        echo "|||未检测到模组"
+        return
+    fi
+
+    local cgpaddr qnwinfo
+    if command -v timeout >/dev/null 2>&1; then
+        cgpaddr="$(timeout 3 sh "$modem_at" "$at_port" 'AT+CGPADDR=1' 2>/dev/null | tr -d '\r' | grep '+CGPADDR:' | head -n 1)"
+        qnwinfo="$(timeout 3 sh "$modem_at" "$at_port" 'AT+QNWINFO' 2>/dev/null | tr -d '\r' | grep '+QNWINFO:' | head -n 1)"
+    else
+        cgpaddr="$(sh "$modem_at" "$at_port" 'AT+CGPADDR=1' 2>/dev/null | tr -d '\r' | grep '+CGPADDR:' | head -n 1)"
+        qnwinfo="$(sh "$modem_at" "$at_port" 'AT+QNWINFO' 2>/dev/null | tr -d '\r' | grep '+QNWINFO:' | head -n 1)"
+    fi
+
+    local sim_ip="$(printf '%s\n' "$cgpaddr" | awk -F'"' '{print $2}' | awk -F',' '{print $1}')"
+    local plmn="$(printf '%s\n' "$qnwinfo" | awk -F'"' '{print $4}')"
+    local band="$(printf '%s\n' "$qnwinfo" | awk -F'"' '{print $6}')"
+    local mode="$(printf '%s\n' "$qnwinfo" | awk -F'"' '{print $2}')"
+
+    local oper
+    case "$plmn" in
+        46001|46006|46009) oper="中国联通" ;;
+        46000|46002|46004|46007|46008) oper="中国移动" ;;
+        46003|46005|46011|46012) oper="中国电信" ;;
+        46015) oper="中国广电" ;;
+        *) oper="${plmn:-未知运营商}" ;;
+    esac
+
+    echo "${sim_ip:-未获取}|${oper}|${band:-未知频段}|${mode:-未知}"
+}
+
+get_wan_public_ip() {
+    local ipip
+    ipip="$(curl -s -m 2 http://myip.ipip.net 2>/dev/null)"
+    if [ -n "$ipip" ]; then
+        local ip="$(echo "$ipip" | awk '{print $2}' | sed 's/当前//; s/IP：//')"
+        local loc="$(echo "$ipip" | sed -n 's/.*来自于：//p')"
+        echo "${ip:-未知} (${loc:-未知})"
+    else
+        echo "未获取到"
+    fi
+}
+
