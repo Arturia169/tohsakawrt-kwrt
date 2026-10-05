@@ -124,6 +124,14 @@ jobs:
           tag_name: TohsakaWrt-${{ env.BUILD_DATE }}-${{ env.PROFILE }}
           body_path: release.txt
 
+      - name: Notify on failure
+        if: failure() && env.TELEGRAM_TOKEN != ''
+        continue-on-error: true
+        run: |
+          curl -k --data chat_id="$TELEGRAM_CHAT_ID" \
+            --data "text=❌ TohsakaWrt ${KWRT_REL} ${PROFILE} 构建失败 | 运行链接：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" >/dev/null 2>&1
+
       - name: Telegram notification
         if: env.TELEGRAM_TOKEN
         continue-on-error: true
