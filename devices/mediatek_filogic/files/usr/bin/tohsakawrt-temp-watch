@@ -13,10 +13,6 @@ STATE_FILE="/tmp/tohsakawrt_temp_state"
 
 [ -r /usr/lib/tohsakawrt/common.sh ] && . /usr/lib/tohsakawrt/common.sh
 
-html_escape() {
-    printf '%s' "$1" | sed 's/\&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
-}
-
 [ -r "$TEMP_FILE" ] || exit 0
 
 RAW_TEMP="$(cat "$TEMP_FILE" 2>/dev/null)"

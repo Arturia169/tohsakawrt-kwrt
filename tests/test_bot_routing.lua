@@ -35,7 +35,7 @@ local function route_message(text)
                 updates = updates + 1
                 if updates == 1 then return { result = {} } end
                 if updates == 2 then
-                    return { result = { { update_id = 2, message = { chat = { id = configured_chat_id }, text = text } } } }
+                    return { result = { { update_id = 2, message = { chat = { id = configured_chat_id, type = "private" }, from = { id = configured_chat_id }, text = text } } } }
                 end
                 error("__TEST_STOP__")
             end,

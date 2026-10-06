@@ -559,8 +559,9 @@ quectel_sim_info()
 	imsi=$(sh ${SCRIPT_DIR}/modem_at.sh $at_port $at_command | sed -n '2p' | sed 's/\r//g')
 
     #ICCID（集成电路卡识别码）
-    at_command="AT+ICCID"
-	# iccid=$(sh ${SCRIPT_DIR}/modem_at.sh $at_port $at_command | grep -o "+ICCID:[ ]*[-0-9]\+" | grep -o "[-0-9]\{1,4\}")
+    # P0 fix: ICCID 解析恢复。Quectel 用 AT+QCCID（AT+ICCID 通常不支持）。
+    iccid=$(AT_TIMEOUT=3 sh ${SCRIPT_DIR}/modem_at.sh $at_port 'AT+QCCID' 2>/dev/null | tr -d '\r' | sed -n 's/.*+QCCID:[[:space:]]*//p' | tail -n 1 | tr -cd '0-9A-F')
+    [ -n "$iccid" ] || iccid=$(AT_TIMEOUT=3 sh ${SCRIPT_DIR}/modem_at.sh $at_port 'AT+CCID' 2>/dev/null | tr -d '\r' | sed -n 's/.*+CCID:[[:space:]]*//p' | tail -n 1 | tr -cd '0-9A-F')
 }
 
 #获取网络类型

@@ -1,2 +1,3 @@
 3 3 12 12 * /usr/bin/nginx-util check_ssl
 * * * * * /usr/bin/tohsakawrt-watch >/dev/null 2>&1
+0 0 * * * /usr/bin/tohsakawrt-flowcard-daily >/dev/null 2>&1

@@ -1,6 +1,7 @@
-package.path = "devices/mediatek_filogic/files/usr/lib/lua/?.lua;devices/mediatek_filogic/files/usr/lib/lua/?/init.lua;files/usr/lib/lua/?.lua;files/usr/lib/lua/?/init.lua;" .. package.path
+package.path = "devices/mediatek_filogic/files/usr/lib/lua/?.lua;devices/mediatek_filogic/files/usr/lib/lua/?/init.lua;files/usr/lib/lua/?.lua;files/usr/lib/lua/?/init.lua;/usr/lib/lua/?.lua;/usr/lib/lua/?/init.lua;" .. package.path
 
 local configured_chat_id = "123456"
+local configured_user_id = ""
 local update_response
 local update_calls
 local sent_messages
@@ -23,6 +24,7 @@ local function install_bot_stubs()
                 if option == "enabled" then return "1" end
                 if option == "token" then return "test-token" end
                 if option == "chat_id" then return configured_chat_id end
+                if option == "user_id" then return configured_user_id end
                 return default
             end,
             get_state = function(_, default) return default end,
@@ -50,13 +52,19 @@ local function install_bot_stubs()
     package.preload["tohsakawrt.esim"] = function() return {} end
 end
 
-local function run_with_message(source_chat_id)
+-- opts.chat_type 默认 private；opts.from_id 默认等于 chat id（私聊语义）
+local function run_with_message(source_chat_id, opts)
+    opts = opts or {}
     install_bot_stubs()
     update_response = {
         result = {
             {
                 update_id = 1,
-                message = { chat = { id = source_chat_id }, text = "/help" }
+                message = {
+                    chat = { id = source_chat_id, type = opts.chat_type or "private" },
+                    from = { id = opts.from_id or source_chat_id },
+                    text = "/help"
+                }
             }
         }
     }
@@ -78,6 +86,32 @@ assert(chat_actions == 1, "authorized message must be dispatched")
 assert(sent_messages == 1, "authorized /help command must send its response")
 assert(state_writes == 1, "authorized message must update the polling offset")
 
+-- 新增断言：user_id 白名单（配置后按发送者身份严格校验）
+configured_user_id = "555000"
+run_with_message(configured_chat_id, { from_id = "999000" })
+assert(sent_messages == 0, "配置 user_id 后，发送者不匹配必须拒绝")
+assert(chat_actions == 0, "被拒绝的发送者不得触发任何动作")
+
+configured_user_id = "555000"
+run_with_message(configured_chat_id, { from_id = "555000" })
+assert(chat_actions == 1, "配置 user_id 且发送者匹配必须放行")
+assert(sent_messages == 1, "放行后 /help 必须正常回复")
+
+-- 新增断言：未配置 user_id 时，群聊必须拒绝（防任意群成员控制路由器）
+configured_user_id = ""
+run_with_message(configured_chat_id, { chat_type = "supergroup", from_id = "777000" })
+assert(sent_messages == 0, "群聊且未配置 user_id 必须拒绝")
+
+-- 新增断言：群聊配置了 user_id 且匹配则放行（保留群聊可用性）
+configured_user_id = "777000"
+run_with_message(configured_chat_id, { chat_type = "supergroup", from_id = "777000" })
+assert(chat_actions == 1, "群聊配置 user_id 且匹配必须放行")
+
+-- 新增断言：私聊但 from.id 与 chat.id 不一致（异常构造）必须拒绝
+configured_user_id = ""
+run_with_message(configured_chat_id, { chat_type = "private", from_id = "424242" })
+assert(sent_messages == 0, "私聊下发送者与 chat 不一致必须拒绝")
+
 local captured_command
 local original_execute = os.execute
 os.execute = function(command) captured_command = command end
@@ -91,4 +125,4 @@ os.execute = original_execute
 assert(captured_command == "logger -t 'Tohsaka-Bot' 'Command: $(reboot) `id` '\\'' \"   '",
     "log command must exactly quote shell metacharacters and normalize control whitespace")
 
-print("PASS: bot rejects unauthorized chats, dispatches the configured chat, and safely quotes logs")
+print("PASS: bot rejects unauthorized chats/senders, dispatches the configured chat, and safely quotes logs")

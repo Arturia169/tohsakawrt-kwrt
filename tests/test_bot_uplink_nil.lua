@@ -20,8 +20,8 @@ package.preload["tohsakawrt.tg"] = function()
             update_calls = update_calls + 1
             if update_calls == 1 then return { result = {} } end
             if update_calls == 2 then return { result = {
-                { update_id = 1, message = { chat = { id = 77 }, text = "/status" } },
-                { update_id = 2, message = { chat = { id = 77 }, text = "/uplink" } }
+                { update_id = 1, message = { chat = { id = 77, type = "private" }, from = { id = 77 }, text = "/status" } },
+                { update_id = 2, message = { chat = { id = 77, type = "private" }, from = { id = 77 }, text = "/uplink" } }
             } } end
             error("__TEST_STOP__")
         end,

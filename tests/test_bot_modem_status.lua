@@ -22,7 +22,7 @@ package.preload["tohsakawrt.tg"] = function()
             calls = calls + 1
             if calls == 1 then return { result = {} } end
             if calls == 2 then
-                return { result = { { update_id = 1, message = { chat = { id = configured_chat_id }, text = "/modem" } } } }
+                return { result = { { update_id = 1, message = { chat = { id = configured_chat_id, type = "private" }, from = { id = configured_chat_id }, text = "/modem" } } } }
             end
             error("__TEST_STOP__")
         end,

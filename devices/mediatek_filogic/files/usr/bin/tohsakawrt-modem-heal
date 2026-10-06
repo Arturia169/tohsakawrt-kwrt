@@ -172,15 +172,28 @@ heal_cellular_data() {
     local last_heal_file="$STATE_DIR/tohsakawrt-5g-data.lastheal"
     local active_alert_file="$STATE_DIR/tohsakawrt-5g-data.active-alert"
     local nodata_mode_file="$STATE_DIR/tohsakawrt-5g-data.nodata-mode"
+    local last_iccid_file="$STATE_DIR/tohsakawrt-5g-data.last-iccid"
 
     local iccid=""
     local at_reply=""
     if [ -x "$AT_SCRIPT" ] && [ -e "$AT_PORT" ]; then
-        at_reply="$(sh "$AT_SCRIPT" "$AT_PORT" 'AT+QCCID' 2>/dev/null)"
-        iccid="$(printf '%s\n' "$at_reply" | sed -n '/QCCID:/s/.*QCCID:[[:space:]]*//p' | tail -n 1 | tr -d '\"[:space:]' | tr '[:lower:]' '[:upper:]' | tr -cd '0-9A-F')"
-        if [ -z "$iccid" ] || printf '%s' "$at_reply" | grep -qi 'ERROR'; then
-            at_reply="$(sh "$AT_SCRIPT" "$AT_PORT" 'AT+CCID' 2>/dev/null)"
-            iccid="$(printf '%s\n' "$at_reply" | sed -n '/CCID:/s/.*CCID:[[:space:]]*//p' | tail -n 1 | tr -d '\"[:space:]' | tr '[:lower:]' '[:upper:]' | tr -cd '0-9A-F')"
+        local try=0
+        while [ "$try" -lt 2 ]; do
+            try=$((try + 1))
+            at_reply="$(AT_TIMEOUT=3 sh "$AT_SCRIPT" "$AT_PORT" 'AT+QCCID' 2>/dev/null)"
+            iccid="$(printf '%s\n' "$at_reply" | sed -n '/QCCID:/s/.*QCCID:[[:space:]]*//p' | tail -n 1 | tr -d '\"[:space:]' | tr '[:lower:]' '[:upper:]' | tr -cd '0-9A-F')"
+            if [ -z "$iccid" ] || printf '%s' "$at_reply" | grep -qi 'ERROR'; then
+                at_reply="$(AT_TIMEOUT=3 sh "$AT_SCRIPT" "$AT_PORT" 'AT+CCID' 2>/dev/null)"
+                iccid="$(printf '%s\n' "$at_reply" | sed -n '/CCID:/s/.*CCID:[[:space:]]*//p' | tail -n 1 | tr -d '\"[:space:]' | tr '[:lower:]' '[:upper:]' | tr -cd '0-9A-F')"
+            fi
+            if [ -n "$iccid" ]; then break; fi
+            sleep 1
+        done
+        if [ -n "$iccid" ]; then
+            printf '%s\n' "$iccid" > "$last_iccid_file" 2>/dev/null
+        else
+            iccid="$(cat "$last_iccid_file" 2>/dev/null | tr -cd '0-9A-F')"
+            [ -z "$iccid" ] || logger -t tohsakawrt-modem-heal "ICCID 实时读取失败，沿用上次成功值"
         fi
     fi
 

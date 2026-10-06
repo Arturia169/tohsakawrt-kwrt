@@ -245,66 +245,31 @@ function M.proxy_outbound_ip(force)
 end
 
 function M.switch_uplink(target)
-    local cur = M.uplink_status().type
+    -- 出口切换只保留一份实现：shell 脚本 /usr/bin/tohsakawrt-uplink
+    -- （该脚本已被 tests/test_uplink_switch.sh 覆盖，含失败回滚断言）
+    local arg
     if target == "wan" or target == "eth0" then
-        if cur == "wan" then return "ALREADY_WAN" end
-        local usb_route = core.exec_line("ip route show default dev usb0 2>/dev/null")
-        local usb_gw = usb_route:match("via%s+([^%s]+)")
-        if usb_gw then
-            core.exec("ip route del default via " .. usb_gw .. " dev usb0 metric 1 2>/dev/null")
-            core.exec("ip route del default via " .. usb_gw .. " dev usb0 metric 5 2>/dev/null")
-        end
-        local active = core.exec_line("ip route get 8.8.8.8 2>/dev/null")
-        if active:match("dev%s+([^%s]+)") ~= "eth0" then
-            core.log("TohsakaWrt-Uplink", "Failed to switch to WAN: " .. (active ~= "" and active or "no route to 8.8.8.8"))
-            return "ERROR_SWITCH_FAILED"
-        end
-        local wan_metric = core.get_uci("network", "wan", "metric", "10")
-        local modem_metric = core.get_uci("network", "5Ga", "metric", "20")
-        if wan_metric == "20" or modem_metric == "5" then
-            core.set_uci("network", "wan", "metric", "10")
-            core.set_uci("network", "5Ga", "metric", "20")
-        end
-        core.set_cached_state("cache_pub_ip", "")
-        core.log("TohsakaWrt-Uplink", "Uplink switched to WAN (eth0)")
-        return "SUCCESS_WAN"
+        arg = "wan"
     elseif target == "5g" or target == "usb0" then
-        if cur == "5g" then return "ALREADY_5G" end
-        local ip = M.usb0_ip()
-        if ip == "未获取到 IP" or ip == "" then
-            return "ERROR_5G_NO_IP"
-        end
-        local usb_route = core.exec_line("ip route show default dev usb0 2>/dev/null")
-        local usb_gw = usb_route:match("via%s+([^%s]+)")
-        if not usb_gw then
-            return "ERROR_5G_NO_IP"
-        end
-        local eth_route = core.exec_line("ip route show default dev eth0 2>/dev/null")
-        local eth_gw = eth_route:match("via%s+([^%s]+)")
-        if eth_gw then
-            core.exec("ip route del default via " .. eth_gw .. " dev eth0 metric 1 2>/dev/null")
-        end
-        core.exec("ip route del default via " .. usb_gw .. " dev usb0 metric 5 2>/dev/null")
-        core.exec("ip route replace default via " .. usb_gw .. " dev usb0 metric 1")
-        local active = core.exec_line("ip route get 8.8.8.8 2>/dev/null")
-        if active:match("dev%s+([^%s]+)") ~= "usb0" then
-            core.exec("ip route del default via " .. usb_gw .. " dev usb0 metric 1 2>/dev/null")
-            core.log("TohsakaWrt-Uplink", "Failed to switch to 5G: " .. (active ~= "" and active or "no route to 8.8.8.8"))
-            return "ERROR_SWITCH_FAILED"
-        end
-        local wan_metric = core.get_uci("network", "wan", "metric", "10")
-        local modem_metric = core.get_uci("network", "5Ga", "metric", "20")
-        if wan_metric == "20" or modem_metric == "5" then
-            core.set_uci("network", "wan", "metric", "10")
-            core.set_uci("network", "5Ga", "metric", "20")
-        end
-        core.set_cached_state("cache_pub_ip", "")
-        core.log("TohsakaWrt-Uplink", "Uplink switched to 5G (usb0)")
-        return "SUCCESS_5G"
+        arg = "5g"
     else
         return "INVALID_TARGET"
     end
+
+    local raw = core.exec_line("/usr/bin/tohsakawrt-uplink " .. arg .. " 2>/dev/null") or ""
+    raw = raw:gsub("%s+$", "")
+    local code = raw:match("^([A-Z0-9_]+)")
+    local res = code or raw
+    if res == "" then
+        core.log("TohsakaWrt-Uplink", "uplink script returned nothing for " .. arg)
+        res = "ERROR_SWITCH_FAILED"
+    end
+    if res == "SUCCESS_WAN" or res == "SUCCESS_5G" then
+        core.set_cached_state("cache_pub_ip", "")
+    end
+    return res
 end
+
 
 function M.wan_speed(dev)
     dev = dev or "eth0"
@@ -412,7 +377,7 @@ function M.http_metric(url)
 end
 
 function M.storage_info()
-    local storage = core.exec("df -h 2>/dev/null | grep -E '(/overlay$| /$| /tmp$|/mnt/)'")
+    local storage = core.exec("df -h 2>/dev/null | grep -E '(/overlay$| /$| /tmp$|/mnt/|/opt$)'")
     local block = core.exec("block info 2>/dev/null")
     return storage, block
 end

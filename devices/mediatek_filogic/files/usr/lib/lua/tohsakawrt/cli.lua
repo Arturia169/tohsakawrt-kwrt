@@ -79,8 +79,13 @@ function M.modem(args)
         local out = modem.at(cmd)
         if out then io.write(out) end
     elseif sub == "heal" then
-        local res = modem.keepalive_and_heal()
-        print("Heal status: " .. res)
+        -- 模组自愈只保留一份实现：shell 脚本 /usr/bin/tohsakawrt-modem-heal
+        local out = core.exec("/usr/bin/tohsakawrt-modem-heal 2>&1")
+        if out and out ~= "" then
+            io.write(out)
+        else
+            print("Modem heal 已执行（详情：logread -t tohsakawrt-modem-heal）")
+        end
     else
         print("Usage: tohsakawrt modem {status | sms [N] | heal | at <cmd>}")
     end

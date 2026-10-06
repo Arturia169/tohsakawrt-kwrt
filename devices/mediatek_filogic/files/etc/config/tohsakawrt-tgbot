@@ -1,8 +1,9 @@
 # 凭据不入库：真实值仅存在于设备 uci（tohsakawrt-tgbot.main.*）
-# 干净刷机后需在设备上重新填入 token/chat_id 并置 enabled=1
+# 干净刷机后需在设备上重新填入 token/chat_id/user_id 并置 enabled=1
 config bot 'main'
         option enabled '0'
         option token ''
         option chat_id ''
+        option user_id ''
         option bark_key ''
 

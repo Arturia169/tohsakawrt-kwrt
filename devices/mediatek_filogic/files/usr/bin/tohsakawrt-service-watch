@@ -17,10 +17,6 @@ BOOT_SENT="$STATE_DIR/boot_sent"
 
 [ -r /usr/lib/tohsakawrt/common.sh ] && . /usr/lib/tohsakawrt/common.sh
 
-html_escape() {
-    printf '%s' "$1" | sed 's/\&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
-}
-
 mkdir -p "$STATE_DIR"
 
 acquire_lock() {

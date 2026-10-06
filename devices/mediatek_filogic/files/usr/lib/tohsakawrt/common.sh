@@ -98,7 +98,7 @@ send_tg() {
 }
 
 html_escape() {
-    sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+    printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
 }
 
 get_cpu_temp() {

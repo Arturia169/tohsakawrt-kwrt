@@ -1148,6 +1148,17 @@ function M.run()
     local enabled = core.get_uci("tohsakawrt-tgbot", "main", "enabled", "0")
     local token = core.get_uci("tohsakawrt-tgbot", "main", "token", "")
     local chat_id = core.get_uci("tohsakawrt-tgbot", "main", "chat_id", "")
+    local user_id = core.get_uci("tohsakawrt-tgbot", "main", "user_id", "")
+    -- 发送者身份闸门：配置了 user_id 则严格校验；未配置时只接受私聊（私聊里 chat_id 即用户 ID）。
+    local function sender_allowed(from_id, chat_key, chat_type, configured_user)
+        if configured_user ~= nil and configured_user ~= "" then
+            return from_id ~= nil and tostring(from_id) == tostring(configured_user)
+        end
+        if chat_type == "private" then
+            return from_id ~= nil and tostring(from_id) == tostring(chat_key)
+        end
+        return false
+    end
     if enabled ~= "1" or token == "" or chat_id == "" then
         core.log("Tohsaka-Bot", "Bot disabled or unconfigured in UCI. Exiting.")
         return
@@ -1223,8 +1234,11 @@ function M.run()
 
                 if u.callback_query then
                     local cq = u.callback_query
-                    local source_chat_id = cq.message and cq.message.chat and cq.message.chat.id
-                    if not source_chat_id or tostring(source_chat_id) ~= tostring(chat_id) then
+                    local cq_chat = cq.message and cq.message.chat
+                    local source_chat_id = cq_chat and cq_chat.id
+                    local cq_from_id = cq.from and cq.from.id
+                    if not source_chat_id or tostring(source_chat_id) ~= tostring(chat_id)
+                        or not sender_allowed(cq_from_id, chat_id, cq_chat and cq_chat.type, user_id) then
                         core.log("Tohsaka-Bot", "Rejected update from unauthorized chat")
                     else
                         local cq_id = cq.id
@@ -1238,7 +1252,10 @@ function M.run()
                 elseif u.message or u.edited_message then
                     local msg = u.message or u.edited_message
                     local source_chat_id = msg and msg.chat and msg.chat.id
-                    if not source_chat_id or tostring(source_chat_id) ~= tostring(chat_id) then
+                    local source_from_id = msg and msg.from and msg.from.id
+                    local source_chat_type = msg and msg.chat and msg.chat.type
+                    if not source_chat_id or tostring(source_chat_id) ~= tostring(chat_id)
+                        or not sender_allowed(source_from_id, chat_id, source_chat_type, user_id) then
                         core.log("Tohsaka-Bot", "Rejected update from unauthorized chat")
                     else
                         if msg and msg.text then

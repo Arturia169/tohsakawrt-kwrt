@@ -406,3 +406,4 @@ zlib
 zram-swap
 luci-app-sms-manager
 luci-i18n-sms-manager-zh-cn
+coreutils-timeout
