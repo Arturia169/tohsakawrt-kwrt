@@ -121,6 +121,65 @@ function M.edit_msg(msg_id, text, inline_kb)
     return api_request("editMessageText", payload, 8)
 end
 
+-- 一次连接内完成"应答按钮 + 更新消息"：省掉一次 TLS 握手（本机实测约 1 秒）
+-- 返回 true = 两个请求都成功；false = 有请求失败；nil = 根本没发出去
+function M.answer_and_edit(cb_id, toast, msg_id, text, inline_kb)
+    local token, chat_id, enabled = get_creds()
+    if not enabled or token == "" or not chat_id then return nil end
+    if not msg_id then
+        return M.answer_callback(cb_id, toast)
+    end
+
+    core.init()
+    local stamp = string.format("/tmp/tohsakawrt/tg_%d_%d", os.time(), math.random(1000, 9999))
+    local a_file = stamp .. "_cb.json"
+    local b_file = stamp .. "_edit.json"
+
+    local payload_b = {
+        chat_id = chat_id,
+        message_id = tonumber(msg_id),
+        text = text,
+        parse_mode = "HTML",
+        disable_web_page_preview = true
+    }
+    if inline_kb then
+        payload_b.reply_markup = { inline_keyboard = inline_kb }
+    end
+
+    local fa = io.open(a_file, "w")
+    local fb = fa and io.open(b_file, "w") or nil
+    if not fa or not fb then
+        if fa then fa:close() end
+        if fb then fb:close() end
+        os.remove(a_file)
+        os.remove(b_file)
+        return nil
+    end
+    fa:write(json.stringify({ callback_query_id = tostring(cb_id), text = toast or "" }))
+    fa:close()
+    fb:write(json.stringify(payload_b))
+    fb:close()
+
+    local base = string.format("https://api.telegram.org/bot%s", token)
+    local cmd = string.format(
+        "curl -4 --http1.1 --connect-timeout 4 -s -m 5 -X POST -H 'Content-Type: application/json' --data-binary @%s '%s/answerCallbackQuery' " ..
+        "--next -4 --http1.1 --connect-timeout 4 -s -m 10 -X POST -H 'Content-Type: application/json' --data-binary @%s '%s/editMessageText'",
+        a_file, base, b_file, base)
+    local out = core.exec(cmd)
+    os.remove(a_file)
+    os.remove(b_file)
+
+    if not out or out == "" then
+        core.log("Tg", "answer_and_edit: empty response")
+        return nil
+    end
+    if out:find('"ok":false', 1, true) then
+        core.log("Tg", "answer_and_edit: 有请求失败: " .. out:sub(1, 160))
+        return false
+    end
+    return true
+end
+
 function M.answer_callback(cb_id, text)
     local payload = {
         callback_query_id = tostring(cb_id),

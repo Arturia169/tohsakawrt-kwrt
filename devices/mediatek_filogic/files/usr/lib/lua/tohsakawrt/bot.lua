@@ -68,7 +68,7 @@ local function cmd_help()
     tg.send_msg(text)
 end
 
-local function cmd_status()
+local function build_status_card()
     local metrics = sys.system_metrics()
     local temp = sys.cpu_temp()
     local pub_ip = sys.public_ip()
@@ -111,7 +111,15 @@ local function cmd_status()
         }
     }
 
-    tg.send_msg(text, inline_kb)
+    return text, inline_kb
+end
+
+local function cmd_status(msg_id)
+    local text, inline_kb = build_status_card()
+    if msg_id then
+        return tg.edit_msg(msg_id, text, inline_kb)
+    end
+    return tg.send_msg(text, inline_kb)
 end
 
 local function cmd_uplink()
@@ -395,7 +403,7 @@ local function cmd_temp()
     tg.send_msg(text)
 end
 
-local function cmd_modem(msg_id)
+local function cmd_modem(msg_id, cb_id)
     local m = modem.info()
     local usb0 = sys.usb0_ip()
     local port = modem.get_port and modem.get_port() or "/dev/ttyUSB3"
@@ -488,14 +496,16 @@ local function cmd_modem(msg_id)
         }
     }
 
-    if msg_id then
-        tg.edit_msg(msg_id, text, inline_kb)
-    else
-        tg.send_msg(text, inline_kb)
+    if msg_id and cb_id then
+        return tg.answer_and_edit(cb_id, "正在刷新模组状态...", msg_id, text, inline_kb)
     end
+    if msg_id then
+        return tg.edit_msg(msg_id, text, inline_kb)
+    end
+    return tg.send_msg(text, inline_kb)
 end
 
-local function cmd_sms(limit, msg_id)
+local function cmd_sms(limit, msg_id, cb_id)
     limit = tonumber(limit) or 3
     if limit > 10 then limit = 10 end
     if limit < 1 then limit = 1 end
@@ -518,9 +528,11 @@ local function cmd_sms(limit, msg_id)
                 { text = "📡 模组状态", callback_data = "refresh_modem" }
             }
         }
-        if msg_id then tg.edit_msg(msg_id, text, inline_kb)
-        else tg.send_msg(text, inline_kb) end
-        return
+        if msg_id and cb_id then
+            return tg.answer_and_edit(cb_id, "正在读取最新短信...", msg_id, text, inline_kb)
+        end
+        if msg_id then return tg.edit_msg(msg_id, text, inline_kb) end
+        return tg.send_msg(text, inline_kb)
     end
 
     local items = {}
@@ -634,7 +646,7 @@ local function cmd_undirect(arg, confirmed)
     end
 end
 
-local function cmd_direct_list()
+local function cmd_direct_list(msg_id, cb_id)
     local list = clash.direct_list()
     local now = os.date("%Y-%m-%d %H:%M:%S")
 
@@ -666,7 +678,13 @@ local function cmd_direct_list()
 
 🕰️ <i>%s</i>]], table.concat(lines, "\n"), #list, now)
 
-    tg.send_msg(text, inline_kb)
+    if msg_id and cb_id then
+        return tg.answer_and_edit(cb_id, "🔄 正在刷新直连白名单...", msg_id, text, inline_kb)
+    end
+    if msg_id then
+        return tg.edit_msg(msg_id, text, inline_kb)
+    end
+    return tg.send_msg(text, inline_kb)
 end
 
 local function cmd_clients()
@@ -984,20 +1002,19 @@ local function handle_callback(cb_id, msg_id, data_str)
         cmd_uplink()
 
     elseif data_str == "refresh_status" then
-        tg.answer_callback(cb_id, "🔄 正在刷新看板...")
-        cmd_status()
+        local text, kb = build_status_card()
+        if tg.answer_and_edit(cb_id, "🔄 正在刷新看板...", msg_id, text, kb) == nil then
+            tg.send_msg(text, kb)
+        end
 
     elseif data_str == "refresh_direct" then
-        tg.answer_callback(cb_id, "🔄 正在刷新直连白名单...")
-        cmd_direct_list()
+        cmd_direct_list(msg_id, cb_id)
 
     elseif data_str == "refresh_modem" then
-        tg.answer_callback(cb_id, "正在刷新模组状态...")
-        cmd_modem(msg_id)
+        cmd_modem(msg_id, cb_id)
 
     elseif data_str == "show_sms" or data_str == "refresh_sms" then
-        tg.answer_callback(cb_id, "正在读取最新短信...")
-        cmd_sms(3, msg_id)
+        cmd_sms(3, msg_id, cb_id)
 
     elseif data_str == "re_ping" then
         tg.answer_callback(cb_id, "🩺 正在重新测试网络质量，请稍候约2秒...")
