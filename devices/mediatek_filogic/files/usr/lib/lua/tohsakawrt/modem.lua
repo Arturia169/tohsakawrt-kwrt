@@ -21,12 +21,15 @@ function M.get_port()
 end
 
 function M.at(cmd, timeout)
-    timeout = timeout or 3
+    timeout = math.max(1, math.floor(tonumber(timeout) or 3))
     local port = M.get_port()
     if not nixio.fs.stat(port) or not nixio.fs.stat(MODEM_AT) then
         return nil, "Modem AT port or script not found"
     end
-    local run_cmd = string.format("sh %s %s '%s' 2>/dev/null", MODEM_AT, port, cmd)
+    local inner = string.format("sh %s %s '%s' 2>/dev/null", MODEM_AT, port, cmd)
+    local run_cmd = string.format(
+        "if command -v timeout >/dev/null 2>&1; then timeout %d %s; else %s & __p=$!; ( sleep %d; kill -9 $__p 2>/dev/null ) >/dev/null 2>&1 & __w=$!; wait $__p; kill $__w 2>/dev/null; fi",
+        timeout, inner, inner, timeout)
     return core.exec(run_cmd)
 end
 

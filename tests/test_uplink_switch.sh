@@ -34,7 +34,7 @@ case "$*" in
         echo "8.8.8.8 via 192.168.225.1 dev $route_dev src 192.168.225.43"
         ;;
     'route show default dev usb0') [ "${TEST_USB_GW:-1}" = 1 ] && echo 'default via 192.168.225.1 dev usb0 proto static metric 20' ;;
-    'route show default dev eth0') echo 'default via 192.168.1.1 dev eth0 proto static metric 10' ;;
+    'route show default dev eth0') [ "${TEST_ETH_GW:-1}" = 1 ] && echo 'default via 192.168.1.1 dev eth0 proto static metric 10' ;;
     '-4 addr show usb0') [ "${TEST_USB_IP:-1}" = 1 ] && echo '2: usb0 inet 192.168.225.43/24 scope global usb0' ;;
 esac
 EOF
@@ -67,6 +67,8 @@ TEST_ROUTE_GET_DEV=to5g TEST_USB_IP=1 TEST_USB_GW=1 "$SCRIPT" 5g > "$TMP/switch5
 cp "$CALLS" "$TMP/calls-5g.log"
 check '切换过程没有 ubus call network reload' "$(if grep -q 'ubus call network reload' "$CALLS"; then echo 0; else echo 1; fi)"
 check '切 5G 添加 metric 1 优先路由且未 ifup/ifdown' "$(grep -Fq 'ip route replace default via 192.168.225.1 dev usb0 metric 1' "$CALLS" && ! grep -Eq '(^| )(ifup|ifdown)( |$)' "$CALLS" && echo 1 || echo 0)"
+check 'normalize_metrics 归位 metric 时提交 uci（否则是空操作）' \
+    "$(grep -Fq 'uci commit network' "$TMP/calls-5g.log" && echo 1 || echo 0)"
 
 : > "$CALLS"
 TEST_ROUTE_GET_DEV=towan TEST_USB_IP=1 TEST_USB_GW=1 "$SCRIPT" wan > "$TMP/switchwan.out" 2>&1
@@ -78,6 +80,16 @@ if TEST_ROUTE_GET_DEV=eth0 TEST_USB_IP=0 TEST_USB_GW=1 "$SCRIPT" 5g > "$TMP/noip
 check 'usb0 无 IP 时非零退出且打印中文原因' "$([ "$noip_failed" -eq 1 ] && grep -q '未获取到 IP' "$TMP/noip.out" && echo 1 || echo 0)"
 check 'usb0 无 IP 时没有路由变更' "$(grep -Eq '^ip route (replace|del) ' "$CALLS" && echo 0 || echo 1)"
 check '切换脚本通过 sh -n' "$(sh -n "$SCRIPT" && echo 1 || echo 0)"
+
+: > "$CALLS"
+if TEST_ROUTE_GET_DEV=usb0 TEST_ETH_GW=0 TEST_USB_GW=1 "$SCRIPT" wan > "$TMP/no-wan-gateway.out" 2>&1; then no_wan_failed=0; else no_wan_failed=1; fi
+check 'WAN 无默认网关时返回 ERROR_SWITCH_FAILED' "$([ "$no_wan_failed" -eq 1 ] && grep -Fxq 'ERROR_SWITCH_FAILED' "$TMP/no-wan-gateway.out" && echo 1 || echo 0)"
+check 'WAN 无默认网关时不删除任何 5G 默认路由' "$(grep -Eq '^ip route del default .* dev usb0 ' "$CALLS" && echo 0 || echo 1)"
+
+: > "$CALLS"
+if TEST_ROUTE_GET_DEV=usb0 TEST_ETH_GW=1 TEST_USB_GW=1 "$SCRIPT" wan > "$TMP/rollback.out" 2>&1; then rollback_failed=0; else rollback_failed=1; fi
+check 'WAN 切换校验失败时返回 ERROR_SWITCH_FAILED' "$([ "$rollback_failed" -eq 1 ] && grep -Fxq 'ERROR_SWITCH_FAILED' "$TMP/rollback.out" && echo 1 || echo 0)"
+check 'WAN 切换校验失败时恢复 5G metric 1 默认路由' "$(grep -Fq 'ip route replace default via 192.168.225.1 dev usb0 metric 1' "$CALLS" && echo 1 || echo 0)"
 
 printf 'PASS=%s FAIL=%s\n' "$pass" "$fail"
 printf '%s\n' '--- calls log: 5G switch ---'

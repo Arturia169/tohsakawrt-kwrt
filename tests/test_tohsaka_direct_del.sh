@@ -2,7 +2,12 @@
 set -u
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-SCRIPT="$ROOT/devices/mediatek_filogic/files/usr/bin/tohsaka-direct"
+SCRIPT=""
+for cand in "$ROOT/devices/mediatek_filogic/files/usr/bin/tohsaka-direct" \
+            "$ROOT/files/usr/bin/tohsaka-direct"; do
+    [ -f "$cand" ] && SCRIPT="$cand" && break
+done
+[ -n "${SCRIPT:-}" ] || { echo "cannot locate tohsaka-direct"; exit 1; }
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 

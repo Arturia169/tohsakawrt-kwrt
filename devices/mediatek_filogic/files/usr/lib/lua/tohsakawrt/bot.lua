@@ -1086,7 +1086,7 @@ local function handle_command(text)
         switch_profile(selector)
     elseif cmd == "/start" or cmd == "/help" or cmd == "/menu" or full:find("帮助") then
         cmd_help()
-    elseif cmd == "/status" or full:find("状态") or full:find("看板") then
+    elseif cmd == "/status" or (full:find("状态") and not full:find("模组") and not full:find("5G") and not full:find("5g")) or full:find("看板") then
         cmd_status()
     elseif cmd == "/uplink" or cmd == "/switch_wan" or full:find("出口") or full:find("切网") or full:find("换网") or full:find("切5G") or full:find("切5g") then
         cmd_uplink()

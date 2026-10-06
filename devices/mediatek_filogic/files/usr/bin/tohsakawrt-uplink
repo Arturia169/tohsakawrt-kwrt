@@ -22,6 +22,7 @@ normalize_metrics() {
     if [ "$wan_metric" = "20" ] || [ "$modem_metric" = "5" ]; then
         uci set network.wan.metric=10 2>/dev/null
         uci set network.5Ga.metric=20 2>/dev/null
+        uci commit network 2>/dev/null
     fi
 }
 
@@ -36,6 +37,13 @@ switch_to_wan() {
         return 0
     fi
 
+    local eth_gw="$(get_gateway eth0)"
+    if [ -z "$eth_gw" ]; then
+        logger -t TohsakaWrt-Uplink "WAN route validation failed: no default gateway on eth0"
+        echo "ERROR_SWITCH_FAILED"
+        return 1
+    fi
+
     local usb_gw="$(get_gateway usb0)"
     if [ -n "$usb_gw" ]; then
         ip route del default via "$usb_gw" dev usb0 metric 1 2>/dev/null || true
@@ -44,6 +52,11 @@ switch_to_wan() {
     local active="$(ip route get 8.8.8.8 2>/dev/null)"
     local active_dev="$(printf '%s\n' "$active" | sed -n 's/.* dev \([^ ]*\).*/\1/p')"
     if [ "$active_dev" != "eth0" ]; then
+        if [ -n "$usb_gw" ]; then
+            ip route replace default via "$usb_gw" dev usb0 metric 1 2>/dev/null || true
+            ip route replace default via "$usb_gw" dev usb0 metric 5 2>/dev/null || true
+            logger -t TohsakaWrt-Uplink "Restored 5G default routes after WAN validation failure"
+        fi
         logger -t TohsakaWrt-Uplink "WAN route validation failed: ${active:-no route to 8.8.8.8}"
         echo "ERROR_SWITCH_FAILED"
         return 1

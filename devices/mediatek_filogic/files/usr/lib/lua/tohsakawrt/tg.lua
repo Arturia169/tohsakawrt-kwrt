@@ -59,7 +59,15 @@ local function api_request(method, payload, timeout)
     os.remove(tmp_payload)
 
     if not out or out == "" then return nil, "Empty response" end
-    local res = json.parse(out)
+    local ok, res = pcall(json.parse, out)
+    if not ok then
+        core.log("Tg", "API response parse error: " .. tostring(res))
+        return nil, tostring(res)
+    end
+    if type(res) == "table" and res.ok == false then
+        core.log("Tg", "API error: " .. tostring(res.description or res.error_code))
+        return nil, tostring(res.description or "api_error")
+    end
     return res
 end
 
