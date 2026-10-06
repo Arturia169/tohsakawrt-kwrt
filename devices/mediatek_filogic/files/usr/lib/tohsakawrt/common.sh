@@ -98,7 +98,12 @@ send_tg() {
     tg_chat="$(uci -q get tohsakawrt-tgbot.main.chat_id)"
     tg_enabled="$(uci -q get tohsakawrt-tgbot.main.enabled)"
 
-    [ "$tg_enabled" = "1" ] && [ -n "$tg_token" ] && [ -n "$tg_chat" ] || return 0
+    # 未配置时也必须留下痕迹：旧写法 `... || return 0` 会"什么都不发却报告成功"，
+    # 导致调用方以为已投递（06-07 的告警演示就栽在这里）
+    if [ "$tg_enabled" != "1" ] || [ -z "$tg_token" ] || [ -z "$tg_chat" ]; then
+        logger -t TohsakaWrt-Tg "send_tg 未发送：机器人未启用或凭据缺失（enabled=${tg_enabled}）"
+        return 1
+    fi
 
     if [ -z "$reply_markup" ]; then
         reply_markup="$(tg_auto_kb "$text")"
@@ -118,7 +123,21 @@ send_tg() {
     if [ -n "$reply_markup" ]; then
         set -- "$@" -d "reply_markup=${reply_markup}"
     fi
-    curl "$@" >/dev/null 2>&1
+
+    # 投递校验：curl 成功不等于送达，必须看 Telegram 是否回 ok:true；
+    # 失败记日志并重试一次（06-07 曾出现 curl 退出码 0 但用户收不到的情况）
+    local attempt reply
+    for attempt in 1 2; do
+        reply="$(curl "$@" 2>&1)"
+        case "$reply" in
+            *'"ok":true'*)
+                return 0
+                ;;
+        esac
+        logger -t TohsakaWrt-Tg "send_tg 投递失败（第 ${attempt} 次）: $(printf '%s' "$reply" | tr -d '\n' | cut -c1-200)"
+        sleep 1
+    done
+    return 1
 }
 
 html_escape() {
