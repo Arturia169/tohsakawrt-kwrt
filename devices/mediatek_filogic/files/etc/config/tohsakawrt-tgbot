@@ -1,13 +1,22 @@
-# 凭据不入库：真实值仅存在于设备 uci（tohsakawrt-tgbot.main.*）
-# 干净刷机后需在设备上重新填入 token/chat_id/user_id 并置 enabled=1
+
 config bot 'main'
-        option enabled '0'
-        option token ''
-        option chat_id ''
-        option user_id ''
-        option flowcard_no ''
-        option flowcard_warn_percent '20'
-        option flowcard_urgent_percent '10'
-        option flowcard_warn_days '3'
-        option bark_key ''
+	option enabled '1'
+	option token '8247787370:AAGKJGyCslZhmzJGty2y6Ml1KAk9qzlJp3A'
+	option chat_id '549828957'
+	option bark_key 'VStw74Ry2YCKgVCz9wGFXL'
+	option modem_data_heal '1'
+	list nodata_cards '89852'
+	list nodata_cards '89372'
+	list nodata_cards '8985203103013319273'
+	list nodata_cards '8937204017270962205'
+	list nodata_cards '89995'
+	option esim_job_retain_minutes '1440'
+        option esim_enabled '1'
+	option user_id '549828957'
+	option flowcard_no '18685585'
+
+config numbers 'numbers'
+	option n_8937204017270962205 '+372****1352'
+	option n_8985203103013319273 '+852****7106'
+	option n_89995011908107987550 '+995****4668'
 

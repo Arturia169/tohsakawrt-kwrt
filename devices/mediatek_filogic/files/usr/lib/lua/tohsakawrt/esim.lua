@@ -258,6 +258,31 @@ function M.job_result(id)
     return read(STATE .. "/esim-job-" .. tostring(id) .. ".txt")
 end
 
+-- 任务编号是否已被占用（.spec 或 .txt 任一个存在即算占用）
+-- 路径规则只保留在这里，避免别的模块各写一份
+function M.job_exists(id)
+    local key = tostring(id)
+    if read(STATE .. "/esim-job-" .. key .. ".spec") then return true end
+    if read(STATE .. "/esim-job-" .. key .. ".txt") then return true end
+    return false
+end
+
+-- 清理过期任务文件：默认保留 24 小时（按钮上的"查看结果"通常几小时内就会点），
+-- 可用 uci tohsakawrt-tgbot.main.esim_job_retain_minutes 调整。
+-- 用一条 busybox find 完成（支持 -mmin 与 -exec rm）。
+function M.cleanup_jobs(keep_minutes)
+    core.init()
+    local minutes = tonumber(keep_minutes)
+        or tonumber(core.get_uci("tohsakawrt-tgbot", "main", "esim_job_retain_minutes", "1440"))
+        or 1440
+    if minutes < 60 then minutes = 60 end
+    if minutes > 10080 then minutes = 10080 end
+    core.exec(string.format(
+        "find %s -maxdepth 1 -name 'esim-job-*' -mmin +%d -exec rm -f {} \\; 2>/dev/null",
+        STATE, minutes))
+    return true
+end
+
 function M.start_job(kind, id, target_iccid, display_name, main_uplink, extra_arg, message_id)
     core.init()
     local spec = STATE .. "/esim-job-" .. id .. ".spec"

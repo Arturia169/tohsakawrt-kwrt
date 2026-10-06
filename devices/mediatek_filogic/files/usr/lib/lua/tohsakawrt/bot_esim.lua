@@ -31,12 +31,23 @@ function M.cmd_cards(msg_id)
     if msg_id then tg.edit_msg(msg_id, text, kb) else tg.send_msg(text, kb) end
 end
 
+-- 任务编号：秒 + 6 位随机，并确认该编号的文件不存在（撞号就重试）。
+-- 旧写法是"秒 + 3 位随机"，同一秒内建两个任务有约 1/900 概率撞号，
+-- 撞号会导致两个任务互相覆盖结果文件。
 function M.new_job_id()
-    return tostring(os.time()) .. tostring(math.random(100, 999))
+    for _ = 1, 8 do
+        local id = tostring(os.time()) .. string.format("%06d", math.random(0, 999999))
+        if not esim.job_exists(id) then return id end
+    end
+    -- 极端情况（同名文件极多）退化为"秒 + 递增序号"，仍保证同秒内不重复
+    _job_seq = (_job_seq or 0) + 1
+    return tostring(os.time()) .. string.format("%06d", _job_seq % 1000000)
 end
 
 function M.start_esim_job(kind, target, display_name, message_id, extra_arg)
     if not esim_enabled() then tg.send_msg("⚠️ 功能已停用"); return end
+    -- 建新任务前先清掉过期任务文件（原先从不清理，会一直堆积）
+    pcall(esim.cleanup_jobs)
     local id = M.new_job_id()
     local action = (kind == "reload" and "正在重载 5G 模组…")
         or (kind == "download" and "正在连接服务器下载写卡…")

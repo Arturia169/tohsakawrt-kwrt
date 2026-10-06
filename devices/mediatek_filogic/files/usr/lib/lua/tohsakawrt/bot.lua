@@ -364,6 +364,9 @@ function M.run()
         return
     end
 
+    -- 启动时清一次过期 eSIM 任务文件（不依赖是否有人建任务）
+    pcall(esimm.cleanup_jobs)
+
     local offset = tonumber(core.get_state("offset", "0")) or 0
 
     -- Synchronize offset on startup to avoid backlog
