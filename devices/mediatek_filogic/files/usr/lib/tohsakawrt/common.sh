@@ -69,9 +69,30 @@ push_bark() {
         "$bark_api" >/dev/null 2>&1
 }
 
+# ---- 告警附带的操作按钮 ----
+# callback_data 必须是机器人已认识的动作（见 bot.lua 的 handle_callback）：
+#   refresh_status / refresh_modem / open_uplink_menu / re_ping / test_nodes
+TG_KB_STATUS='{"inline_keyboard":[[{"text":"🩺 查状态","callback_data":"refresh_status"}]]}'
+TG_KB_STATUS_UPLINK='{"inline_keyboard":[[{"text":"🩺 查状态","callback_data":"refresh_status"},{"text":"🔀 切换出口","callback_data":"open_uplink_menu"}]]}'
+TG_KB_STATUS_MODEM='{"inline_keyboard":[[{"text":"🩺 查状态","callback_data":"refresh_status"},{"text":"📶 查模组","callback_data":"refresh_modem"}]]}'
+TG_KB_STATUS_PING='{"inline_keyboard":[[{"text":"🩺 查状态","callback_data":"refresh_status"},{"text":"📡 重新体检","callback_data":"re_ping"}]]}'
+TG_KB_STATUS_NODES='{"inline_keyboard":[[{"text":"🩺 查状态","callback_data":"refresh_status"},{"text":"🌐 测节点","callback_data":"test_nodes"}]]}'
+
+# 按告警正文自动挑选按钮；send_tg 传 "-" 表示这条不带按钮
+tg_auto_kb() {
+    case "$1" in
+        *主出口探测超时*|*网络异常*|*已上线*) echo "$TG_KB_STATUS_UPLINK" ;;
+        *5G*降级*|*5G*恢复*|*热备链路*|*模组*) echo "$TG_KB_STATUS_MODEM" ;;
+        *OpenClash*|*核心*) echo "$TG_KB_STATUS_NODES" ;;
+        *高温*|*温度*|*高带宽*) echo "$TG_KB_STATUS_PING" ;;
+        *) echo "$TG_KB_STATUS" ;;
+    esac
+}
+
 send_tg() {
     local text="$(printf '%b' "$1")"
     local parse_mode="${2:-}"
+    local reply_markup="${3:-}"
     local tg_token tg_chat tg_enabled
     tg_token="$(uci -q get tohsakawrt-tgbot.main.token)"
     tg_chat="$(uci -q get tohsakawrt-tgbot.main.chat_id)"
@@ -79,22 +100,25 @@ send_tg() {
 
     [ "$tg_enabled" = "1" ] && [ -n "$tg_token" ] && [ -n "$tg_chat" ] || return 0
 
-    if [ -n "$parse_mode" ]; then
-        curl -m 10 -fsS \
-            -X POST \
-            "https://api.telegram.org/bot${tg_token}/sendMessage" \
-            -d "chat_id=${tg_chat}" \
-            -d "parse_mode=${parse_mode}" \
-            --data-urlencode "text=${text}" \
-            >/dev/null 2>&1
-    else
-        curl -m 10 -fsS \
-            -X POST \
-            "https://api.telegram.org/bot${tg_token}/sendMessage" \
-            -d "chat_id=${tg_chat}" \
-            --data-urlencode "text=${text}" \
-            >/dev/null 2>&1
+    if [ -z "$reply_markup" ]; then
+        reply_markup="$(tg_auto_kb "$text")"
     fi
+    if [ "$reply_markup" = "-" ]; then
+        reply_markup=""
+    fi
+
+    set -- -m 10 -fsS \
+        -X POST \
+        "https://api.telegram.org/bot${tg_token}/sendMessage" \
+        -d "chat_id=${tg_chat}" \
+        --data-urlencode "text=${text}"
+    if [ -n "$parse_mode" ]; then
+        set -- "$@" -d "parse_mode=${parse_mode}"
+    fi
+    if [ -n "$reply_markup" ]; then
+        set -- "$@" -d "reply_markup=${reply_markup}"
+    fi
+    curl "$@" >/dev/null 2>&1
 }
 
 html_escape() {

@@ -115,7 +115,9 @@ local ok, err = pcall(function()
         string.format("• 额度重置周期：<code>%s</code>", tostring(expiry)), "━━━━━━━━━━━━━━━━━━",
         "💡 <i>由路由器 TohsakaWrt 模组管家自动送达</i>"
     }
-    assert(tg.send_msg(table.concat(lines, "\n")) ~= nil, "Telegram report send failed")
+    local kb = { { { text = "🩺 查状态", callback_data = "refresh_status" },
+                    { text = "📶 查模组", callback_data = "refresh_modem" } } }
+    assert(tg.send_msg(table.concat(lines, "\n"), kb) ~= nil, "Telegram report send failed")
 end)
 
 if not ok then
