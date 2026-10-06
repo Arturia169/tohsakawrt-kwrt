@@ -84,8 +84,10 @@ function M.set_cached_state(key, val)
 end
 
 function M.log(tag, msg)
-    local clean = tostring(msg):gsub('"', '\\"')
-    os.execute(string.format('logger -t "%s" "%s"', tag or "TohsakaWrt", clean))
+    local function shell_quote(value)
+        return "'" .. tostring(value):gsub("[\n\r\t]", " "):gsub("'", "'\\''") .. "'"
+    end
+    os.execute(string.format("logger -t %s %s", shell_quote(tag or "TohsakaWrt"), shell_quote(msg)))
 end
 
 function M.exec(cmd)

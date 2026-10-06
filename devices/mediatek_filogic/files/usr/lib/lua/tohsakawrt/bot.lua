@@ -1220,20 +1220,30 @@ function M.run()
 
                 if u.callback_query then
                     local cq = u.callback_query
-                    local cq_id = cq.id
-                    local msg_id = cq.message and cq.message.message_id
-                    local data_str = cq.data or ""
-                    local ok, err = pcall(handle_callback, cq_id, msg_id, data_str)
-                    if not ok then
-                        core.log("Tohsaka-Bot", "Callback error: " .. tostring(err))
+                    local source_chat_id = cq.message and cq.message.chat and cq.message.chat.id
+                    if not source_chat_id or tostring(source_chat_id) ~= tostring(chat_id) then
+                        core.log("Tohsaka-Bot", "Rejected update from unauthorized chat")
+                    else
+                        local cq_id = cq.id
+                        local msg_id = cq.message and cq.message.message_id
+                        local data_str = cq.data or ""
+                        local ok, err = pcall(handle_callback, cq_id, msg_id, data_str)
+                        if not ok then
+                            core.log("Tohsaka-Bot", "Callback error: " .. tostring(err))
+                        end
                     end
                 elseif u.message or u.edited_message then
                     local msg = u.message or u.edited_message
-                    if msg and msg.text then
-                        tg.send_chat_action("typing")
-                        local ok, err = pcall(handle_command, msg.text)
-                        if not ok then
-                            core.log("Tohsaka-Bot", "Command error: " .. tostring(err))
+                    local source_chat_id = msg and msg.chat and msg.chat.id
+                    if not source_chat_id or tostring(source_chat_id) ~= tostring(chat_id) then
+                        core.log("Tohsaka-Bot", "Rejected update from unauthorized chat")
+                    else
+                        if msg and msg.text then
+                            tg.send_chat_action("typing")
+                            local ok, err = pcall(handle_command, msg.text)
+                            if not ok then
+                                core.log("Tohsaka-Bot", "Command error: " .. tostring(err))
+                            end
                         end
                     end
                 end
