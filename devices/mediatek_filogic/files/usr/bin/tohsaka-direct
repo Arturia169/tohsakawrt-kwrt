@@ -10,12 +10,31 @@ API_URL="http://127.0.0.1:9090/configs?force=true"
 mkdir -p /etc/openclash 2>/dev/null
 touch "$LIST_FILE" 2>/dev/null
 
+# 探测目标文件 rules: 区段实际使用的缩进（跳过 TG_DIRECT_RULES 块本身）
+# 规则：先取块外第一条规则行的缩进；若取不到，再沿用块内现有缩进；都取不到则用 0 空格
+detect_indent() {
+    awk '
+      /^rules:/ { seen=1; next }
+      !seen { next }
+      /# === TG_DIRECT_RULES_START ===/ { blk=1; next }
+      /# === TG_DIRECT_RULES_END ===/ { blk=0; next }
+      blk { if (blkind == "") { match($0, /^[ \t]*/); blkind = substr($0, 1, RLENGTH) } next }
+      !found && /^[ \t]*- / { match($0, /^[ \t]*/); print substr($0, 1, RLENGTH); found=1; exit }
+      END { if (!found) print blkind }
+    ' "$1"
+}
+
 sync_rules_to_yaml() {
     local target_yaml="$1"
     [ -f "$target_yaml" ] || return 0
 
-    lua - "$LIST_FILE" "$target_yaml" << 'EOF'
-local list_file, yaml_file = arg[1], arg[2]
+    # 关键修复：注入块必须沿用目标文件自己的缩进，
+    # 否则运行时配置（0 空格缩进）会因混缩进变成非法 YAML，导致热重载被核心静默拒收
+    local indent
+    indent="$(detect_indent "$target_yaml")"
+
+    lua - "$LIST_FILE" "$target_yaml" "$indent" << 'EOF'
+local list_file, yaml_file, indent = arg[1], arg[2], arg[3] or ""
 
 local targets = {}
 local f = io.open(list_file, "r")
@@ -33,13 +52,13 @@ local function make_rule(cleaned)
     local direct_str = "\231\155\180\232\191\158"
     local _, colon_cnt = cleaned:gsub(":", "")
     if cleaned:match("^%d+%.%d+%.%d+%.%d+/%d+$") then
-        return string.format("  - IP-CIDR,%s,%s,no-resolve", cleaned, direct_str)
+        return string.format("%s- IP-CIDR,%s,%s,no-resolve", indent, cleaned, direct_str)
     elseif cleaned:match("^%d+%.%d+%.%d+%.%d+$") then
-        return string.format("  - IP-CIDR,%s/32,%s,no-resolve", cleaned, direct_str)
+        return string.format("%s- IP-CIDR,%s/32,%s,no-resolve", indent, cleaned, direct_str)
     elseif colon_cnt > 1 then
-        return string.format("  - IP-CIDR6,%s/128,%s,no-resolve", cleaned, direct_str)
+        return string.format("%s- IP-CIDR6,%s/128,%s,no-resolve", indent, cleaned, direct_str)
     else
-        return string.format("  - DOMAIN-SUFFIX,%s,%s", cleaned, direct_str)
+        return string.format("%s- DOMAIN-SUFFIX,%s,%s", indent, cleaned, direct_str)
     end
 end
 
