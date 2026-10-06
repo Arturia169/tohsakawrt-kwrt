@@ -7,6 +7,11 @@ local json = require("luci.jsonc")
 
 local STATE = "/tmp/tohsakawrt/state"
 
+-- Keep quoting local: offline tests stub tohsakawrt.core, so a shared core helper would test the stub instead of this code.
+local function shell_quote(value)
+    return "'" .. tostring(value):gsub("[\n\r\t]", " "):gsub("'", "'\\''") .. "'"
+end
+
 local function lpa_payload(output)
     local last
     for line in tostring(output or ""):gmatch("[^\r\n]+") do
@@ -283,9 +288,9 @@ function M.worker(id)
     if kind == "download" then
         local ac = target
         local confirm = extra_arg
-        local cmd = "lpac profile download -a " .. string.format("%q", ac)
+        local cmd = "lpac profile download -a " .. shell_quote(ac)
         if confirm ~= "" then
-            cmd = cmd .. " -c " .. string.format("%q", confirm)
+            cmd = cmd .. " -c " .. shell_quote(confirm)
         end
         local raw = lpac(cmd)
         local payload, err = lpa_payload(raw)
