@@ -4,6 +4,8 @@ local M = {}
 -- 共享零件统一放在 bot_common（模块引用、转义、确认框、计时、eSIM 开关）
 local bc = require("tohsakawrt.bot_common")
 local net = require("tohsakawrt.bot_net")
+local sysm = require("tohsakawrt.bot_sys")
+local dirt = require("tohsakawrt.bot_direct")
 
 -- 兼容：cmd_ping 已搬到 bot_net，但 bot 模块仍保留同名入口（有用例直接调用 bot.cmd_ping）
 M.cmd_ping = net.cmd_ping
@@ -43,73 +45,6 @@ local function cmd_help()
 /poweroff - 🔌 关闭路由器电源 (带确认闸门)
 
 <i>💡 点击下方快捷键盘可直接执行常用指令。</i>]]
-    tg.send_msg(text)
-end
-
-local function build_status_card()
-    local metrics = sys.system_metrics()
-    local temp = sys.cpu_temp()
-    local pub_ip = sys.public_ip()
-    local uplink = sys.uplink_status()
-    local uplink_dev = tostring(uplink.dev or "unknown")
-    local cur_ip = (uplink.type == "wan") and sys.wan_ip() or sys.usb0_ip()
-    local c_status = clash.status()
-    local speed = sys.wan_speed(uplink_dev)
-    local now = os.date("%Y-%m-%d %H:%M:%S")
-
-    local safe_pub_ip = pub_ip:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
-
-    local temp_icon = "🟢"
-    local temp_num = tonumber(temp:match("(%d+%.?%d*)"))
-    if temp_num and temp_num >= 70 then temp_icon = "🔴"
-    elseif temp_num and temp_num >= 60 then temp_icon = "⚠️" end
-
-    local text = string.format([[📊 <b>综合运行看板</b>
-
-━━━━━━━━━━━━━━━━━━
-📟 <b>设备型号</b>：Cudy TR3000 (MT7981B)
-⏱️ <b>持续运行</b>：%s
-🌡️ <b>核心温度</b>：%s %s
-🧠 <b>可用内存</b>：%s
-📈 <b>系统负载</b>：%s
-💾 <b>存储空间</b>：%s
-━━━━━━━━━━━━━━━━━━
-🚀 <b>实时速率</b>：%s
-🌐 <b>宽带外网</b>：<code>%s</code>
-📡 <b>出口网卡</b>：<code>%s (%s)</code>
-🚦 <b>网络连通</b>：🟢 正常
-🧩 <b>OpenClash</b>：%s (%s)
-━━━━━━━━━━━━━━━━━━
-🕰️ <i>%s</i>]], html_escape(metrics.uptime), temp_icon, html_escape(temp), html_escape(metrics.mem_str), html_escape(metrics.load), html_escape(metrics.root_str), html_escape(speed), safe_pub_ip, html_escape(uplink_dev), html_escape(cur_ip), c_status.running and "🟢 正常运行" or "🔴 未运行", html_escape(c_status.version), html_escape(now))
-
-    local inline_kb = {
-        {
-            { text = "🔀 切换主力出口", callback_data = "open_uplink_menu" },
-            { text = "🔄 刷新看板", callback_data = "refresh_status" }
-        }
-    }
-
-    return text, inline_kb
-end
-
-local function cmd_status(msg_id)
-    local text, inline_kb = build_status_card()
-    if msg_id then
-        return tg.edit_msg(msg_id, text, inline_kb)
-    end
-    return tg.send_msg(text, inline_kb)
-end
-
-local function cmd_temp()
-    local temp = sys.cpu_temp()
-    local now = os.date("%Y-%m-%d %H:%M:%S")
-    local text = string.format([[🌡️ <b>CPU 实时温度</b>
-
-━━━━━━━━━━━━━━━━━━
-🔥 <b>当前核心温度</b>：<code>%s</code>
-📊 <b>状态评估</b>：正常 (安全范围 &lt; 75°C)
-━━━━━━━━━━━━━━━━━━
-🕰️ <i>%s</i>]], html_escape(temp), html_escape(now))
     tg.send_msg(text)
 end
 
@@ -295,227 +230,6 @@ local function cmd_sms(limit, msg_id, cb_id)
     end
 end
 
-local function cmd_direct(arg)
-    arg = arg and arg:match("^%s*(.-)%s*$") or ""
-    if arg == "" then
-        local text = [[🎯 <b>添加直连白名单</b>
-
-━━━━━━━━━━━━━━━━━━
-<b>用法：</b>
-<code>/direct &lt;域名或IP&gt;</code>
-
-<b>示例：</b>
-• 域名：<code>/direct mysite.com</code>
-• IP地址：<code>/direct 123.45.67.89</code>
-• 网段：<code>/direct 10.0.0.0/8</code>
-
-💡 <i>添加后规则自动写入顶部并毫秒级热重载，无需重启核心！</i>]]
-        tg.send_msg(text)
-        return
-    end
-
-    local res = clash.direct_add(arg)
-    if res:find("^ADDED:") then
-        local cleaned = res:gsub("^ADDED:", "")
-        tg.send_msg(string.format([[✅ <b>已成功加入直连白名单</b>
-
-━━━━━━━━━━━━━━━━━━
-🎯 <b>目标条目</b>：<code>%s</code>
-⚡ <b>生效状态</b>：规则已毫秒级热重载 (Direct)
-━━━━━━━━━━━━━━━━━━
-<i>如需移除，可发送：<code>/undirect %s</code></i>
-
-🕰️ <i>%s</i>]], html_escape(cleaned), html_escape(cleaned), os.date("%Y-%m-%d %H:%M:%S")))
-    elseif res:find("^EXISTS:") then
-        local cleaned = res:gsub("^EXISTS:", "")
-        tg.send_msg(string.format("ℹ️ <b>条目已在直连白名单中</b>：目标 <code>%s</code> 此前已添加，当前正处于直连状态。", html_escape(cleaned)))
-    else
-        tg.send_msg("⚠️ <b>添加失败</b>：输入的目标无效或解析为空。")
-    end
-end
-
-local function cmd_undirect(arg, confirmed)
-    arg = arg and arg:match("^%s*(.-)%s*$") or ""
-    if arg == "" then
-        tg.send_msg("🗑️ <b>移除直连白名单</b>\n\n<b>用法：</b>\n<code>/undirect &lt;序号 或 域名/IP&gt;</code>\n\n示例：<code>/undirect 1</code>")
-        return
-    end
-    if not confirmed then
-        ask_confirm("删除直连白名单", arg, "目标将不再享受免代理直连待遇，重新受 OpenClash 分流规则控制", "do_undirect:" .. arg)
-        return
-    end
-
-    local res = clash.direct_del(arg)
-    if res:find("^DELETED:") then
-        local cleaned = res:gsub("^DELETED:", "")
-        tg.send_msg(string.format("🗑️ 已从直连白名单移除目标 <code>%s</code>，核心配置已同步热重载。", html_escape(cleaned)))
-    elseif res:find("^ERROR:out_of_range") then
-        tg.send_msg("⚠️ <b>移除失败</b>：指定的序号超出当前列表范围。")
-    else
-        tg.send_msg("⚠️ <b>移除失败</b>：列表中未找到指定条目。")
-    end
-end
-
-local function cmd_direct_list(msg_id, cb_id)
-    local list = clash.direct_list()
-    local now = os.date("%Y-%m-%d %H:%M:%S")
-
-    if #list == 0 then
-        tg.send_msg(string.format("🎯 <b>OpenClash 直连白名单 (0 条)</b>\n\n当前尚未添加任何自定义直连规则。\n发送 <code>/direct &lt;域名或IP&gt;</code> 可直接添加。\n\n🕰️ <i>%s</i>", now))
-        return
-    end
-
-    local lines = {}
-    for i, item in ipairs(list) do
-        local icon = item:match("^%d") and "🔢" or "🌐"
-        table.insert(lines, string.format("%s <b>%d.</b> <code>%s</code>", icon, i, html_escape(item)))
-    end
-
-    local inline_kb = {
-        { { text = "🔄 刷新列表", callback_data = "refresh_direct" } }
-    }
-
-    local text = string.format([[🎯 <b>OpenClash 直连白名单</b>
-
-━━━━━━━━━━━━━━━━━━
-%s
-━━━━━━━━━━━━━━━━━━
-📊 <b>共计</b>：<code>%d</code> 个自定义直连规则
-
-💡 <b>快捷操作提示：</b>
-• 添加：发送 <code>/direct 域名或IP</code>
-• 移除：发送 <code>/undirect 序号</code> (如 <code>/undirect 1</code>)
-
-🕰️ <i>%s</i>]], table.concat(lines, "\n"), #list, now)
-
-    if msg_id and cb_id then
-        return tg.answer_and_edit(cb_id, "🔄 正在刷新直连白名单...", msg_id, text, inline_kb)
-    end
-    if msg_id then
-        return tg.edit_msg(msg_id, text, inline_kb)
-    end
-    return tg.send_msg(text, inline_kb)
-end
-
-local function cmd_clients()
-    local aliases = sys.load_aliases()
-    local leases = {}
-    local f = io.open("/tmp/dhcp.leases", "r")
-    if f then
-        for line in f:lines() do
-            local ts, mac, ip, name = line:match("^(%S+)%s+(%S+)%s+(%S+)%s+(%S+)")
-            if mac and ip then
-                local l_mac = mac:lower()
-                local d_name = aliases[l_mac] or ((name == "*" or name == "") and "未知设备" or name)
-                d_name = d_name:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
-                table.insert(leases, string.format("• <b>%s</b>\n  ├ <b>IP</b>：<code>%s</code>\n  └ <b>MAC</b>：<code>%s</code>", d_name, html_escape(ip), html_escape(mac:upper())))
-            end
-        end
-        f:close()
-    end
-
-    local now = os.date("%Y-%m-%d %H:%M:%S")
-    local body = (#leases > 0) and table.concat(leases, "\n") or "暂无在线客户端数据"
-    local text = string.format([[👥 <b>在线客户端 (%d 台)</b>
-
-━━━━━━━━━━━━━━━━━━
-%s
-━━━━━━━━━━━━━━━━━━
-💡 <i>提示：发送 /alias 查看或为未知设备添加中文备注。</i>
-
-🕰️ <i>%s</i>]], #leases, body, now)
-
-    tg.send_msg(text)
-end
-
-local function cmd_alias(arg)
-    arg = arg and arg:match("^%s*(.-)%s*$") or ""
-    if arg == "" then
-        local aliases = sys.load_aliases()
-        local lines = {}
-        for m, n in pairs(aliases) do
-            table.insert(lines, string.format("• <code>%s</code> : <b>%s</b>", html_escape(m:upper()), html_escape(n)))
-        end
-        local list_body = (#lines > 0) and table.concat(lines, "\n") or "暂无设备备注记录"
-        local text = string.format([[🏷️ <b>设备备注管理</b>
-
-━━━━━━━━━━━━━━━━━━
-%s
-━━━━━━━━━━━━━━━━━━
-<b>使用说明：</b>
-• <b>添加/修改备注</b>：<code>/alias MAC地址 设备名字</code>
-  <i>例如：/alias 26:e2:0d:d6:08:d2 客厅电视</i>
-• <b>删除备注</b>：<code>/alias del MAC地址</code>
-
-🕰️ <i>%s</i>]], list_body, os.date("%Y-%m-%d %H:%M:%S"))
-        tg.send_msg(text)
-        return
-    end
-
-    local sub_cmd, rest = arg:match("^(%S+)%s*(.*)$")
-    sub_cmd = sub_cmd or ""
-    if sub_cmd == "del" or sub_cmd == "rm" then
-        local target_mac = rest:match("^(%S+)")
-        if target_mac and target_mac ~= "" then
-            sys.del_alias(target_mac)
-            tg.send_msg(string.format("🗑️ 已删除 MAC <code>%s</code> 的设备备注。", html_escape(target_mac:upper())))
-        else
-            tg.send_msg("⚠️ 请提供要删除的 MAC 地址，例如：<code>/alias del 26:e2:0d:d6:08:d2</code>")
-        end
-        return
-    end
-
-    local set_mac = sub_cmd
-    local set_name = rest:match("^%s*(.-)%s*$")
-    if not set_name or set_name == "" then
-        tg.send_msg("⚠️ 缺少设备名字。\n格式：<code>/alias MAC地址 设备名字</code>\n例如：<code>/alias 26:e2:0d:d6:08:d2 客厅电视</code>")
-        return
-    end
-
-    sys.set_alias(set_mac, set_name)
-    local text = string.format([[✅ <b>设备备注已保存</b>
-
-━━━━━━━━━━━━━━━━━━
-🔑 <b>MAC</b>：<code>%s</code>
-🏷️ <b>备注</b>：%s
-━━━━━━━━━━━━━━━━━━
-<i>下次查询在线设备时将直接展示该备注！</i>
-
-🕰️ <i>%s</i>]], html_escape(set_mac:upper()), html_escape(set_name), os.date("%Y-%m-%d %H:%M:%S"))
-    tg.send_msg(text)
-end
-
-local function cmd_storage()
-    local storage, block = sys.storage_info()
-    local now = os.date("%Y-%m-%d %H:%M:%S")
-    local s_text = (storage ~= "") and storage:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;") or "未获取到存储空间"
-    local b_text = (block ~= "") and block:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;") or "未获取到块设备"
-
-    local text = string.format([[💾 <b>存储状态</b>
-━━━━━━━━━━━━━━━━━━
-💾 <b>分区状态</b>：
-<pre><code>%s</code></pre>
-📦 <b>块设备</b>：
-<pre><code>%s</code></pre>
-━━━━━━━━━━━━━━━━━━
-
-🕰️ <i>%s</i>]], s_text, b_text, now)
-    tg.send_msg(text)
-end
-
-local function cmd_usb()
-    local usb = sys.usb_info():gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
-    local now = os.date("%Y-%m-%d %H:%M:%S")
-    local text = string.format([[🔌 <b>USB 拓扑</b>
-━━━━━━━━━━━━━━━━━━
-🔌 <b>设备信息</b>：
-<pre><code>%s</code></pre>
-━━━━━━━━━━━━━━━━━━
-
-🕰️ <i>%s</i>]], usb, now)
-    tg.send_msg(text)
-end
-
 local function cmd_cards(msg_id)
     if not esim_enabled() then
         if msg_id then tg.edit_msg(msg_id, "⚠️ 功能已停用") else tg.send_msg("⚠️ 功能已停用") end
@@ -605,7 +319,7 @@ local function handle_callback(cb_id, msg_id, data_str)
         local target = data_str:gsub("^do_undirect:", "")
         tg.answer_callback(cb_id, "正在删除条目...")
         tg.edit_msg(msg_id, "🗑️ 操作已确认：正在从直连白名单移除 <code>" .. html_escape(target) .. "</code>。")
-        cmd_undirect(target, true)
+        dirt.cmd_undirect(target, true)
 
     elseif data_str == "do_sys_reboot" then
         tg.answer_callback(cb_id, "正在重启路由器...")
@@ -711,13 +425,13 @@ local function handle_callback(cb_id, msg_id, data_str)
         end
 
     elseif data_str == "refresh_status" then
-        local text, kb = build_status_card()
+        local text, kb = sysm.build_status_card()
         if tg.answer_and_edit(cb_id, "🔄 正在刷新看板...", msg_id, text, kb) == nil then
             tg.send_msg(text, kb)
         end
 
     elseif data_str == "refresh_direct" then
-        cmd_direct_list(msg_id, cb_id)
+        dirt.cmd_direct_list(msg_id, cb_id)
 
     elseif data_str == "refresh_modem" then
         cmd_modem(msg_id, cb_id)
@@ -817,7 +531,7 @@ local function handle_command(text)
     elseif cmd == "/start" or cmd == "/help" or cmd == "/menu" or full:find("帮助") then
         cmd_help()
     elseif cmd == "/status" or (full:find("状态") and not full:find("模组") and not full:find("5G") and not full:find("5g")) or full:find("看板") then
-        cmd_status()
+        sysm.cmd_status()
     elseif cmd == "/uplink" or cmd == "/switch_wan" or full:find("出口") or full:find("切网") or full:find("换网") or full:find("切5G") or full:find("切5g") then
         net.cmd_uplink()
     elseif cmd == "/ping" or cmd == "/check" or cmd == "/test" or full:find("体检") or full:find("双向") or full:find("测速") then
@@ -829,26 +543,26 @@ local function handle_command(text)
     elseif cmd == "/wan" or full:find("外网") or full:find("路由") then
         net.cmd_wan()
     elseif cmd == "/temp" or full:find("温度") then
-        cmd_temp()
+        sysm.cmd_temp()
     elseif cmd == "/modem" or full:find("5G") or full:find("5g") or full:find("模组") then
         cmd_modem()
     elseif cmd == "/sms" or cmd == "/msg" or full:find("短信") or full:find("验证码") then
         local count = tonumber(arg:match("(%d+)")) or 3
         cmd_sms(count)
     elseif cmd == "/direct" or cmd == "/bypass" then
-        cmd_direct(arg)
+        dirt.cmd_direct(arg)
     elseif cmd == "/undirect" or full:find("删直连") then
-        cmd_undirect(arg)
+        dirt.cmd_undirect(arg)
     elseif cmd == "/direct_list" or full:find("白名单") or full:find("直连") then
         if arg and arg ~= "" then
-            cmd_direct(arg)
+            dirt.cmd_direct(arg)
         else
-            cmd_direct_list()
+            dirt.cmd_direct_list()
         end
     elseif cmd == "/clients" or cmd == "/devices" or full:find("设备") or full:find("客户端") then
-        cmd_clients()
+        sysm.cmd_clients()
     elseif cmd == "/alias" or full:find("备注") then
-        cmd_alias(arg)
+        dirt.cmd_alias(arg)
     elseif cmd == "/reboot" or full:find("重启系统") or full:find("重启路由器") then
         ask_confirm("重启路由器系统", "TohsakaWrt 宿主机", "全家网络将中断约 1~2 分钟，直到路由器重新启动完成", "do_sys_reboot")
     elseif cmd == "/poweroff" or cmd == "/shutdown" or full:find("关闭路由器") or full:find("路由器关机") then
@@ -858,9 +572,9 @@ local function handle_command(text)
     elseif cmd == "/clash" or full:find("核心") then
         net.cmd_clash()
     elseif cmd == "/storage" or full:find("存储") then
-        cmd_storage()
+        sysm.cmd_storage()
     elseif cmd == "/usb" or full:find("USB") or full:find("usb") then
-        cmd_usb()
+        sysm.cmd_usb()
     else
         local safe = full:gsub("%d+", function(value)
             if (#value >= 18 and #value <= 22) or #value == 32 then return value:sub(1, 6) .. "…" .. value:sub(-4) end

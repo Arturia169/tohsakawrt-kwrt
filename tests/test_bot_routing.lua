@@ -9,6 +9,11 @@ local function route_message(text)
 
     package.loaded["tohsakawrt.bot"] = nil
     package.loaded["tohsakawrt.bot_common"] = nil
+    package.loaded["tohsakawrt.bot_net"] = nil
+    package.loaded["tohsakawrt.bot_sys"] = nil
+    package.loaded["tohsakawrt.bot_direct"] = nil
+    package.loaded["tohsakawrt.bot_modem"] = nil
+    package.loaded["tohsakawrt.bot_esim"] = nil
     package.loaded["tohsakawrt.core"] = nil
     package.loaded["tohsakawrt.tg"] = nil
     package.loaded["tohsakawrt.system"] = nil

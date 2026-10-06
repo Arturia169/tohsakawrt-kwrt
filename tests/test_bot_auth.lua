@@ -19,6 +19,11 @@ local function install_bot_stubs()
 
     package.loaded["tohsakawrt.bot"] = nil
     package.loaded["tohsakawrt.bot_common"] = nil
+    package.loaded["tohsakawrt.bot_net"] = nil
+    package.loaded["tohsakawrt.bot_sys"] = nil
+    package.loaded["tohsakawrt.bot_direct"] = nil
+    package.loaded["tohsakawrt.bot_modem"] = nil
+    package.loaded["tohsakawrt.bot_esim"] = nil
     package.preload["tohsakawrt.core"] = function()
         return {
             get_uci = function(_, _, option, default)
