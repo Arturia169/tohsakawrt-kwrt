@@ -1,40 +1,14 @@
 -- TohsakaWrt Telegram Bot Daemon (Pure Lua)
 local M = {}
 
-local core = require("tohsakawrt.core")
-local tg = require("tohsakawrt.tg")
-local sys = require("tohsakawrt.system")
-local modem = require("tohsakawrt.modem")
-local clash = require("tohsakawrt.clash")
-local esim = require("tohsakawrt.esim")
-local nixio_ok, nixio = pcall(require, "nixio")
-if not nixio_ok then nixio = nil end
-
-local function html_escape(value)
-    local escaped = tostring(value or ""):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
-    return escaped
-end
+-- 共享零件统一放在 bot_common（模块引用、转义、确认框、计时、eSIM 开关）
+local bc = require("tohsakawrt.bot_common")
+local core, tg, sys, modem, clash, esim, nixio =
+    bc.core, bc.tg, bc.sys, bc.modem, bc.clash, bc.esim, bc.nixio
+local html_escape, ask_confirm, now_ms, esim_enabled =
+    bc.html_escape, bc.ask_confirm, bc.now_ms, bc.esim_enabled
 
 -- ==================== COMMAND HANDLERS ====================
-
-local function ask_confirm(title, desc, impact, confirm_action)
-    local text = string.format([[⚠️ <b>敏感操作确认</b>
-━━━━━━━━━━━━━━━━━━
-<b>操作项目</b>：<code>%s</code>
-<b>操作目标</b>：<code>%s</code>
-<b>影响评估</b>：%s
-
-❓ <b>请确认是否真的执行？</b>
-
-🕰️ <i>%s</i>]], html_escape(title), html_escape(desc), html_escape(impact), os.date("%Y-%m-%d %H:%M:%S"))
-    local inline_kb = {
-        {
-            { text = "🔴 确认执行", callback_data = confirm_action },
-            { text = "🟢 取消操作", callback_data = "cancel_action" }
-        }
-    }
-    tg.send_msg(text, inline_kb)
-end
 
 local function cmd_help()
     local text = [[🤖 <b>Telegram 机器人使用说明</b>
@@ -814,10 +788,6 @@ local function cmd_usb()
     tg.send_msg(text)
 end
 
-local function esim_enabled()
-    return core.get_uci("tohsakawrt-tgbot", "main", "esim_enabled", "1") ~= "0"
-end
-
 local function cmd_cards(msg_id)
     if not esim_enabled() then
         if msg_id then tg.edit_msg(msg_id, "⚠️ 功能已停用") else tg.send_msg("⚠️ 功能已停用") end
@@ -887,17 +857,6 @@ local function switch_profile(selector)
 end
 
 -- ==================== CALLBACK DISPATCH ====================
-
--- 计时用：/proc/uptime 精确到 0.01 秒（os.time 只有秒级，量不出按钮快慢）
-local function now_ms()
-    local f = io.open("/proc/uptime", "r")
-    if not f then return os.time() * 1000 end
-    local raw = f:read("*a")
-    f:close()
-    local sec = tonumber(raw and raw:match("^(%d+%.?%d*)"))
-    if not sec then return os.time() * 1000 end
-    return math.floor(sec * 1000)
-end
 
 local function handle_callback(cb_id, msg_id, data_str)
     local t0 = now_ms()

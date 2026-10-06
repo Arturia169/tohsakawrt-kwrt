@@ -18,6 +18,7 @@ local function install_bot_stubs()
     state_writes = 0
 
     package.loaded["tohsakawrt.bot"] = nil
+    package.loaded["tohsakawrt.bot_common"] = nil
     package.preload["tohsakawrt.core"] = function()
         return {
             get_uci = function(_, _, option, default)

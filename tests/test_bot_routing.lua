@@ -8,6 +8,7 @@ local function route_message(text)
     local status_calls = 0
 
     package.loaded["tohsakawrt.bot"] = nil
+    package.loaded["tohsakawrt.bot_common"] = nil
     package.loaded["tohsakawrt.core"] = nil
     package.loaded["tohsakawrt.tg"] = nil
     package.loaded["tohsakawrt.system"] = nil
