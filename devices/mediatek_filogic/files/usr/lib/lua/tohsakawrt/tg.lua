@@ -30,7 +30,8 @@ M.DEFAULT_KEYBOARD = {
         { { text = "🧭 节点分流" }, { text = "🔀 分流模式" } },
         { { text = "👥 在线设备" }, { text = "🌐 外网详情" } },
         { { text = "🎯 直连白名单" }, { text = "🩺 双向体检" } },
-        { { text = "🌡️ 实时温度" }, { text = "📡 5G模组" } }
+        { { text = "🌡️ 实时温度" }, { text = "📡 5G模组" } },
+        { { text = "🔄 模组重载" }, { text = "📇 卡内号码" } }
     },
     resize_keyboard = true
 }

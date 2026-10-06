@@ -7,6 +7,10 @@ local modem = require("tohsakawrt.modem")
 local clash = require("tohsakawrt.clash")
 local tg = require("tohsakawrt.tg")
 
+local function html_escape(value)
+    return tostring(value or ""):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+end
+
 function M.status()
     local uplink = sys.uplink_status()
     local temp = sys.cpu_temp()
@@ -52,11 +56,24 @@ function M.modem(args)
     if sub == "status" or not sub or sub == "" then
         local m = modem.info()
         print("Modem: Quectel RM500Q-GL")
-        print("Port: /dev/ttyUSB2")
-        print("Operator: " .. m.oper)
-        print("Band: " .. m.band)
-        print("Mode: " .. m.mode)
-        print("Cellular IP: " .. m.sim_ip)
+        print("Port: " .. (modem.get_port and modem.get_port() or "/dev/ttyUSB3"))
+        print("Operator: " .. (m.oper or "未知"))
+        print("Band: " .. (m.band or "未知"))
+        print("Mode: " .. (m.mode or "未知"))
+        if m.temp then print("Temp: " .. m.temp) end
+        if m.rsrp then print("RSRP: " .. m.rsrp) end
+        if m.sinr then print("SINR: " .. m.sinr) end
+        if m.qci then print("5QI: " .. m.qci) end
+        if m.ambr_dl then print("AMBR DL: " .. m.ambr_dl) end
+        print("Cellular IP: " .. (m.sim_ip or "未获取"))
+    elseif sub == "sms" then
+        local limit = tonumber(args[2]) or 5
+        local list = modem.sms_list and modem.sms_list("ME", limit) or {}
+        print("=== SMS Inbox (Recent " .. #list .. ") ===")
+        for i, sm in ipairs(list) do
+            local code_str = sm.code and (" [Code: " .. sm.code .. "]") or ""
+            print(string.format("[%d] %s (%s)%s:\n%s\n", i, sm.sender, sm.timestamp, code_str, sm.content))
+        end
     elseif sub == "at" then
         local cmd = table.concat(args, " ", 2)
         local out = modem.at(cmd)
@@ -65,7 +82,7 @@ function M.modem(args)
         local res = modem.keepalive_and_heal()
         print("Heal status: " .. res)
     else
-        print("Usage: tohsakawrt modem {status | heal | at <cmd>}")
+        print("Usage: tohsakawrt modem {status | sms [N] | heal | at <cmd>}")
     end
 end
 
@@ -107,7 +124,7 @@ function M.notify(args)
         print("Usage: tohsakawrt notify <text>")
         return
     end
-    tg.send_msg(text)
+    tg.send_msg("ℹ️ " .. html_escape(text))
 end
 
 function M.main(argv)

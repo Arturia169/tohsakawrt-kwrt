@@ -114,4 +114,14 @@ fi
 /etc/init.d/cron enable
 /etc/init.d/cron restart >/dev/null 2>&1
 
+# 8. 5G 数据自愈开关与无数据业务 SIM 前缀白名单
+uci -q get tohsakawrt-tgbot.main.modem_data_heal >/dev/null 2>&1 || uci set tohsakawrt-tgbot.main.modem_data_heal='1'
+uci -q get tohsakawrt-tgbot.main.esim_enabled >/dev/null 2>&1 || uci set tohsakawrt-tgbot.main.esim_enabled='1'
+uci -q get tohsakawrt-tgbot.main.nodata_cards >/dev/null 2>&1 || {
+    uci add_list tohsakawrt-tgbot.main.nodata_cards='89852'
+    uci add_list tohsakawrt-tgbot.main.nodata_cards='89372'
+    uci add_list tohsakawrt-tgbot.main.nodata_cards='89995'
+}
+uci commit tohsakawrt-tgbot
+
 exit 0

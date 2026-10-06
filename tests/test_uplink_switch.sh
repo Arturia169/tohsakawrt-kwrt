@@ -2,7 +2,14 @@
 set -u
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-SCRIPT="$ROOT/devices/mediatek_filogic/files/usr/bin/tohsakawrt-uplink"
+# 兼容两种仓库布局：构建仓 devices/mediatek_filogic/files/... 与开发树 files/...
+SCRIPT=""
+for candidate in \
+    "$ROOT/devices/mediatek_filogic/files/usr/bin/tohsakawrt-uplink" \
+    "$ROOT/files/usr/bin/tohsakawrt-uplink" ; do
+    [ -f "$candidate" ] && SCRIPT="$candidate" && break
+done
+SCRIPT="${UPLINK_SCRIPT_OVERRIDE:-${SCRIPT:-$ROOT/files/usr/bin/tohsakawrt-uplink}}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 BIN="$TMP/bin"

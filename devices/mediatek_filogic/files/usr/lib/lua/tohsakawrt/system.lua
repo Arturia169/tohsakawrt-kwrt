@@ -181,7 +181,7 @@ function M.public_ip(force)
     if out and out ~= "" then
         local ip = out:match("(%d+%.%d+%.%d+%.%d+)")
         local loc = out:match("来自于：(.*)") or out:match("来自于:(.*)")
-        if loc then loc = loc:match("^%s*(.-)%s*$") end
+        if loc then loc = loc:gsub("%s+", " "):match("^%s*(.-)%s*$") end
         if ip then
             res = string.format("%s (%s)", ip, (loc and loc ~= "") and loc or "未知")
         end
@@ -390,9 +390,9 @@ function M.ping_metric(target, count)
         elseif num >= 80 then icon = "🟡" end
         local loss_num = tonumber(loss) or 0
         local loss_str = (loss_num > 0) and string.format("%d%% 丢包", loss_num) or "0% 丢包"
-        return string.format("%s <code>%.1f ms</code> (%s)", icon, num, loss_str)
+        return true, icon, string.format("%.1f", num), loss_str
     else
-        return "🔴 <code>超时不可达</code> (100% 丢包)"
+        return false, "🔴", "超时不可达", "100% 丢包"
     end
 end
 
@@ -405,9 +405,9 @@ function M.http_metric(url)
         local icon = "🟢"
         if ms >= 1000 then icon = "🟠"
         elseif ms >= 500 then icon = "🟡" end
-        return string.format("%s <code>%d ms</code>", icon, ms)
+        return true, icon, tostring(ms)
     else
-        return "🔴 <code>请求超时</code>"
+        return false, "🔴", "请求超时"
     end
 end
 

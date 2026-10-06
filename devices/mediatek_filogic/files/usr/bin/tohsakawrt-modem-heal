@@ -1,6 +1,8 @@
 #!/bin/sh
 
-AT_PORT="${TWR_HEAL_AT_PORT:-/dev/ttyUSB2}"
+AT_PORT="${TWR_HEAL_AT_PORT:-$(uci -q get modem.modem0.at_port || echo '/dev/ttyUSB3')}"
+[ -e "$AT_PORT" ] || [ "${TWR_HEAL_AT_PORT_FAKE:-0}" = "1" ] || AT_PORT="/dev/ttyUSB3"
+[ -e "$AT_PORT" ] || [ "${TWR_HEAL_AT_PORT_FAKE:-0}" = "1" ] || AT_PORT="/dev/ttyUSB2"
 AT_SCRIPT="${TWR_HEAL_AT_SCRIPT:-/usr/share/modem/modem_at.sh}"
 NET_CLASS_DIR="${TWR_HEAL_NET_CLASS_DIR:-/sys/class/net}"
 MM_INIT="/etc/init.d/modemmanager"
@@ -118,13 +120,62 @@ fi
 
 heal_cellular_data() {
     local dev="usb0"
-    [ -d "$NET_CLASS_DIR/$dev" ] || return 0
 
     local now="$(date +%s 2>/dev/null)"
     local fail_count_file="$STATE_DIR/tohsakawrt-5g-data.fails"
     local first_fail_file="$STATE_DIR/tohsakawrt-5g-data.firstfail"
     local last_heal_file="$STATE_DIR/tohsakawrt-5g-data.lastheal"
     local active_alert_file="$STATE_DIR/tohsakawrt-5g-data.active-alert"
+    local nodata_mode_file="$STATE_DIR/tohsakawrt-5g-data.nodata-mode"
+
+    local iccid=""
+    local at_reply=""
+    if [ -x "$AT_SCRIPT" ] && [ -e "$AT_PORT" ]; then
+        at_reply="$(sh "$AT_SCRIPT" "$AT_PORT" 'AT+QCCID' 2>/dev/null)"
+        iccid="$(printf '%s\n' "$at_reply" | sed -n '/QCCID:/s/.*QCCID:[[:space:]]*//p' | tail -n 1 | tr -d '\"[:space:]' | tr '[:lower:]' '[:upper:]' | tr -cd '0-9A-F')"
+        if [ -z "$iccid" ] || printf '%s' "$at_reply" | grep -qi 'ERROR'; then
+            at_reply="$(sh "$AT_SCRIPT" "$AT_PORT" 'AT+CCID' 2>/dev/null)"
+            iccid="$(printf '%s\n' "$at_reply" | sed -n '/CCID:/s/.*CCID:[[:space:]]*//p' | tail -n 1 | tr -d '\"[:space:]' | tr '[:lower:]' '[:upper:]' | tr -cd '0-9A-F')"
+        fi
+    fi
+
+    local modem_data_heal="$(uci -q get tohsakawrt-tgbot.main.modem_data_heal 2>/dev/null)"
+    local nodata_cards="$(uci -q get tohsakawrt-tgbot.main.nodata_cards 2>/dev/null)"
+    local nodata_prefix=""
+    if [ "$modem_data_heal" = "0" ]; then
+        nodata_prefix="modem_data_heal=0"
+    elif [ -n "$iccid" ]; then
+        while IFS= read -r candidate; do
+            candidate="$(printf '%s' "$candidate" | tr -d '\"[:space:]' | tr '[:lower:]' '[:upper:]' | tr -cd '0-9A-F')"
+            [ -n "$candidate" ] || continue
+            case "$iccid" in
+                "$candidate"*) nodata_prefix="$candidate"; break ;;
+            esac
+        done <<EOF_NODATA
+$(printf '%s\n' "$nodata_cards" | tr ' ' '\n')
+EOF_NODATA
+    fi
+
+    local nodata_state="normal"
+    [ -n "$iccid" ] || nodata_state="unknown"
+    [ -n "$nodata_prefix" ] && nodata_state="silent:$nodata_prefix"
+    local previous_nodata_state="$(cat "$nodata_mode_file" 2>/dev/null)"
+    if [ "$nodata_state" != "$previous_nodata_state" ]; then
+        case "$nodata_state" in
+            silent:modem_data_heal=0) logger -t tohsakawrt-modem-heal "5G data heal paused by modem_data_heal=0" ;;
+            silent:*) logger -t tohsakawrt-modem-heal "接码卡已识别（ICCID 前缀 ${nodata_state#silent:}）：暂停数据自愈" ;;
+            unknown) logger -t tohsakawrt-modem-heal "ICCID 读取失败，按数据卡处理并继续数据自愈" ;;
+            normal) [ -z "$previous_nodata_state" ] || logger -t tohsakawrt-modem-heal "已恢复数据自愈" ;;
+        esac
+        printf '%s\n' "$nodata_state" > "$nodata_mode_file" 2>/dev/null
+    fi
+    case "$nodata_state" in
+        silent:*)
+            rm -f "$fail_count_file" "$first_fail_file" "$last_heal_file" 2>/dev/null
+            return 0
+            ;;
+    esac
+    [ -d "$NET_CLASS_DIR/$dev" ] || return 0
     local ip="$(ip -4 addr show "$dev" 2>/dev/null | awk '/inet / {print $2}')"
 
     # 2. 独立链路心跳探测：绑定 usb0 网卡探测阿里 DNS (223.5.5.5) 或腾讯 DNS (119.29.29.29)
@@ -157,7 +208,7 @@ heal_cellular_data() {
             local last_alert="$(cat "$active_alert_file" 2>/dev/null)"
             if [ -z "$last_alert" ] || [ "$((now - last_alert))" -ge 1800 ]; then
                 if command -v send_tg >/dev/null 2>&1; then
-                    send_tg "⚠️ <b>5G 主出口探测超时</b>\n\n5G 正在承载主出口，探测超时，已按策略不做动作。" "HTML"
+                    send_tg "⚠️ <b>5G 主出口探测超时</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>探测结果</b>：5G 正在承载主出口，探测超时，已按策略不做动作\n━━━━━━━━━━━━━━━━━━\n\n🕰️ <i>$(date '+%Y-%m-%d %H:%M:%S')</i>" "HTML"
                 fi
                 echo "$now" > "$active_alert_file"
             fi
@@ -204,8 +255,12 @@ heal_cellular_data() {
             sleep 3
             ifup 5Ga 2>/dev/null
         fi
-        if command -v send_tg >/dev/null 2>&1; then
-            send_tg "⚠️ <b>5G 热备链路脱网告警</b>\n\n检测到 5G 模组连续 5 次数据探测超时，已执行射频重注网自愈，请留意模组连接状态。" "HTML"
+        local last_alert="$(cat "$active_alert_file" 2>/dev/null)"
+        if [ -z "$last_alert" ] || [ "$((now - last_alert))" -ge 1800 ]; then
+            if command -v send_tg >/dev/null 2>&1; then
+                send_tg "🔴 <b>5G 热备链路脱网告警</b>\n━━━━━━━━━━━━━━━━━━\n📊 <b>探测结果</b>：连续 5 次数据探测超时\n🔄 <b>已执行动作</b>：射频重注网自愈\n━━━━━━━━━━━━━━━━━━\n<i>请留意模组连接状态。</i>\n\n🕰️ <i>$(date '+%Y-%m-%d %H:%M:%S')</i>" "HTML"
+            fi
+            echo "$now" > "$active_alert_file"
         fi
     fi
 }

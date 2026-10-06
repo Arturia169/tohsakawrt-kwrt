@@ -17,6 +17,10 @@ BOOT_SENT="$STATE_DIR/boot_sent"
 
 [ -r /usr/lib/tohsakawrt/common.sh ] && . /usr/lib/tohsakawrt/common.sh
 
+html_escape() {
+    printf '%s' "$1" | sed 's/\&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
 mkdir -p "$STATE_DIR"
 
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -113,10 +117,10 @@ if [ "$WAN_UP" -eq 1 ]; then
         DURATION=$(($(date +%s) - DOWN_AT))
         DURATION_TEXT="$(format_duration "$DURATION")"
 
-        BODY="✅ TohsakaWrt 网络已恢复\n\n━━━━━━━━━━━━━━\n📡 接口：${WAN_DEV}\n🟢 状态：网络可用\n⏱️ 离线：${DURATION_TEXT}\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n外网连接已恢复正常。"
+        BODY="✅ <b>网络已恢复</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n🟢 <b>状态</b>：网络可用\n⏱️ <b>离线时长</b>：<code>$(html_escape "$DURATION_TEXT")</code>\n━━━━━━━━━━━━━━━━━━\n<i>外网连接已恢复正常。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
         push_bark \
-            "✅ TohsakaWrt 网络已恢复" \
+            "✅ 网络已恢复" \
             "$BODY" \
             "active" \
             "glass"
@@ -144,10 +148,10 @@ else
         logger -t TohsakaWrt-Watch \
             "WAN offline after 3 consecutive checks"
 
-        BODY="🌐 TohsakaWrt 网络异常\n\n━━━━━━━━━━━━━━\n📡 接口：${WAN_DEV}\n🔴 状态：外网不可达\n📊 检测：连续 3 次失败\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n已记录离线开始时间。恢复后会自动推送离线时长。"
+        BODY="🔴 <b>网络异常</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n🔴 <b>状态</b>：外网不可达\n📊 <b>检测</b>：连续 3 次失败\n━━━━━━━━━━━━━━━━━━\n<i>已记录离线开始时间。恢复后会自动推送离线时长。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
         push_bark \
-            "🌐 TohsakaWrt 网络异常" \
+            "🔴 网络异常" \
             "$BODY" \
             "timeSensitive" \
             "alarm" || true
@@ -173,7 +177,7 @@ network_get_ipaddr6 CUR_IP6 wan_6 2>/dev/null || network_get_ipaddr6 CUR_IP6 wan
 if [ -n "$CUR_IP" ] && [ "$WAN_UP" -eq 1 ]; then
     OLD_IP="$(cat "$WAN_IP_FILE" 2>/dev/null)"
     if [ -n "$OLD_IP" ] && [ "$OLD_IP" != "$CUR_IP" ]; then
-        IP_BODY="🌐 TohsakaWrt WAN IP 变动\n\n━━━━━━━━━━━━━━\n📡 接口：${WAN_DEV}\n🔻 原 IPv4：${OLD_IP}\n🔺 新 IPv4：${CUR_IP}\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━"
+        IP_BODY="🌐 <b>WAN IP 变动</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n🔻 <b>原 IPv4</b>：<code>$(html_escape "$OLD_IP")</code>\n🔺 <b>新 IPv4</b>：<code>$(html_escape "$CUR_IP")</code>\n━━━━━━━━━━━━━━━━━━\n\n🕰️ <i>$(html_escape "$NOW")</i>"
         push_bark "🌐 WAN IP 变动提醒" "$IP_BODY" "active" "bell"
         send_tg "$IP_BODY" HTML
         logger -t TohsakaWrt-Watch "WAN IP changed: ${OLD_IP} -> ${CUR_IP}"
@@ -184,7 +188,7 @@ fi
 if [ -n "$CUR_IP6" ] && [ "$WAN_UP" -eq 1 ]; then
     OLD_IP6="$(cat "$WAN_IP6_FILE" 2>/dev/null)"
     if [ -n "$OLD_IP6" ] && [ "$OLD_IP6" != "$CUR_IP6" ]; then
-        IP6_BODY="🌐 TohsakaWrt IPv6 变动\n\n━━━━━━━━━━━━━━\n📡 接口：${WAN_DEV}\n🔻 原 IPv6：${OLD_IP6}\n🔺 新 IPv6：${CUR_IP6}\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━"
+        IP6_BODY="🌐 <b>IPv6 变动</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n🔻 <b>原 IPv6</b>：<code>$(html_escape "$OLD_IP6")</code>\n🔺 <b>新 IPv6</b>：<code>$(html_escape "$CUR_IP6")</code>\n━━━━━━━━━━━━━━━━━━\n\n🕰️ <i>$(html_escape "$NOW")</i>"
         push_bark "🌐 IPv6 变动提醒" "$IP6_BODY" "active" "bell"
         send_tg "$IP6_BODY" HTML
         logger -t TohsakaWrt-Watch "WAN IPv6 changed"
@@ -214,7 +218,7 @@ elif [ "$NIKKI_RUNNING" -eq 1 ]; then
         DURATION=$(($(date +%s) - DOWN_AT))
         DURATION_TEXT="$(format_duration "$DURATION")"
 
-        BODY="✅ OpenClash 已恢复\n\n━━━━━━━━━━━━━━\n🟢 核心：Clash API 正常\n🌐 外网：$([ "$WAN_UP" -eq 1 ] && echo 正常 || echo 异常)\n⏱️ 故障：${DURATION_TEXT}\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\nOpenClash 核心已重新响应。"
+        BODY="✅ <b>OpenClash 已恢复</b>\n━━━━━━━━━━━━━━━━━━\n🟢 <b>核心</b>：Clash API 正常\n🌐 <b>外网</b>：$([ "$WAN_UP" -eq 1 ] && echo 正常 || echo 异常)\n⏱️ <b>故障时长</b>：<code>$(html_escape "$DURATION_TEXT")</code>\n━━━━━━━━━━━━━━━━━━\n<i>OpenClash 核心已重新响应。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
         push_bark \
             "✅ OpenClash 已恢复" \
@@ -246,7 +250,7 @@ else
 
     if [ "$WAN_UP" -eq 1 ] && [ ! -f "$NIKKI_ALERTED" ]; then
 
-        BODY="🧩 OpenClash 运行异常\n\n━━━━━━━━━━━━━━\n📦 插件：已启用\n🔴 核心：Clash 未响应\n🌐 外网：正常\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n请检查 OpenClash 核心状态或最近的节点配置。"
+        BODY="🔴 <b>OpenClash 运行异常</b>\n━━━━━━━━━━━━━━━━━━\n📦 <b>插件</b>：已启用\n🔴 <b>核心</b>：Clash 未响应\n🌐 <b>外网</b>：正常\n━━━━━━━━━━━━━━━━━━\n<i>请检查 OpenClash 核心状态或最近的节点配置。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
         push_bark \
             "🧩 OpenClash 运行异常" \
@@ -266,7 +270,9 @@ fi
 # ==========================================================
 
 MOBILE_STATE_FILE="${STATE_DIR}/mobile_state"
-AT_PORT="/dev/ttyUSB2"
+AT_PORT="$(uci -q get modem.modem0.at_port || echo '/dev/ttyUSB3')"
+[ -e "$AT_PORT" ] || AT_PORT="/dev/ttyUSB3"
+[ -e "$AT_PORT" ] || AT_PORT="/dev/ttyUSB2"
 MODEM_AT="/usr/share/modem/modem_at.sh"
 MOBILE_HISTORY_FILE="/root/tohsakawrt-logs/5g-history.log"
 mkdir -p /root/tohsakawrt-logs
@@ -339,10 +345,10 @@ if [ -e "$AT_PORT" ] && [ -x "$MODEM_AT" ]; then
 
         elif [ "$MOBILE_STATE" = "4g" ] && [ "$OLD_MOBILE_STATE" = "5g" ]; then
 
-            MOBILE_BODY="📶 TohsakaWrt 5G 已降级\n\n━━━━━━━━━━━━━━\n📡 运营商：${MOBILE_OPERATOR}\n📶 当前：${MOBILE_MODE}\n📻 频段：${MOBILE_BAND}\n🔻 变化：5G → 4G\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n可能是附近 5G 小区暂时不可用。恢复 5G 后会自动通知。"
+            MOBILE_BODY="⚠️ <b>5G 已降级</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>运营商</b>：$(html_escape "$MOBILE_OPERATOR")\n📶 <b>当前制式</b>：<code>$(html_escape "$MOBILE_MODE")</code>\n📻 <b>频段</b>：<code>$(html_escape "$MOBILE_BAND")</code>\n🔻 <b>变化</b>：5G → 4G\n━━━━━━━━━━━━━━━━━━\n<i>可能是附近 5G 小区暂时不可用。恢复 5G 后会自动通知。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
             push_bark \
-                "📶 TohsakaWrt 5G 已降级" \
+                "⚠️ 5G 已降级" \
                 "$MOBILE_BODY" \
                 "timeSensitive" \
                 "bell"
@@ -358,10 +364,10 @@ if [ -e "$AT_PORT" ] && [ -x "$MODEM_AT" ]; then
 
         elif [ "$MOBILE_STATE" = "5g" ] && [ "$OLD_MOBILE_STATE" = "4g" ]; then
 
-            MOBILE_BODY="📡 TohsakaWrt 5G 已恢复\n\n━━━━━━━━━━━━━━\n📡 运营商：${MOBILE_OPERATOR}\n📶 当前：${MOBILE_MODE}\n📻 频段：${MOBILE_BAND}\n🔺 变化：4G → 5G\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n移动网络已重新接入 5G。"
+            MOBILE_BODY="✅ <b>5G 已恢复</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>运营商</b>：$(html_escape "$MOBILE_OPERATOR")\n📶 <b>当前制式</b>：<code>$(html_escape "$MOBILE_MODE")</code>\n📻 <b>频段</b>：<code>$(html_escape "$MOBILE_BAND")</code>\n🔺 <b>变化</b>：4G → 5G\n━━━━━━━━━━━━━━━━━━\n<i>移动网络已重新接入 5G。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
             push_bark \
-                "📡 TohsakaWrt 5G 已恢复" \
+                "✅ 5G 已恢复" \
                 "$MOBILE_BODY" \
                 "active" \
                 "glass"
@@ -392,7 +398,7 @@ if [ "$WAN_UP" -eq 1 ] && [ ! -f "$BOOT_SENT" ]; then
         NIKKI_TEXT="运行异常"
     fi
 
-    BODY="✅ TohsakaWrt 已上线\n\n━━━━━━━━━━━━━━\n📟 设备：Cudy TR3000\n⏱️ 运行：${UPTIME_TEXT}\n🌡️ 温度：${TEMP}\n🧠 可用内存：${MEM}\n📡 上网接口：${WAN_DEV}\n🧩 OpenClash：${NIKKI_TEXT}\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n启动自检完成。"
+    BODY="✅ <b>TohsakaWrt 已上线</b>\n━━━━━━━━━━━━━━━━━━\n📟 <b>设备</b>：<code>Cudy TR3000</code>\n⏱️ <b>运行时长</b>：<code>$(html_escape "$UPTIME_TEXT")</code>\n🌡️ <b>温度</b>：<code>$(html_escape "$TEMP")</code>\n🧠 <b>可用内存</b>：<code>$(html_escape "$MEM")</code>\n📡 <b>上网接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n🧩 <b>OpenClash</b>：$(html_escape "$NIKKI_TEXT")\n━━━━━━━━━━━━━━━━━━\n<i>启动自检完成。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
     push_bark \
         "✅ TohsakaWrt 已上线" \
@@ -435,7 +441,7 @@ if [ -f "$DHCP_LEASES" ]; then
                 fi
                 [ -n "$alias_name" ] && device_name="${alias_name} (${device_name})"
 
-                DEV_BODY="🔔 新设备接入局域网\n\n━━━━━━━━━━━━━━\n📱 设备：${device_name}\n🏠 分配 IP：${ip}\n🔑 MAC：$(echo "$mac" | tr '[:lower:]' '[:upper:]')\n🕰️ 时间：${NOW}\n━━━━━━━━━━━━━━\n\n如非本人设备请留意网络安全。"
+                DEV_BODY="🔔 <b>新设备接入局域网</b>\n━━━━━━━━━━━━━━━━━━\n📱 <b>设备</b>：$(html_escape "$device_name")\n🏠 <b>分配 IP</b>：<code>$(html_escape "$ip")</code>\n🔑 <b>MAC</b>：<code>$(html_escape "$(echo "$mac" | tr '[:lower:]' '[:upper:]')")</code>\n━━━━━━━━━━━━━━━━━━\n<i>如非本人设备请留意网络安全。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
                 push_bark "🔔 新设备接入" "$DEV_BODY" "timeSensitive" "bell"
                 send_tg "$DEV_BODY" HTML
@@ -489,7 +495,7 @@ if [ -n "$WAN_DEV" ] && [ "$WAN_DEV" != "未知" ]; then
                             PEAK_SPEED="$SPEED_BPS"
 
                             SPEED_STR="$(format_traffic_speed "$SPEED_BPS")"
-                            ALERT_BODY="🚀 <b>检测到持续高带宽下载</b>\n\n━━━━━━━━━━━━━━\n⬇️ <b>过去1分钟均速</b>：<code>${SPEED_STR}</code>\n⏱️ <b>持续时间</b>：已持续 &gt; 1 分钟\n📡 <b>监控接口</b>：<code>${WAN_DEV}</code>\n🕰️ <b>触发时间</b>：${NOW}\n━━━━━━━━━━━━━━\n\n💡 <i>大流量监测中，结束后自动推送汇总。</i>"
+                            ALERT_BODY="🚀 <b>检测到持续高带宽下载</b>\n━━━━━━━━━━━━━━━━━━\n⬇️ <b>过去 1 分钟均速</b>：<code>$(html_escape "$SPEED_STR")</code>\n⏱️ <b>持续时间</b>：已持续 &gt; 1 分钟\n📡 <b>监控接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n━━━━━━━━━━━━━━━━━━\n<i>大流量监测中，结束后自动推送汇总。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
                             push_bark "🚀 持续高带宽下载" "$(echo -e "$ALERT_BODY" | sed 's/<[^>]*>//g')" "timeSensitive" "minuet"
                             send_tg "$ALERT_BODY" HTML
@@ -510,7 +516,7 @@ if [ -n "$WAN_DEV" ] && [ "$WAN_DEV" != "未知" ]; then
                                 PEAK_STR="$(awk -v s="$PEAK_SPEED" 'BEGIN {printf "%.1f MB/s", s/1048576}')"
                                 AVG_STR="$(format_traffic_speed "$AVG_SPEED")"
 
-                                REPORT_BODY="🏁 <b>高带宽下载已结束</b>\n\n━━━━━━━━━━━━━━\n⏱️ <b>总持续时长</b>：<code>${TOTAL_DUR}</code>\n⚡ <b>最高峰值</b>：<code>${PEAK_STR}</code>\n📊 <b>全程均速</b>：<code>${AVG_STR}</code>\n💾 <b>总计消耗</b>：<code>${TOTAL_SIZE}</code>\n📡 <b>监控接口</b>：<code>${WAN_DEV}</code>\n🕰️ <b>结束时间</b>：${NOW}\n━━━━━━━━━━━━━━\n\n<i>带宽已恢复至日常水平。</i>"
+                                REPORT_BODY="🏁 <b>高带宽下载已结束</b>\n━━━━━━━━━━━━━━━━━━\n⏱️ <b>总持续时长</b>：<code>$(html_escape "$TOTAL_DUR")</code>\n⚡ <b>最高峰值</b>：<code>$(html_escape "$PEAK_STR")</code>\n📊 <b>全程均速</b>：<code>$(html_escape "$AVG_STR")</code>\n💾 <b>总计消耗</b>：<code>$(html_escape "$TOTAL_SIZE")</code>\n📡 <b>监控接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n━━━━━━━━━━━━━━━━━━\n<i>带宽已恢复至日常水平。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
                                 push_bark "🏁 高带宽下载已结束" "$(echo -e "$REPORT_BODY" | sed 's/<[^>]*>//g')" "active" "glass"
                                 send_tg "$REPORT_BODY" HTML

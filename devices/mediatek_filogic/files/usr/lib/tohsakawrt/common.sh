@@ -161,7 +161,7 @@ get_wan_public_ip() {
     ipip="$(curl -s -m 2 http://myip.ipip.net 2>/dev/null)"
     if [ -n "$ipip" ]; then
         local ip="$(echo "$ipip" | awk '{print $2}' | sed 's/当前//; s/IP：//')"
-        local loc="$(echo "$ipip" | sed -n 's/.*来自于：//p')"
+        local loc="$(echo "$ipip" | sed -n 's/.*来自于：//p' | awk '{$1=$1; print}')"
         echo "${ip:-未知} (${loc:-未知})"
     else
         echo "未获取到"
