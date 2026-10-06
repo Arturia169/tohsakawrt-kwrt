@@ -159,7 +159,9 @@ function M.sms_list(storage, limit)
 
     local cmd = string.format("sms_tool -d %s -s %s -j recv 2>/dev/null", port, storage)
     local raw = core.exec(cmd)
-    local data = raw and json.parse(raw)
+    if not raw or raw == "" then return nil end
+    local ok, data = pcall(json.parse, raw)
+    if not ok or type(data) ~= "table" then return nil end
     local msgs = (data and data.msg) or {}
 
     local multipart = {}
@@ -233,6 +235,7 @@ function M.sms_poll_new()
     if last_used == -1 then
         -- 首次启动记录当前最新短信，避免历史短信刷屏
         local list = M.sms_list("ME", 1)
+        if not list then return {} end
         local latest_ts = (list and list[1] and list[1].sort_time) or 0
         core.set_state("sms_last_used", tostring(cur_used))
         core.set_state("sms_last_ts", tostring(latest_ts))
@@ -247,6 +250,7 @@ function M.sms_poll_new()
     end
 
     local all_sms = M.sms_list("ME", 10)
+    if not all_sms then return {} end
     local new_sms = {}
     local max_ts = last_ts
 

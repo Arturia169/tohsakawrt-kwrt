@@ -7,6 +7,8 @@ local sys = require("tohsakawrt.system")
 local modem = require("tohsakawrt.modem")
 local clash = require("tohsakawrt.clash")
 local esim = require("tohsakawrt.esim")
+local nixio_ok, nixio = pcall(require, "nixio")
+if not nixio_ok then nixio = nil end
 
 local function html_escape(value)
     local escaped = tostring(value or ""):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")

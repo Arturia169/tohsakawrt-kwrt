@@ -6,6 +6,15 @@ local json = require("luci.jsonc")
 
 local API_BASE = "http://127.0.0.1:9090"
 
+-- Keep quoting local so offline tests that stub core still exercise this file's real quoting logic.
+local function shell_quote(value)
+    return "'" .. tostring(value):gsub("[\n\r\t]", " "):gsub("'", "'\\''") .. "'"
+end
+
+local function valid_target(t)
+    return type(t) == "string" and (t:match("^[%w_%.%-%:]+$") or t:match("^[%w_%.%-%:]+/%d+$"))
+end
+
 local function api_get(endpoint, timeout)
     timeout = timeout or 3
     local cmd = string.format("curl -s -m %d '%s%s'", timeout, API_BASE, endpoint)
@@ -167,12 +176,14 @@ function M.direct_list()
 end
 
 function M.direct_add(target)
-    local res = core.exec_line(string.format('/usr/bin/tohsaka-direct add "%s" 2>/dev/null', target))
+    if not valid_target(target) then return "ERROR:invalid_target" end
+    local res = core.exec_line("/usr/bin/tohsaka-direct add " .. shell_quote(target) .. " 2>/dev/null")
     return res
 end
 
 function M.direct_del(target)
-    local res = core.exec_line(string.format('/usr/bin/tohsaka-direct del "%s" 2>/dev/null', target))
+    if not valid_target(target) then return "ERROR:invalid_target" end
+    local res = core.exec_line("/usr/bin/tohsaka-direct del " .. shell_quote(target) .. " 2>/dev/null")
     return res
 end
 

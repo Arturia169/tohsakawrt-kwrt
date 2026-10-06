@@ -2,9 +2,9 @@
 # Tohsaka-Direct: OpenClash 直连白名单管理工具
 # 支持 Telegram Bot 及 Shell CLI 快速增删查与热重载
 
-LIST_FILE="/etc/openclash/tg_direct_rules.list"
-RUN_YAML="/etc/openclash/config.yaml"
-BAK_YAML="/etc/openclash/config/config.yaml"
+LIST_FILE="${TG_DIRECT_LIST:-/etc/openclash/tg_direct_rules.list}"
+RUN_YAML="${TG_DIRECT_RUN_YAML:-/etc/openclash/config.yaml}"
+BAK_YAML="${TG_DIRECT_BAK_YAML:-/etc/openclash/config/config.yaml}"
 API_URL="http://127.0.0.1:9090/configs?force=true"
 
 mkdir -p /etc/openclash 2>/dev/null
@@ -154,7 +154,8 @@ case "$1" in
             # 找到对应行的内容
             target="$(awk 'NF && !/^#/ {count++; if(count=='"$arg"') {print; exit}}' "$LIST_FILE")"
             if [ -n "$target" ]; then
-                grep -Fxv "$target" "$LIST_FILE" > "${LIST_FILE}.tmp" && mv "${LIST_FILE}.tmp" "$LIST_FILE"
+                grep -Fxv "$target" "$LIST_FILE" > "${LIST_FILE}.tmp"
+                if ! mv "${LIST_FILE}.tmp" "$LIST_FILE"; then rm -f "${LIST_FILE}.tmp"; echo "ERROR:delete_failed"; exit 1; fi
                 sync_rules_to_yaml "$RUN_YAML"
                 sync_rules_to_yaml "$BAK_YAML"
                 reload_clash
@@ -166,7 +167,8 @@ case "$1" in
         else
             target="$(clean_input "$arg")"
             if grep -Fxq "$target" "$LIST_FILE" 2>/dev/null; then
-                grep -Fxv "$target" "$LIST_FILE" > "${LIST_FILE}.tmp" && mv "${LIST_FILE}.tmp" "$LIST_FILE"
+                grep -Fxv "$target" "$LIST_FILE" > "${LIST_FILE}.tmp"
+                if ! mv "${LIST_FILE}.tmp" "$LIST_FILE"; then rm -f "${LIST_FILE}.tmp"; echo "ERROR:delete_failed"; exit 1; fi
                 sync_rules_to_yaml "$RUN_YAML"
                 sync_rules_to_yaml "$BAK_YAML"
                 reload_clash
