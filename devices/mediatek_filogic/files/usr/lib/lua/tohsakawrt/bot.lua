@@ -880,7 +880,19 @@ end
 
 -- ==================== CALLBACK DISPATCH ====================
 
+-- 计时用：/proc/uptime 精确到 0.01 秒（os.time 只有秒级，量不出按钮快慢）
+local function now_ms()
+    local f = io.open("/proc/uptime", "r")
+    if not f then return os.time() * 1000 end
+    local raw = f:read("*a")
+    f:close()
+    local sec = tonumber(raw and raw:match("^(%d+%.?%d*)"))
+    if not sec then return os.time() * 1000 end
+    return math.floor(sec * 1000)
+end
+
 local function handle_callback(cb_id, msg_id, data_str)
+    local t0 = now_ms()
     if data_str == "cancel_action" then
         tg.answer_callback(cb_id, "操作已取消")
         tg.edit_msg(msg_id, "🛡️ <b>操作已取消</b>\n\n未对系统或服务进行任何修改。")
@@ -1056,6 +1068,8 @@ local function handle_callback(cb_id, msg_id, data_str)
 
         tg.edit_msg(msg_id, new_text, inline_kb)
     end
+
+    core.log("Tohsaka-Bot", string.format("Callback %s 用时 %.1f 秒", tostring(data_str), (now_ms() - t0) / 1000))
 end
 
 -- ==================== COMMAND DISPATCH ====================
@@ -1069,6 +1083,7 @@ local function handle_command(text)
         return value
     end)
     core.log("Tohsaka-Bot", "Command: " .. log_text)
+    local t_cmd0 = now_ms()
 
     local cmd, arg
     if text:sub(1, 1) == "/" then
@@ -1156,6 +1171,8 @@ local function handle_command(text)
         end):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
         tg.send_msg(string.format("⚠️ <b>未识别的命令</b>：<code>%s</code>\n\n发送 /help 或点击下方键盘查看可用命令。", safe))
     end
+
+    core.log("Tohsaka-Bot", string.format("Command %s 用时 %.1f 秒", tostring(cmd), (now_ms() - t_cmd0) / 1000))
 end
 
 -- ==================== MAIN EVENT LOOP ====================
