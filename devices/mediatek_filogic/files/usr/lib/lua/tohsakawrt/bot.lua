@@ -174,7 +174,7 @@ local function handle_callback(cb_id, msg_id, data_str)
         tg.edit_msg(msg_id, new_text, inline_kb)
 
     elseif data_str == "open_uplink_menu" then
-        local text, kb = build_uplink_menu()
+        local text, kb = net.build_uplink_menu()
         if tg.answer_and_edit(cb_id, "🔀 正在打开出口切换菜单...", msg_id, text, kb) == nil then
             tg.send_msg(text, kb)
         end

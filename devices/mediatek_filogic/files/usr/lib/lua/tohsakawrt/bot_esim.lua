@@ -3,7 +3,7 @@
 local bc = require("tohsakawrt.bot_common")
 local core, tg, sys, modem, clash, esim, nixio =
     bc.core, bc.tg, bc.sys, bc.modem, bc.clash, bc.esim, bc.nixio
-local html_escape, ask_confirm = bc.html_escape, bc.ask_confirm
+local html_escape, ask_confirm, esim_enabled = bc.html_escape, bc.ask_confirm, bc.esim_enabled
 
 local M = {}
 

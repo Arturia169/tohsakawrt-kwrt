@@ -7,7 +7,7 @@ local html_escape, ask_confirm = bc.html_escape, bc.ask_confirm
 
 local M = {}
 
-local function build_uplink_menu()
+function M.build_uplink_menu()
     local uplink = sys.uplink_status()
     local cur_name = (uplink.type == "wan") and "有线宽带 (eth0)" or ((uplink.type == "5g") and "5G 蜂窝网络 (usb0)" or (tostring(uplink.dev or "unknown") .. " (未知接口)"))
     local cur_icon = (uplink.type == "wan") and "🌐" or "📶"
@@ -72,7 +72,7 @@ local function build_uplink_menu()
 end
 
 function M.cmd_uplink(msg_id)
-    local text, inline_kb = build_uplink_menu()
+    local text, inline_kb = M.build_uplink_menu()
     if msg_id then
         return tg.edit_msg(msg_id, text, inline_kb)
     end
