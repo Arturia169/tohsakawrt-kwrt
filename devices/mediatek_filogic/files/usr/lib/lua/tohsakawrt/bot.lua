@@ -122,7 +122,7 @@ local function cmd_status(msg_id)
     return tg.send_msg(text, inline_kb)
 end
 
-local function cmd_uplink()
+local function build_uplink_menu()
     local uplink = sys.uplink_status()
     local cur_name = (uplink.type == "wan") and "有线宽带 (eth0)" or ((uplink.type == "5g") and "5G 蜂窝网络 (usb0)" or (tostring(uplink.dev or "unknown") .. " (未知接口)"))
     local cur_icon = (uplink.type == "wan") and "🌐" or "📶"
@@ -183,7 +183,15 @@ local function cmd_uplink()
 
 🕰️ <i>%s</i>]], cur_icon, html_escape(cur_name), html_escape(ip_wan), wan_pub_line, html_escape(ip_5g), html_escape(m_info.sim_ip), cell_mode_line, cell_pub_line, html_escape(now))
 
-    tg.send_msg(text, inline_kb)
+    return text, inline_kb
+end
+
+local function cmd_uplink(msg_id)
+    local text, inline_kb = build_uplink_menu()
+    if msg_id then
+        return tg.edit_msg(msg_id, text, inline_kb)
+    end
+    return tg.send_msg(text, inline_kb)
 end
 
 function M.cmd_ping()
@@ -1010,8 +1018,10 @@ local function handle_callback(cb_id, msg_id, data_str)
         tg.edit_msg(msg_id, new_text, inline_kb)
 
     elseif data_str == "open_uplink_menu" then
-        tg.answer_callback(cb_id, "🔀 正在打开出口切换菜单...")
-        cmd_uplink()
+        local text, kb = build_uplink_menu()
+        if tg.answer_and_edit(cb_id, "🔀 正在打开出口切换菜单...", msg_id, text, kb) == nil then
+            tg.send_msg(text, kb)
+        end
 
     elseif data_str == "refresh_status" then
         local text, kb = build_status_card()
