@@ -60,13 +60,16 @@ io.open = function(path, mode)
     return original_open(path, mode)
 end
 
-local flowcard_script
-for _, candidate in ipairs({
-    "devices/mediatek_filogic/files/usr/bin/tohsakawrt-flowcard-daily",
-    "files/usr/bin/tohsakawrt-flowcard-daily"
-}) do
-    local probe = io.open(candidate, "r")
-    if probe then probe:close(); flowcard_script = candidate; break end
+-- 允许用环境变量指定脚本路径：实机上用例跑在 /tmp，仓库相对路径不存在
+local flowcard_script = os.getenv("FLOWCARD_SCRIPT_OVERRIDE")
+if not flowcard_script then
+    for _, candidate in ipairs({
+        "devices/mediatek_filogic/files/usr/bin/tohsakawrt-flowcard-daily",
+        "files/usr/bin/tohsakawrt-flowcard-daily"
+    }) do
+        local probe = io.open(candidate, "r")
+        if probe then probe:close(); flowcard_script = candidate; break end
+    end
 end
 assert(flowcard_script, "cannot locate tohsakawrt-flowcard-daily payload")
 
