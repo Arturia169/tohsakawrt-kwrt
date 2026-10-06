@@ -3,8 +3,8 @@
 BARK_KEY="$(uci -q get tohsakawrt-tgbot.main.bark_key)"
 BARK_API="https://api.day.app/push"
 
-STATE_DIR="/tmp/tohsakawrt-watch"
-LOCK_DIR="/tmp/tohsakawrt-service-watch.lock"
+STATE_DIR="${TWR_SERVICE_WATCH_STATE_DIR:-/tmp/tohsakawrt-watch}"
+LOCK_DIR="${TWR_SERVICE_WATCH_LOCK_DIR:-/tmp/tohsakawrt-service-watch.lock}"
 WAN_STATE_FILE="$STATE_DIR/wan_state"
 WAN_FAIL_FILE="$STATE_DIR/wan_fail"
 WAN_DOWN_SINCE="$STATE_DIR/wan_down_since"
@@ -23,24 +23,54 @@ html_escape() {
 
 mkdir -p "$STATE_DIR"
 
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
-    case "$LOCK_PID" in
-        ''|*[!0-9]*)
-            logger -t TohsakaWrt-Watch "Previous run still active, skip"
-            exit 0
-            ;;
-    esac
-    if kill -0 "$LOCK_PID" 2>/dev/null; then
-        logger -t TohsakaWrt-Watch "Previous run still active, skip"
-        exit 0
+acquire_lock() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        : > "$LOCK_DIR/.new"
+    else
+        if [ ! -d "$LOCK_DIR" ]; then
+            logger -t TohsakaWrt-Watch "Unable to create lock directory: $LOCK_DIR"
+            return 1
+        fi
+        LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+        STALE=0
+        case "$LOCK_PID" in
+            ''|*[!0-9]*) STALE=1 ;;
+            *)
+                if kill -0 "$LOCK_PID" 2>/dev/null; then
+                    logger -t TohsakaWrt-Watch "Previous run still active, skip"
+                    return 1
+                fi
+                LOCK_AGE=0
+                LOCK_MTIME="$(stat -c %Y "$LOCK_DIR" 2>/dev/null)"
+                NOW_EPOCH="$(date +%s 2>/dev/null)"
+                case "$LOCK_MTIME:$NOW_EPOCH" in *[!0-9:]*) LOCK_AGE=601 ;; *) LOCK_AGE=$((NOW_EPOCH - LOCK_MTIME)) ;; esac
+                [ "$LOCK_AGE" -gt 600 ] && STALE=1
+                [ "$STALE" -eq 0 ] && { logger -t TohsakaWrt-Watch "Dead lock pid is recent; skip recovery"; return 1; }
+                ;;
+        esac
+        logger -t TohsakaWrt-Watch "Removing stale lock (pid=${LOCK_PID:-missing})"
+        rm -f "$LOCK_DIR/pid" "$LOCK_DIR/.new" 2>/dev/null
+        rmdir "$LOCK_DIR" 2>/dev/null || return 1
+        if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+            [ -d "$LOCK_DIR" ] && logger -t TohsakaWrt-Watch "Another run acquired the lock, skip" || logger -t TohsakaWrt-Watch "Unable to reacquire lock directory: $LOCK_DIR"
+            return 1
+        fi
     fi
-    rm -f "$LOCK_DIR/pid" 2>/dev/null
-    rmdir "$LOCK_DIR" 2>/dev/null || exit 0
-    mkdir "$LOCK_DIR" 2>/dev/null || exit 0
-fi
-echo "$$" > "$LOCK_DIR/pid"
-trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM
+    rm -f "$LOCK_DIR/.new" 2>/dev/null
+    if ! printf '%s\n' "$$" > "$LOCK_DIR/pid"; then
+        rm -f "$LOCK_DIR/pid" 2>/dev/null
+        rmdir "$LOCK_DIR" 2>/dev/null
+        logger -t TohsakaWrt-Watch "Unable to write lock pid: $LOCK_DIR/pid"
+        return 1
+    fi
+    return 0
+}
+
+lock_cleanup() { rm -f "$LOCK_DIR/pid" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null; }
+acquire_lock || exit 0
+trap 'lock_cleanup' EXIT
+trap 'lock_cleanup; exit 130' INT
+trap 'lock_cleanup; exit 143' TERM
 
 NOW="$(date '+%m-%d %H:%M:%S')"
 
@@ -103,7 +133,7 @@ fi
 
 WAN_STATE="$(cat "$WAN_STATE_FILE" 2>/dev/null)"
 WAN_FAIL="$(cat "$WAN_FAIL_FILE" 2>/dev/null)"
-[ -n "$WAN_FAIL" ] || WAN_FAIL=0
+case "$WAN_FAIL" in ''|*[!0-9]*) WAN_FAIL=0 ;; esac
 
 if [ "$WAN_UP" -eq 1 ]; then
 
@@ -112,9 +142,12 @@ if [ "$WAN_UP" -eq 1 ]; then
     if [ "$WAN_STATE" = "down" ]; then
 
         DOWN_AT="$(cat "$WAN_DOWN_SINCE" 2>/dev/null)"
-        [ -n "$DOWN_AT" ] || DOWN_AT="$(date +%s)"
+        case "$DOWN_AT" in ''|*[!0-9]*) DOWN_AT="$(date +%s)" ;; esac
+        case "$DOWN_AT" in ''|*[!0-9]*) DOWN_AT=0 ;; esac
 
-        DURATION=$(($(date +%s) - DOWN_AT))
+        DURATION_NOW="$(date +%s)"
+        case "$DURATION_NOW" in ''|*[!0-9]*) DURATION_NOW=0 ;; esac
+        DURATION=$((DURATION_NOW - DOWN_AT))
         DURATION_TEXT="$(format_duration "$DURATION")"
 
         BODY="✅ <b>网络已恢复</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n🟢 <b>状态</b>：网络可用\n⏱️ <b>离线时长</b>：<code>$(html_escape "$DURATION_TEXT")</code>\n━━━━━━━━━━━━━━━━━━\n<i>外网连接已恢复正常。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
@@ -213,9 +246,12 @@ elif [ "$NIKKI_RUNNING" -eq 1 ]; then
     if [ "$NIKKI_STATE" = "stopped" ]; then
 
         DOWN_AT="$(cat "$NIKKI_DOWN_SINCE" 2>/dev/null)"
-        [ -n "$DOWN_AT" ] || DOWN_AT="$(date +%s)"
+        case "$DOWN_AT" in ''|*[!0-9]*) DOWN_AT="$(date +%s)" ;; esac
+        case "$DOWN_AT" in ''|*[!0-9]*) DOWN_AT=0 ;; esac
 
-        DURATION=$(($(date +%s) - DOWN_AT))
+        DURATION_NOW="$(date +%s)"
+        case "$DURATION_NOW" in ''|*[!0-9]*) DURATION_NOW=0 ;; esac
+        DURATION=$((DURATION_NOW - DOWN_AT))
         DURATION_TEXT="$(format_duration "$DURATION")"
 
         BODY="✅ <b>OpenClash 已恢复</b>\n━━━━━━━━━━━━━━━━━━\n🟢 <b>核心</b>：Clash API 正常\n🌐 <b>外网</b>：$([ "$WAN_UP" -eq 1 ] && echo 正常 || echo 异常)\n⏱️ <b>故障时长</b>：<code>$(html_escape "$DURATION_TEXT")</code>\n━━━━━━━━━━━━━━━━━━\n<i>OpenClash 核心已重新响应。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
@@ -464,11 +500,19 @@ TRAFFIC_PROC_FILE="${TRAFFIC_PROC_FILE:-/proc/net/dev}"
 if [ -n "$WAN_DEV" ] && [ "$WAN_DEV" != "未知" ]; then
     CURR_RX="$(awk -v d="${WAN_DEV}:" '$1==d {print $2}' "$TRAFFIC_PROC_FILE" 2>/dev/null)"
     NOW_TS="$(date +%s)"
+    case "$NOW_TS" in ''|*[!0-9]*) NOW_TS=0 ;; esac
 
     if [ -n "$CURR_RX" ] && [ "$CURR_RX" -gt 0 ] 2>/dev/null; then
         if [ -f "$TRAFFIC_STATE_FILE" ]; then
             LAST_TS="" LAST_RX="" LAST_DEV="" ALERT_ACTIVE=0 ALERT_START_TS=0 ALERT_START_RX=0 PEAK_SPEED=0
             . "$TRAFFIC_STATE_FILE" 2>/dev/null
+
+            case "$LAST_TS" in ''|*[!0-9]*) LAST_TS=0 ;; esac
+            case "$LAST_RX" in ''|*[!0-9]*) LAST_RX="" ;; esac
+            case "$ALERT_ACTIVE" in ''|*[!0-9]*) ALERT_ACTIVE=0 ;; esac
+            case "$ALERT_START_TS" in ''|*[!0-9]*) ALERT_START_TS=0 ;; esac
+            case "$ALERT_START_RX" in ''|*[!0-9]*) ALERT_START_RX=0 ;; esac
+            case "$PEAK_SPEED" in ''|*[!0-9]*) PEAK_SPEED=0 ;; esac
 
             # 防御 1: 接口切换保护（宽带与 5G 切换时，不同网卡绝不交叉相减）
             if [ "${LAST_DEV:-}" != "$WAN_DEV" ]; then

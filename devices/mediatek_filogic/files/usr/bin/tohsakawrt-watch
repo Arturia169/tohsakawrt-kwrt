@@ -4,6 +4,42 @@
 
 [ -r /usr/lib/tohsakawrt/common.sh ] && . /usr/lib/tohsakawrt/common.sh
 
+LOCK_DIR="${TWR_WATCH_LOCK_DIR:-/tmp/tohsakawrt-watch.lock}"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    if [ ! -d "$LOCK_DIR" ]; then
+        logger -t TohsakaWrt-Watch "Unable to create top-level lock: $LOCK_DIR"
+        exit 0
+    fi
+    LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+    case "$LOCK_PID" in
+        ''|*[!0-9]*) LOCK_STALE=1 ;;
+        *)
+            if kill -0 "$LOCK_PID" 2>/dev/null; then
+                logger -t TohsakaWrt-Watch "Top-level watch already active, skip"
+                exit 0
+            fi
+            LOCK_STALE=1
+            ;;
+    esac
+    logger -t TohsakaWrt-Watch "Removing stale top-level lock (pid=${LOCK_PID:-missing})"
+    rm -f "$LOCK_DIR/pid" 2>/dev/null
+    rmdir "$LOCK_DIR" 2>/dev/null || exit 0
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        [ -d "$LOCK_DIR" ] && logger -t TohsakaWrt-Watch "Top-level watch lock raced, skip" || logger -t TohsakaWrt-Watch "Unable to reacquire top-level lock: $LOCK_DIR"
+        exit 0
+    fi
+fi
+if ! printf '%s\n' "$$" > "$LOCK_DIR/pid"; then
+    rm -f "$LOCK_DIR/pid" 2>/dev/null
+    rmdir "$LOCK_DIR" 2>/dev/null
+    logger -t TohsakaWrt-Watch "Unable to write top-level lock pid"
+    exit 0
+fi
+watch_lock_cleanup() { rm -f "$LOCK_DIR/pid" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null; }
+trap 'watch_lock_cleanup' EXIT
+trap 'watch_lock_cleanup; exit 130' INT
+trap 'watch_lock_cleanup; exit 143' TERM
+
 # 1. CPU 温度监控 (超温预警与回差恢复)
 [ -x /usr/bin/tohsakawrt-temp-watch ] && /usr/bin/tohsakawrt-temp-watch >/dev/null 2>&1
 

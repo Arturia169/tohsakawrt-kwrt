@@ -36,8 +36,52 @@ UPLINK_IS_MODEM=0
 say "modem network: $MODEM_NET; active uplink dev: ${ACTIVE_DEV:-<unknown>}; uplink_is_modem: $UPLINK_IS_MODEM"
 
 if [ "$VERBOSE" -eq 0 ]; then
-    mkdir "$LOCK_DIR" 2>/dev/null || exit 0
-    trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT HUP INT TERM
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        if [ ! -d "$LOCK_DIR" ]; then
+            logger -t tohsakawrt-modem-heal "Unable to create lock directory: $LOCK_DIR"
+            exit 0
+        fi
+        LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+        case "$LOCK_PID" in
+            ''|*[!0-9]*) LOCK_STALE=1 ;;
+            *)
+                if kill -0 "$LOCK_PID" 2>/dev/null; then
+                    logger -t tohsakawrt-modem-heal "Previous run still active, skip"
+                    exit 0
+                fi
+                LOCK_STALE=1
+                ;;
+        esac
+        if [ "$LOCK_STALE" -eq 1 ]; then
+            logger -t tohsakawrt-modem-heal "Removing stale lock (pid=${LOCK_PID:-missing})"
+            rm -f "$LOCK_DIR/pid" 2>/dev/null
+            if ! rmdir "$LOCK_DIR" 2>/dev/null; then
+                logger -t tohsakawrt-modem-heal "Unable to remove stale lock directory: $LOCK_DIR"
+                exit 0
+            fi
+            if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+                if [ -d "$LOCK_DIR" ]; then
+                    logger -t tohsakawrt-modem-heal "Another run acquired the lock, skip"
+                else
+                    logger -t tohsakawrt-modem-heal "Unable to reacquire lock directory: $LOCK_DIR"
+                fi
+                exit 0
+            fi
+        fi
+    fi
+    if ! printf '%s\n' "$$" > "$LOCK_DIR/pid"; then
+        rm -f "$LOCK_DIR/pid" 2>/dev/null
+        rmdir "$LOCK_DIR" 2>/dev/null
+        logger -t tohsakawrt-modem-heal "Unable to write lock pid: $LOCK_DIR/pid"
+        exit 0
+    fi
+    lock_cleanup() {
+        rm -f "$LOCK_DIR/pid" 2>/dev/null
+        rmdir "$LOCK_DIR" 2>/dev/null
+    }
+    trap 'lock_cleanup' EXIT
+    trap 'lock_cleanup; exit 130' INT
+    trap 'lock_cleanup; exit 143' TERM
 fi
 
 get_index() {
@@ -122,6 +166,7 @@ heal_cellular_data() {
     local dev="usb0"
 
     local now="$(date +%s 2>/dev/null)"
+    case "$now" in ''|*[!0-9]*) now=0 ;; esac
     local fail_count_file="$STATE_DIR/tohsakawrt-5g-data.fails"
     local first_fail_file="$STATE_DIR/tohsakawrt-5g-data.firstfail"
     local last_heal_file="$STATE_DIR/tohsakawrt-5g-data.lastheal"
@@ -195,6 +240,7 @@ EOF_NODATA
 
     # 3. 探测失败：记录失败计数，执行阶梯式自愈
     local fails="$(cat "$fail_count_file" 2>/dev/null)"
+    case "$fails" in ''|*[!0-9]*) fails=0 ;; esac
     fails=$(( ${fails:-0} + 1 ))
     echo "$fails" > "$fail_count_file"
     if [ "$fails" -eq 1 ]; then
@@ -206,6 +252,7 @@ EOF_NODATA
         logger -t tohsakawrt-modem-heal "5G data heal skipped: 5G 正在承载主出口，探测超时，已按策略不做动作"
         if [ "$fails" -ge 3 ]; then
             local last_alert="$(cat "$active_alert_file" 2>/dev/null)"
+            case "$last_alert" in *[!0-9]*) last_alert=0 ;; esac
             if [ -z "$last_alert" ] || [ "$((now - last_alert))" -ge 1800 ]; then
                 if command -v send_tg >/dev/null 2>&1; then
                     send_tg "⚠️ <b>5G 主出口探测超时</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>探测结果</b>：5G 正在承载主出口，探测超时，已按策略不做动作\n━━━━━━━━━━━━━━━━━━\n\n🕰️ <i>$(date '+%Y-%m-%d %H:%M:%S')</i>" "HTML"
@@ -221,6 +268,7 @@ EOF_NODATA
     fi
 
     local last_heal="$(cat "$last_heal_file" 2>/dev/null)"
+    case "$last_heal" in ''|*[!0-9]*) last_heal=0 ;; esac
     local heal_interval=$((now - ${last_heal:-0}))
     # 自愈动作防抖：至少间隔 60 秒
     if [ "$heal_interval" -lt 60 ]; then
@@ -242,6 +290,7 @@ EOF_NODATA
         fi
     elif [ "$fails" -ge 3 ]; then
         local first_fail="$(cat "$first_fail_file" 2>/dev/null)"
+        case "$first_fail" in ''|*[!0-9]*) first_fail=0 ;; esac
         local failure_duration=$((now - ${first_fail:-now}))
         if [ "$fails" -lt 5 ] || [ "$failure_duration" -lt 300 ]; then
             logger -t tohsakawrt-modem-heal "5G data heal (Stage 3): RF reset deferred (failures=$fails, duration=${failure_duration}s; need 5 failures and 300s)"
@@ -256,6 +305,7 @@ EOF_NODATA
             ifup 5Ga 2>/dev/null
         fi
         local last_alert="$(cat "$active_alert_file" 2>/dev/null)"
+        case "$last_alert" in *[!0-9]*) last_alert=0 ;; esac
         if [ -z "$last_alert" ] || [ "$((now - last_alert))" -ge 1800 ]; then
             if command -v send_tg >/dev/null 2>&1; then
                 send_tg "🔴 <b>5G 热备链路脱网告警</b>\n━━━━━━━━━━━━━━━━━━\n📊 <b>探测结果</b>：连续 5 次数据探测超时\n🔄 <b>已执行动作</b>：射频重注网自愈\n━━━━━━━━━━━━━━━━━━\n<i>请留意模组连接状态。</i>\n\n🕰️ <i>$(date '+%Y-%m-%d %H:%M:%S')</i>" "HTML"

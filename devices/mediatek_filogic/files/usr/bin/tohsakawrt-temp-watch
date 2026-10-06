@@ -1,6 +1,6 @@
 #!/bin/sh
 
-TEMP_FILE="/sys/class/thermal/thermal_zone0/temp"
+TEMP_FILE="${TWR_TEMP_FILE:-/sys/class/thermal/thermal_zone0/temp}"
 
 WARN_TEMP=80
 CRITICAL_TEMP=90
@@ -20,7 +20,9 @@ html_escape() {
 [ -r "$TEMP_FILE" ] || exit 0
 
 RAW_TEMP="$(cat "$TEMP_FILE" 2>/dev/null)"
-[ -n "$RAW_TEMP" ] || exit 0
+case "$RAW_TEMP" in
+    ''|*[!0-9]*) logger -t TohsakaWrt-Temp "Invalid CPU temperature reading; skipping this check"; exit 0 ;;
+esac
 
 TEMP=$((RAW_TEMP / 1000))
 NOW="$(date '+%m-%d %H:%M')"

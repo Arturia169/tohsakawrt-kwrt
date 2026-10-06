@@ -116,6 +116,7 @@ end
 </style>
 <script type="text/javascript" src="<%=resource%>/xhr.js?v=1.4.4"></script>
 <script type="text/javascript">//<![CDATA[
+	function html_escape(value) { return String(value == null ? "" : value).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
 
 	window.onload=function()
 	{
@@ -198,7 +199,7 @@ end
 				if (value!="-"&&value!=""&&value!="ready")
 				{
 					// value=translation[value]; //是否翻译
-					sim_info_view+='<tr class="tr"><td class="td left" title="'+full_name+'">'+translation[key]+'</td><td class="td left" id="'+key+'">'+value+'</td></tr>';
+					sim_info_view+='<tr class="tr"><td class="td left" title="'+html_escape(full_name)+'">'+html_escape(translation[key])+'</td><td class="td left" id="'+html_escape(key)+'">'+html_escape(value)+'</td></tr>';
 					break;
 				}
 			}
@@ -263,7 +264,7 @@ end
 						full_name="5G QoS Identifier for Downlink (3GPP 5QI)";
 					}
 					// value=translation[value]; //是否翻译
-					network_info_view+='<tr class="tr"><td class="td left" title="'+full_name+'">'+label_name+'</td><td class="td left" id="'+key+'">'+value+'</td></tr>';
+					network_info_view+='<tr class="tr"><td class="td left" title="'+html_escape(full_name)+'">'+html_escape(label_name)+'</td><td class="td left" id="'+html_escape(key)+'">'+html_escape(value)+'</td></tr>';
 					break;
 				}
 			}
@@ -523,6 +524,7 @@ end
 				}
 				//写入视图（不显示空的信息）
 				var value=info[key];
+				var value_is_html=false;
 				if (value!="-"&&value!="")
 				{
 					//添加单位
@@ -547,13 +549,15 @@ end
 							var unit="dBm";
 							var signal_info_view=get_signal_info_view(network_type,"RSRP",value);
 							// value='<div class="cbi-progressbar" title="'+value+' dBm | '+translation[signal_info_view.quality]+' ('+signal_info_view.percent+'%)"><div style="'+signal_info_view.style+'"></div></div>';
-							value='<div class="signal-view"><div class="signal-percent" style="'+signal_info_view.style+'"><div class="signal-context"><small title="'+value+' '+unit+' | '+translation[signal_info_view.quality]+' ('+signal_info_view.percent+'%)"><div style="'+signal_info_view.style+'">'+value+' dB | '+translation[signal_info_view.quality]+' ('+signal_info_view.percent+'%)</small></div></div></div>';
+							value='<div class="signal-view"><div class="signal-percent" style="'+signal_info_view.style+'"><div class="signal-context"><small title="'+html_escape(value)+' '+unit+' | '+html_escape(translation[signal_info_view.quality])+' ('+signal_info_view.percent+'%)"><div style="'+signal_info_view.style+'">'+html_escape(value)+' dB | '+html_escape(translation[signal_info_view.quality])+' ('+signal_info_view.percent+'%)</small></div></div></div>';
+							value_is_html=true;
 						}
 						else if (key=="RxLev")
 						{
 							var unit="dBm";
 							var signal_info_view=get_signal_info_view(network_type,"RxLev",value);
-							value='<div class="signal-view"><div class="signal-percent" style="'+signal_info_view.style+'"><div class="signal-context"><small title="'+value+' '+unit+' | '+translation[signal_info_view.quality]+' ('+signal_info_view.percent+'%)"><div style="'+signal_info_view.style+'">'+value+' dB | '+translation[signal_info_view.quality]+' ('+signal_info_view.percent+'%)</small></div></div></div>';
+							value='<div class="signal-view"><div class="signal-percent" style="'+signal_info_view.style+'"><div class="signal-context"><small title="'+html_escape(value)+' '+unit+' | '+html_escape(translation[signal_info_view.quality])+' ('+signal_info_view.percent+'%)"><div style="'+signal_info_view.style+'">'+html_escape(value)+' dB | '+html_escape(translation[signal_info_view.quality])+' ('+signal_info_view.percent+'%)</small></div></div></div>';
+							value_is_html=true;
 						}
 						else
 						{
@@ -566,13 +570,15 @@ end
 						{
 							var unit="dB";
 							var signal_info_view=get_signal_info_view(network_type,"RSRQ",value);
-							value='<div class="signal-view"><div class="signal-percent" style="'+signal_info_view.style+'"><div class="signal-context"><small title="'+value+' '+unit+' | '+translation[signal_info_view.quality]+' ('+signal_info_view.percent+'%)"><div style="'+signal_info_view.style+'">'+value+' dB | '+translation[signal_info_view.quality]+' ('+signal_info_view.percent+'%)</small></div></div></div>';
+							value='<div class="signal-view"><div class="signal-percent" style="'+signal_info_view.style+'"><div class="signal-context"><small title="'+html_escape(value)+' '+unit+' | '+html_escape(translation[signal_info_view.quality])+' ('+signal_info_view.percent+'%)"><div style="'+signal_info_view.style+'">'+html_escape(value)+' dB | '+html_escape(translation[signal_info_view.quality])+' ('+signal_info_view.percent+'%)</small></div></div></div>';
+							value_is_html=true;
 						}
 						else if (key=="SINR")
 						{
 							var unit="dB";
 							var signal_info_view=get_signal_info_view(network_type,"SINR",value);
-							value='<div class="signal-view"><div class="signal-percent" style="'+signal_info_view.style+'"><div class="signal-context"><small title="'+value+' '+unit+' | '+translation[signal_info_view.quality]+' ('+signal_info_view.percent+'%)"><div style="'+signal_info_view.style+'">'+value+' dB | '+translation[signal_info_view.quality]+' ('+signal_info_view.percent+'%)</small></div></div></div>';
+							value='<div class="signal-view"><div class="signal-percent" style="'+signal_info_view.style+'"><div class="signal-context"><small title="'+html_escape(value)+' '+unit+' | '+html_escape(translation[signal_info_view.quality])+' ('+signal_info_view.percent+'%)"><div style="'+signal_info_view.style+'">'+html_escape(value)+' dB | '+html_escape(translation[signal_info_view.quality])+' ('+signal_info_view.percent+'%)</small></div></div></div>';
+							value_is_html=true;
 						}
 						else
 						{
@@ -582,7 +588,7 @@ end
 					else if (key=="SCS") {
 						value=value+" kHz";
 					}
-					cell_info_view+='<tr class="tr"><td class="td left" title="'+full_name+'">'+translation[key]+'</td><td class="td left" id="'+key+'">'+value+'</td></tr>';
+					cell_info_view+='<tr class="tr"><td class="td left" title="'+html_escape(full_name)+'">'+html_escape(translation[key])+'</td><td class="td left" id="'+html_escape(key)+'">'+(value_is_html?value:html_escape(value))+'</td></tr>';
 					break;
 				}
  			}
@@ -596,7 +602,7 @@ end
 		//获取网络模式
 		var network_mode=Object.keys(cell_info)[0];
 		//获取视图
-		var cell_info_view='<caption>'+translation[network_mode]+'</caption>'; //网络模式视图
+		var cell_info_view='<caption>'+html_escape(translation[network_mode])+'</caption>'; //网络模式视图
 		// var cell_info_view='<tr class="tr"><td class="td center" colspan="2">'+translation[network_mode]+'</td></tr>'; //网络模式视图
 		//获取网络模式下的信息
 		var network_mode_info=cell_info[network_mode];
@@ -628,7 +634,7 @@ end
 			var info_Element=document.getElementById(key);
 			if (info_Element!=null)
 			{
-				info_Element.innerHTML=info[key];
+				info_Element.innerHTML=html_escape(info[key]);
 			}
 		}
 	}
@@ -698,7 +704,7 @@ end
 		else
 		{
 			// 更新提示信息
-			document.getElementById("info_message").innerHTML="<strong>"+sim_status+"</strong>";
+			document.getElementById("info_message").innerHTML="<strong>"+html_escape(sim_status)+"</strong>";
 			// 显示提示信息
 			document.getElementById("cbi-info").style.display="block";
 			// 显示SIM卡信息

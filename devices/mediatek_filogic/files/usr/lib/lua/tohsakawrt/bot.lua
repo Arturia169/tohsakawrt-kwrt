@@ -73,9 +73,10 @@ local function cmd_status()
     local temp = sys.cpu_temp()
     local pub_ip = sys.public_ip()
     local uplink = sys.uplink_status()
+    local uplink_dev = tostring(uplink.dev or "unknown")
     local cur_ip = (uplink.type == "wan") and sys.wan_ip() or sys.usb0_ip()
     local c_status = clash.status()
-    local speed = sys.wan_speed(uplink.dev)
+    local speed = sys.wan_speed(uplink_dev)
     local now = os.date("%Y-%m-%d %H:%M:%S")
 
     local safe_pub_ip = pub_ip:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
@@ -101,7 +102,7 @@ local function cmd_status()
 🚦 <b>网络连通</b>：🟢 正常
 🧩 <b>OpenClash</b>：%s (%s)
 ━━━━━━━━━━━━━━━━━━
-🕰️ <i>%s</i>]], html_escape(metrics.uptime), temp_icon, html_escape(temp), html_escape(metrics.mem_str), html_escape(metrics.load), html_escape(metrics.root_str), html_escape(speed), safe_pub_ip, html_escape(uplink.dev), html_escape(cur_ip), c_status.running and "🟢 正常运行" or "🔴 未运行", html_escape(c_status.version), html_escape(now))
+🕰️ <i>%s</i>]], html_escape(metrics.uptime), temp_icon, html_escape(temp), html_escape(metrics.mem_str), html_escape(metrics.load), html_escape(metrics.root_str), html_escape(speed), safe_pub_ip, html_escape(uplink_dev), html_escape(cur_ip), c_status.running and "🟢 正常运行" or "🔴 未运行", html_escape(c_status.version), html_escape(now))
 
     local inline_kb = {
         {
@@ -115,7 +116,7 @@ end
 
 local function cmd_uplink()
     local uplink = sys.uplink_status()
-    local cur_name = (uplink.type == "wan") and "有线宽带 (eth0)" or ((uplink.type == "5g") and "5G 蜂窝网络 (usb0)" or (uplink.dev .. " (未知接口)"))
+    local cur_name = (uplink.type == "wan") and "有线宽带 (eth0)" or ((uplink.type == "5g") and "5G 蜂窝网络 (usb0)" or (tostring(uplink.dev or "unknown") .. " (未知接口)"))
     local cur_icon = (uplink.type == "wan") and "🌐" or "📶"
 
     local ip_wan = sys.wan_ip()

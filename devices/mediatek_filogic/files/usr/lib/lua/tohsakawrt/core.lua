@@ -49,11 +49,21 @@ end
 function M.set_state(key, value)
     M.init()
     local path = STATE_DIR .. "/" .. key
-    local f = io.open(path, "w")
-    if f then
-        f:write(tostring(value))
-        f:close()
+    local tmp = path .. ".tmp"
+    local f, open_err = io.open(tmp, "w")
+    if not f then return nil, open_err end
+    local ok, write_err = f:write(tostring(value))
+    local close_ok, close_err = f:close()
+    if not ok or close_ok == nil then
+        os.remove(tmp)
+        return nil, write_err or close_err or "write failed"
     end
+    local renamed, rename_err = os.rename(tmp, path)
+    if not renamed then
+        os.remove(tmp)
+        return nil, rename_err or "rename failed"
+    end
+    return true
 end
 
 function M.get_cached_state(key, max_age)
