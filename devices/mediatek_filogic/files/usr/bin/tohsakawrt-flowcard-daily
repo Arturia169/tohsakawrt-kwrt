@@ -1,0 +1,124 @@
+#!/usr/bin/lua
+-- TohsakaWrt 流量卡每日用量报告（每晚 24:00 触发）
+-- 走路由器专属 Telegram 机器人 (@RyanWrt1145_bot)
+local core = require("tohsakawrt.core")
+local tg = require("tohsakawrt.tg")
+local json = require("luci.jsonc")
+
+local STATE_FILE = "/etc/tohsakawrt/flowcard_daily.json"
+-- 卡号不硬编码：从 uci 读取（凭据与卡号一律不入库）
+local CARD_NO = tostring(core.get_uci("tohsakawrt-tgbot", "main", "flowcard_no", "") or ""):gsub("%s", "")
+
+local function format_bar(percent)
+    local filled = math.floor((percent or 0) / 10 + 0.5)
+    if filled < 0 then filled = 0 end
+    if filled > 10 then filled = 10 end
+    local empty = 10 - filled
+    return string.rep("█", filled) .. string.rep("░", empty)
+end
+
+local function quota_icon(percent)
+    if percent > 50 then return "🟢"
+    elseif percent > 20 then return "🟡"
+    else return "🔴" end
+end
+
+local function load_state()
+    local f = io.open(STATE_FILE, "r")
+    if not f then return {} end
+    local content = f:read("*a")
+    f:close()
+    if not content or content == "" then return {} end
+    return json.parse(content) or {}
+end
+
+local function save_state(state)
+    core.exec("mkdir -p /etc/tohsakawrt")
+    local f = io.open(STATE_FILE, "w")
+    if f then
+        f:write(json.stringify(state))
+        f:close()
+    end
+end
+
+local FAILURE_NOTICE = "❌ <b>流量卡每日用量统计失败</b>：接口数据读取或格式化异常"
+
+local ok, err = pcall(function()
+    -- 1. 请求卡商官方接口
+    local card_no = tostring(CARD_NO or ""):gsub("%s", "")
+    if card_no == "" then
+        core.log("Flowcard", "流量卡号未配置（uci tohsakawrt-tgbot.main.flowcard_no），跳过本次报表")
+        return
+    end
+    local payload = json.stringify({ card_no = card_no, iccid = "" })
+    local tmp = "/tmp/flowcard_req.json"
+    local f = assert(io.open(tmp, "w"), "cannot create request file")
+    assert(f:write(payload))
+    assert(f:close())
+
+    local cmd = string.format("curl -s -m 15 -X POST 'https://xlwlwl.com/api/v1/wechat/card-login' -H 'Content-Type: application/json' --data-binary @%s", tmp)
+    local out = core.exec(cmd)
+    os.remove(tmp)
+    if not out or out == "" then error("empty API response") end
+
+    local res = json.parse(out)
+    if type(res) ~= "table" or tonumber(res.code) ~= 200 or type(res.data) ~= "table" or type(res.data.card) ~= "table" then
+        error("invalid API response")
+    end
+
+    local card = res.data.card
+    local total_mb = tonumber(tostring(card.total_flow or "")) or 102400
+    local used_mb = tonumber(tostring(card.used_flow or "")) or 0
+    local left_mb = tonumber(tostring(card.left_flow or "")) or 0
+    local total_gb, used_gb, left_gb = total_mb / 1024, used_mb / 1024, left_mb / 1024
+    local percent = total_mb > 0 and (left_mb / total_mb * 100) or 0
+    if percent > 100 then percent = 100 elseif percent < 0 then percent = 0 end
+
+    -- 2. 对比昨日累计已用，计算今日消耗
+    local state = load_state()
+    if type(state) ~= "table" then state = {} end
+    local today_str = os.date("%Y-%m-%d")
+    local last_used_mb = tonumber(tostring(state.last_used_mb or ""))
+    local delta_text = "首日基线建立（明日起显示精准差值）"
+    if last_used_mb then
+        local delta_mb = used_mb - last_used_mb
+        if delta_mb < 0 then delta_mb = used_mb end
+        local delta_gb = delta_mb / 1024
+        if delta_gb >= 1.0 then
+            delta_text = string.format("%.2f GB", delta_gb)
+        else
+            delta_text = string.format("%.1f MB (%.2f GB)", delta_mb, delta_gb)
+        end
+    end
+
+    -- 3. 保存新台账
+    state.last_record_date = tostring(today_str)
+    state.last_used_mb = used_mb
+    state.last_updated_at = os.time()
+    save_state(state)
+
+    -- 4. 组装并发送 Telegram HTML 报表
+    local icon = quota_icon(percent)
+    local operator = tostring(card.operator_name or "中国联通")
+    local package = tostring(card.package_name or "100G/月享套餐")
+    local expiry = tostring(card.package_end_time or "未知")
+    local expiry_short = expiry:match("(%d%d%-%d%d)T(%d%d:%d%d)")
+    if expiry_short then expiry = expiry:gsub(".*(%d%d%-%d%d)T(%d%d:%d%d).*", "%1 %2") end
+    local lines = {
+        "<b>📶 5G 模组流量卡 · 每日消耗报表</b>", "━━━━━━━━━━━━━━━━━━",
+        "📅 统计周期：<b>今日（截至 24:00）</b>",
+        string.format("🔥 <b>今日消耗流量</b>：<code>%s</code>", tostring(delta_text)),
+        string.format("• 本月累计已用：<code>%.2f GB</code>", used_gb),
+        string.format("%s <code>[%s]</code>  <b>%.1f%%</b> 剩余", icon, format_bar(percent), percent),
+        string.format("• 套餐剩余总量：<code>%.2f / %.2f GB</code>", left_gb, total_gb),
+        string.format("• 运营商与套餐：%s | %s", operator, package),
+        string.format("• 额度重置周期：<code>%s</code>", tostring(expiry)), "━━━━━━━━━━━━━━━━━━",
+        "💡 <i>由路由器 TohsakaWrt 模组管家自动送达</i>"
+    }
+    assert(tg.send_msg(table.concat(lines, "\n")) ~= nil, "Telegram report send failed")
+end)
+
+if not ok then
+    core.log("Flowcard", "Daily report failed: " .. tostring(err))
+    pcall(tg.send_msg, FAILURE_NOTICE)
+end

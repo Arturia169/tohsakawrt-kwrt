@@ -5,5 +5,6 @@ config bot 'main'
         option token ''
         option chat_id ''
         option user_id ''
+        option flowcard_no ''
         option bark_key ''
 
