@@ -1272,8 +1272,9 @@ function M.run()
             for _, u in ipairs(res.result) do
                 local uid = u.update_id
                 if uid then
+                    -- 内存游标先推进（避免同一条被重复拉取），但落盘放到处理完成之后：
+                    -- 处理中重启会重新收到这条指令，而不是永久丢掉它
                     offset = uid + 1
-                    core.set_state("offset", tostring(offset))
                 end
 
                 if u.callback_query then
@@ -1310,6 +1311,10 @@ function M.run()
                             end
                         end
                     end
+                end
+
+                if uid then
+                    core.set_state("offset", tostring(offset))
                 end
             end
         else
