@@ -31,6 +31,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@main
 
+      - name: Run payload test suites
+        run: |
+          set -e
+          sudo apt-get update -qq
+          # lua-cjson 用于让 test_esim.lua 在 CI 上也能真跑（拿不到时会自动 SKIP）
+          sudo apt-get install -y -qq lua5.1 lua-cjson || sudo apt-get install -y -qq lua5.1
+          for t in tests/*.sh;  do echo "=== $t"; sh  "$t"; done
+          for t in tests/*.lua; do echo "=== $t"; lua5.1 "$t"; done
+
       - name: Get current date
         run: |
           echo "BUILD_DATE=$(date +'%Y%m%d')" >> "$GITHUB_ENV"

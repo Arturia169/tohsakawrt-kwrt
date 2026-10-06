@@ -1,7 +1,14 @@
 package.path = "devices/mediatek_filogic/files/usr/lib/lua/?.lua;devices/mediatek_filogic/files/usr/lib/lua/?/init.lua;files/usr/lib/lua/?.lua;files/usr/lib/lua/?/init.lua;" .. package.path
 
 local has_cjson, json = pcall(require, "cjson")
-if not has_cjson then json = require("luci.jsonc") end
+if not has_cjson then
+    local has_jsonc, mod = pcall(require, "luci.jsonc")
+    if not has_jsonc then
+        print("SKIP: test_esim.lua 需要一个 JSON 模块（lua-cjson，或实机上的 luci.jsonc）——请在设备上运行")
+        return
+    end
+    json = mod
+end
 package.preload["luci.jsonc"] = function() return { parse = json.decode or json.parse } end
 package.preload["tohsakawrt.core"] = function()
     return {
