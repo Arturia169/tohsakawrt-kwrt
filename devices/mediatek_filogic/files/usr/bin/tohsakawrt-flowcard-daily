@@ -9,6 +9,37 @@ local STATE_FILE = "/etc/tohsakawrt/flowcard_daily.json"
 -- 卡号不硬编码：从 uci 读取（凭据与卡号一律不入库）
 local CARD_NO = tostring(core.get_uci("tohsakawrt-tgbot", "main", "flowcard_no", "") or ""):gsub("%s", "")
 
+-- 预警阈值（可在 uci 里改：tohsakawrt-tgbot.main.flowcard_*）
+local function cfg_num(key, default)
+    local v = tonumber(tostring(core.get_uci("tohsakawrt-tgbot", "main", key, tostring(default)) or ""))
+    if not v then return default end
+    return v
+end
+local WARN_PERCENT = cfg_num("flowcard_warn_percent", 20)
+local URGENT_PERCENT = cfg_num("flowcard_urgent_percent", 10)
+local WARN_DAYS = cfg_num("flowcard_warn_days", 3)
+
+-- 到期时间兼容三种返回：秒级时间戳 / 毫秒级时间戳 / "YYYY-MM-DDThh:mm:ss"（或省略年份）
+local function parse_expiry(v)
+    if type(v) == "number" then
+        if v > 100000000000 then return math.floor(v / 1000) end
+        return v
+    end
+    local s = tostring(v or "")
+    if s:match("^%d%d%d%d%d+$") then
+        local n = tonumber(s)
+        if n and n > 100000000000 then return math.floor(n / 1000) end
+        return n
+    end
+    local y, mo, d, h, mi = s:match("(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d)")
+    if not y then
+        mo, d, h, mi = s:match("(%d%d)-(%d%d)T(%d%d):(%d%d)")
+        if not mo then return nil end
+        y = tostring(os.date("%Y"))
+    end
+    return os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d), hour = tonumber(h), min = tonumber(mi), sec = 0 })
+end
+
 local function format_bar(percent)
     local filled = math.floor((percent or 0) / 10 + 0.5)
     if filled < 0 then filled = 0 end
@@ -80,8 +111,9 @@ local ok, err = pcall(function()
     local today_str = os.date("%Y-%m-%d")
     local last_used_mb = tonumber(tostring(state.last_used_mb or ""))
     local delta_text = "首日基线建立（明日起显示精准差值）"
+    local delta_mb = nil
     if last_used_mb then
-        local delta_mb = used_mb - last_used_mb
+        delta_mb = used_mb - last_used_mb
         if delta_mb < 0 then delta_mb = used_mb end
         local delta_gb = delta_mb / 1024
         if delta_gb >= 1.0 then
@@ -91,10 +123,51 @@ local ok, err = pcall(function()
         end
     end
 
+    -- 2.5 预警判定（必须在保存台账之前，才能读到"昨日"的用量数据）
+    local warnings, urgent = {}, false
+    local prev_urgent = tostring(state.urgent_state or "") == "1"
+
+    local expiry_display = tostring(card.package_end_time or "未知")
+    if expiry_display:match("(%d%d%-%d%d)T(%d%d:%d%d)") then
+        expiry_display = expiry_display:gsub(".*(%d%d%-%d%d)T(%d%d:%d%d).*", "%1 %2")
+    end
+
+    local end_ts = parse_expiry(card.package_end_time)
+    local days_left = nil
+    if end_ts then days_left = math.floor((end_ts - os.time()) / 86400) end
+
+    if days_left then
+        if days_left < 0 then
+            warnings[#warnings + 1] = string.format("🚨 <b>套餐已到期</b>（%s）", expiry_display)
+            urgent = true
+        elseif days_left <= WARN_DAYS then
+            warnings[#warnings + 1] = string.format("⏳ <b>套餐 %d 天后到期</b>（%s）", days_left, expiry_display)
+            if days_left <= 1 then urgent = true end
+        end
+    end
+
+    if percent <= URGENT_PERCENT then
+        local est = ""
+        if delta_mb and delta_mb > 0 then
+            est = string.format("，按今日速度约可用 %.0f 天", left_mb / delta_mb)
+        end
+        warnings[#warnings + 1] = string.format("🚨 <b>剩余流量不足 %.0f%%</b>：剩 <code>%.2f GB</code>%s", percent, left_gb, est)
+        urgent = true
+    elseif percent <= WARN_PERCENT then
+        warnings[#warnings + 1] = string.format("⚠️ <b>剩余流量偏低 %.0f%%</b>：剩 <code>%.2f GB</code>", percent, left_gb)
+    end
+
+    local prev_delta = tonumber(tostring(state.last_delta_mb or ""))
+    if prev_delta and prev_delta > 0 and last_used_mb and delta_mb and delta_mb > prev_delta * 3 and delta_mb > 1024 then
+        warnings[#warnings + 1] = string.format("📈 <b>今日用量偏高</b>：<code>%.2f GB</code>（昨日 <code>%.2f GB</code>）", delta_mb / 1024, prev_delta / 1024)
+    end
+
     -- 3. 保存新台账
     state.last_record_date = tostring(today_str)
     state.last_used_mb = used_mb
     state.last_updated_at = os.time()
+    if delta_mb then state.last_delta_mb = delta_mb end
+    state.urgent_state = urgent and "1" or "0"
     save_state(state)
 
     -- 4. 组装并发送 Telegram HTML 报表
@@ -115,9 +188,25 @@ local ok, err = pcall(function()
         string.format("• 额度重置周期：<code>%s</code>", tostring(expiry)), "━━━━━━━━━━━━━━━━━━",
         "💡 <i>由路由器 TohsakaWrt 模组管家自动送达</i>"
     }
+
+    -- 预警插在标题之后，最显眼的位置
+    if #warnings > 0 then
+        table.insert(lines, 3, "⚠️ <b>需要注意</b>")
+        for i = #warnings, 1, -1 do
+            table.insert(lines, 4, "• " .. warnings[i])
+        end
+    end
     local kb = { { { text = "🩺 查状态", callback_data = "refresh_status" },
                     { text = "📶 查模组", callback_data = "refresh_modem" } } }
     assert(tg.send_msg(table.concat(lines, "\n"), kb) ~= nil, "Telegram report send failed")
+
+    -- 紧急预警额外单独推一条（只在"从正常变为紧急"时发一次，不会天天骚扰）
+    if urgent and not prev_urgent then
+        local alert_kb = { { { text = "🩺 查状态", callback_data = "refresh_status" } } }
+        pcall(tg.send_msg, string.format(
+            "🚨 <b>流量卡预警</b>\n\n%s\n\n剩余额度：<b>%.1f%%</b>（%.2f / %.2f GB）",
+            table.concat(warnings, "\n"), percent, left_gb, total_gb), alert_kb)
+    end
 end)
 
 if not ok then

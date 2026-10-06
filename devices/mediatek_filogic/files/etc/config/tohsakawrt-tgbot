@@ -6,5 +6,8 @@ config bot 'main'
         option chat_id ''
         option user_id ''
         option flowcard_no ''
+        option flowcard_warn_percent '20'
+        option flowcard_urgent_percent '10'
+        option flowcard_warn_days '3'
         option bark_key ''
 
