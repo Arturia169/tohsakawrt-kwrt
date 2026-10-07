@@ -118,10 +118,19 @@ case "${1:-}" in
         valid_domain "$d" || { echo "ERROR_BAD_DOMAIN"; exit 1; }
         direct_json="$(curl -s -m 8 "$API/proxies/DIRECT/delay?url=https://$d/&timeout=5000" 2>/dev/null)"
         direct_ms="$(printf '%s' "$direct_json" | sed -n 's/.*"delay":\([0-9]*\).*/\1/p')"
-        proxy_s="$(curl -s -o /dev/null -m 8 -x "http://127.0.0.1:${TWR_CLASH_PROXY_PORT:-7890}" -w '%{time_total}' "https://$d/" 2>/dev/null)"
-        proxy_ms="$(awk -v s="$proxy_s" 'BEGIN{ if (s == "" || s + 0 <= 0) { print "" } else { printf "%d", s * 1000 } }')"
+        # 必须校验请求真的拿到了响应：连接被拒时 curl 也是"很快返回"，
+        # 只看耗时会把它当成"代理极快"，从而永远推荐走代理（已实机踩到）
+        proxy_raw="$(curl -s -o /dev/null -m 10 -x "http://127.0.0.1:${TWR_CLASH_PROXY_PORT:-7890}" -w '%{http_code} %{time_total}' "https://$d/" 2>/dev/null)"
+        proxy_code="$(printf '%s' "$proxy_raw" | awk '{print $1}')"
+        proxy_s="$(printf '%s' "$proxy_raw" | awk '{print $2}')"
+        proxy_ms=""
+        case "${proxy_code:-}" in
+            ''|000|*[!0-9]*) proxy_ms="" ;;
+            *) proxy_ms="$(awk -v s="$proxy_s" 'BEGIN{ if (s == "" || s + 0 <= 0) print ""; else printf "%d", s * 1000 }')" ;;
+        esac
         echo "DIRECT_MS:${direct_ms:-NA}"
         echo "PROXY_MS:${proxy_ms:-NA}"
+        echo "PROXY_CODE:${proxy_code:-NA}"
         if [ -n "${direct_ms:-}" ] && [ -n "${proxy_ms:-}" ]; then
             if [ "$direct_ms" -lt "$proxy_ms" ]; then echo "VERDICT:DIRECT"; else echo "VERDICT:PROXY"; fi
         else

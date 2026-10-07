@@ -17,7 +17,7 @@ cat > "$BIN/curl" <<'EOF'
 #!/bin/sh
 case "$*" in
   */proxies/DIRECT/delay*) echo "{\"delay\":${FAKE_DIRECT:-80}}" ;;
-  *-x*) echo "${FAKE_PROXY:-0.400000}" ;;
+  *-x*) echo "${FAKE_PROXY_CODE:-200} ${FAKE_PROXY:-0.400000}" ;;
   *) echo 204 ;;
 esac
 EOF
@@ -40,5 +40,13 @@ check '代理测速失败时判定 UNKNOWN（不瞎给建议）' "$(printf '%s' 
 
 if "$S" smart 'bad;rm' >/dev/null 2>&1; then rc=0; else rc=1; fi
 check '非法域名被拒绝' "$([ "$rc" -eq 1 ] && echo 1 || echo 0)"
+export FAKE_DIRECT=500 FAKE_PROXY_CODE=000 FAKE_PROXY=0.001
+OUT4="$("$S" smart blog.example.com 2>&1)"
+check '回归：连接失败（HTTP 000）不得被当成快 → UNKNOWN' \
+    "$(printf '%s' "$OUT4" | grep -q 'VERDICT:UNKNOWN' && echo 1 || echo 0)"
+export FAKE_DIRECT=500 FAKE_PROXY_CODE=200 FAKE_PROXY=0.100000
+OUT5="$("$S" smart blog.example.com 2>&1)"
+check '回归：拿到真实响应码后才采信耗时（200/100ms → PROXY）' \
+    "$(printf '%s' "$OUT5" | grep -q 'VERDICT:PROXY' && printf '%s' "$OUT5" | grep -q 'PROXY_MS:100' && echo 1 || echo 0)"
 check '脚本通过 sh -n' "$(sh -n "$S" && echo 1 || echo 0)"
 printf 'PASS=%s FAIL=%s\n' "$pass" "$fail"; [ "$fail" -eq 0 ] || exit 1
