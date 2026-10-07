@@ -91,9 +91,10 @@ function M.cmd_device_traffic(msg_id, cb_id)
         -- 名字来源（优先级从高到低）：手动备注 → 静态租约 → DHCP 动态租约主机名
         local aliases = (sys.load_aliases and sys.load_aliases()) or {}
         local leases = {}
-        for mac, name in tostring(core.exec("cat /tmp/dhcp.leases 2>/dev/null") or "")
-            :gmatch("(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+(%S+)") do
-            leases[mac:lower()] = name
+        -- /tmp/dhcp.leases 的一行是：<到期时间> <MAC> <IP> <主机名>
+        for mac, ip, name in tostring(core.exec("cat /tmp/dhcp.leases 2>/dev/null") or "")
+            :gmatch("(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+(%S+)%s+(%S+)") do
+            if name and name ~= "*" then leases[mac:lower()] = name end
         end
         local statics = {}
         for line in tostring(core.exec("uci show dhcp 2>/dev/null") or ""):gmatch("[^\n]+") do
