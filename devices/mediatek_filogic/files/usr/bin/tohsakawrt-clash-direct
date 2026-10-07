@@ -1,0 +1,122 @@
+#!/bin/sh
+# TohsakaWrt：给 Clash 加"强制直连"域名
+# 解决场景：技术博客/自建站套了已被优化的 CDN（落地在香港日本等），走代理反而更慢。
+#
+#   add <域名>   加入直连（写模块+写运行配置+热重载）
+#   del <域名>   移除（同样两处+热重载）
+#   list         列出清单
+#   apply        只做热重载（手工改完模块后可用）
+#   status       输出统计（给机器人用）
+#
+# 两个文件的分工（实机确认）：
+#   MODULE  你手工维护的模块，带 TG_DIRECT_RULES 标记段 —— 保证持久（重启/重新生成后仍在）
+#   RUNTIME 核心实际读取的配置（进程参数 -f /etc/openclash/config.yaml）—— 保证"立即生效"
+# 热重载用 Mihomo 的 PUT /configs，保留现有连接，不重启 OpenClash。
+set -u
+
+MODULE="${TWR_CLASH_MODULE:-/etc/openclash/config/config.yaml}"
+RUNTIME="${TWR_CLASH_RUNTIME:-/etc/openclash/config.yaml}"
+API="${TWR_CLASH_API:-http://127.0.0.1:9090}"
+START="# === TG_DIRECT_RULES_START ==="
+END="# === TG_DIRECT_RULES_END ==="
+
+valid_domain() {
+    case "$1" in
+        ''|*[!a-zA-Z0-9.-]*) return 1 ;;
+    esac
+    printf '%s' "$1" | grep -Eq '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$'
+}
+
+already_in() {
+    grep -qF "DOMAIN-SUFFIX,$1,直连" "$MODULE" 2>/dev/null
+}
+
+add_module() {
+    grep -qF "$START" "$MODULE" 2>/dev/null || return 1
+    awk -v rule="  - DOMAIN-SUFFIX,$1,直连" -v start="$START" '
+        { print }
+        $0 == start && !done { print rule; done = 1 }
+    ' "$MODULE" > "$MODULE.tmp" && mv "$MODULE.tmp" "$MODULE"
+}
+
+del_module() {
+    grep -vF "DOMAIN-SUFFIX,$1,直连" "$MODULE" > "$MODULE.tmp" 2>/dev/null && mv "$MODULE.tmp" "$MODULE"
+}
+
+# 运行配置里没有标记段（生成时注释被剥掉），所以插到 rules: 列表最前面 = 优先级最高
+add_runtime() {
+    grep -qE '^rules:' "$RUNTIME" 2>/dev/null || return 1
+    grep -qF "DOMAIN-SUFFIX,$1,直连" "$RUNTIME" 2>/dev/null && return 0
+    awk -v rule="- DOMAIN-SUFFIX,$1,直连" '
+        { print }
+        /^rules:/ && !done { print rule; done = 1 }
+    ' "$RUNTIME" > "$RUNTIME.tmp" && mv "$RUNTIME.tmp" "$RUNTIME"
+}
+
+del_runtime() {
+    grep -vF "DOMAIN-SUFFIX,$1,直连" "$RUNTIME" > "$RUNTIME.tmp" 2>/dev/null && mv "$RUNTIME.tmp" "$RUNTIME"
+}
+
+reload() {
+    code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 -X PUT "$API/configs?force=false" \
+        -H 'Content-Type: application/json' \
+        --data "{\"path\":\"$RUNTIME\"}" 2>/dev/null)"
+    case "$code" in
+        200|204) return 0 ;;
+        *) echo "RELOAD_FAILED:$code"; return 1 ;;
+    esac
+}
+
+case "${1:-}" in
+    add)
+        d="${2:-}"
+        valid_domain "$d" || { echo "ERROR_BAD_DOMAIN"; exit 1; }
+        [ -f "$MODULE" ] || { echo "ERROR_NO_MODULE"; exit 1; }
+        if already_in "$d"; then
+            echo "ALREADY"
+        else
+            cp -a "$MODULE" "$MODULE.bak-clashdirect-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+            add_module "$d" || { echo "ERROR_NO_MARKER"; exit 1; }
+            echo "ADDED"
+        fi
+        add_runtime "$d" >/dev/null 2>&1 || true
+        reload || true
+        ;;
+
+    del)
+        d="${2:-}"
+        valid_domain "$d" || { echo "ERROR_BAD_DOMAIN"; exit 1; }
+        del_module "$d"
+        del_runtime "$d"
+        echo "DELETED"
+        reload || true
+        ;;
+
+    list)
+        [ -f "$MODULE" ] || exit 0
+        awk -v start="$START" -v end="$END" '
+            $0 == start { inblock = 1; next }
+            $0 == end { inblock = 0 }
+            inblock && $0 ~ /DOMAIN-SUFFIX/ {
+                line = $0
+                sub(/^[ \t]*-[ \t]*DOMAIN-SUFFIX,/, "", line)
+                sub(/,直连.*$/, "", line)
+                print line
+            }' "$MODULE"
+        ;;
+
+    apply)
+        reload || { echo "ERROR_RELOAD"; exit 1; }
+        echo "OK_RELOADED"
+        ;;
+
+    status)
+        n="$(sh "$0" list 2>/dev/null | wc -l)"
+        echo "DIRECT_RULES:${n}"
+        ;;
+
+    *)
+        echo "Usage: $0 {add <domain> | del <domain> | list | apply | status}"
+        exit 1
+        ;;
+esac
