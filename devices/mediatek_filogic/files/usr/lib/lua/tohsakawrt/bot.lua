@@ -42,6 +42,7 @@ local function cmd_help()
 /modemreload - 🔄 重载 5G 模组
 /trend - 📈 5G 信号趋势（最近 60 分钟，含频段跳变统计）
 /band - 📻 5G 频段设置（锁定/恢复，带自动回退）
+/gnss - 🛰️ GNSS 定位（坐标 / 地图链接 / 开关）
 /cards - 📇 查看卡内号码
 /switch <序号或关键词> - 🔀 切换 eSIM 号码
 /download <激活码> [确认码] - 📥 下载并写入新 eSIM Profile
@@ -190,6 +191,10 @@ local function handle_callback(cb_id, msg_id, data_str)
     elseif data_str == "refresh_direct" then
         dirt.cmd_direct_list(msg_id, cb_id)
 
+    elseif data_str == "gnss_show" then
+        modm.cmd_gnss(msg_id, cb_id)
+    elseif data_str == "gnss_start" or data_str == "gnss_stop" then
+        modm.gnss_action(data_str == "gnss_start" and "start" or "stop", msg_id, cb_id)
     elseif data_str == "band_menu" then
         modm.cmd_band_menu(msg_id, cb_id)
     elseif data_str:match("^band_confirm:") then
@@ -311,6 +316,8 @@ local function handle_command(text)
         net.cmd_wan()
     elseif cmd == "/temp" or full:find("温度") then
         sysm.cmd_temp()
+    elseif cmd == "/gnss" or cmd == "/gps" or full:find("定位") or full:find("GPS") then
+        modm.cmd_gnss()
     elseif cmd == "/band" or cmd == "/bands" or full:find("频段") then
         local list = full:match("^/band%s+([0-9:]+)") or full:match("^/bands%s+([0-9:]+)")
         if list then modm.band_confirm(list) else modm.cmd_band_menu() end

@@ -107,6 +107,9 @@ function M.cmd_modem(msg_id, cb_id)
         {
             { text = "📈 信号趋势", callback_data = "signal_trend" },
             { text = "📻 频段设置", callback_data = "band_menu" }
+        },
+        {
+            { text = "🛰️ GNSS 定位", callback_data = "gnss_show" }
         }
     }
 
@@ -118,6 +121,38 @@ function M.cmd_modem(msg_id, cb_id)
     end
     return tg.send_msg(text, inline_kb)
 end
+-- GNSS 定位：交给脚本渲染（解析只有一份实现），这里只负责转发与按钮
+function M.cmd_gnss(msg_id, cb_id)
+    local body = core.exec("/usr/bin/tohsakawrt-gnss show 2>/dev/null") or ""
+    body = tostring(body):gsub("%s+$", "")
+    if body == "" then
+        body = "🛰️ <b>GNSS 定位</b>\n\n<i>暂时读不到模组状态。</i>"
+    end
+    local kb = {
+        {
+            { text = "▶️ 开启定位", callback_data = "gnss_start" },
+            { text = "⏹️ 停止定位", callback_data = "gnss_stop" }
+        },
+        {
+            { text = "🔄 刷新", callback_data = "gnss_show" },
+            { text = "📡 返回模组", callback_data = "refresh_modem" }
+        }
+    }
+    if msg_id and cb_id then
+        return tg.answer_and_edit(cb_id, "正在读取定位...", msg_id, body, kb)
+    end
+    if msg_id then return tg.edit_msg(msg_id, body, kb) end
+    return tg.send_msg(body, kb)
+end
+
+function M.gnss_action(action, msg_id, cb_id)
+    local out = tostring(core.exec("/usr/bin/tohsakawrt-gnss " .. action .. " 2>/dev/null") or ""):gsub("%s+$", "")
+    local toast = (action == "start") and (out == "OK_STARTED" and "已开启，正在搜星" or "开启失败")
+        or (out == "OK_STOPPED" and "已停止定位" or "停止失败")
+    if cb_id then tg.answer_callback(cb_id, toast) end
+    return M.cmd_gnss(msg_id, nil)
+end
+
 -- 频段设置的常用组合（按需增删；都用冒号分隔的 NR 频段号）
 local BAND_PRESETS = {
     { label = "🔒 只锁 n78", list = "78" },

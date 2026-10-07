@@ -1,0 +1,103 @@
+#!/bin/sh
+# TohsakaWrt GNSS 定位（RM500Q-GL 内置 GNSS）
+#   show [lat,lon]  输出可直接发 Telegram 的 HTML 状态（可带上与某点的直线距离）
+#   start           开启 GNSS（首次定位通常 30~90 秒）
+#   stop            关闭 GNSS
+#
+# 说明：GNSS 只读取卫星定位，不影响蜂窝数据；关闭后立即释放。
+set -u
+
+[ -r /usr/lib/tohsakawrt/common.sh ] && . /usr/lib/tohsakawrt/common.sh
+
+AT_PORT="${TWR_GNSS_AT_PORT:-$(uci -q get modem.modem0.at_port 2>/dev/null || echo '/dev/ttyUSB3')}"
+[ -e "$AT_PORT" ] || AT_PORT="/dev/ttyUSB3"
+[ -e "$AT_PORT" ] || AT_PORT="/dev/ttyUSB2"
+AT_SCRIPT="${TWR_GNSS_AT_SCRIPT:-/usr/share/modem/modem_at.sh}"
+
+at() {
+    [ -x "$AT_SCRIPT" ] || return 1
+    AT_TIMEOUT="${AT_TIMEOUT:-8}" sh "$AT_SCRIPT" "$AT_PORT" "$1" 2>/dev/null | tr -d '\r'
+}
+
+gnss_on() {
+    at 'AT+QGPS?' | grep -q '+QGPS: 1'
+}
+
+# 两点直线距离（km，保留一位）；用于"离家多远"这类判断
+distance_km() {
+    awk -v la1="$1" -v lo1="$2" -v la2="$3" -v lo2="$4" 'BEGIN{
+        pi = 3.14159265358979; r = 6371
+        dlat = (la2 - la1) * pi / 180; dlon = (lo2 - lo1) * pi / 180
+        a = sin(dlat/2)^2 + cos(la1*pi/180) * cos(la2*pi/180) * sin(dlon/2)^2
+        c = 2 * atan2(sqrt(a), sqrt(1-a))
+        printf "%.1f", r * c
+    }'
+}
+
+case "${1:-show}" in
+    start)
+        at 'AT+QGPS=1' >/dev/null 2>&1
+        if gnss_on; then echo "OK_STARTED"; exit 0; fi
+        echo "ERROR_START_FAILED"
+        exit 1
+        ;;
+
+    stop)
+        at 'AT+QGPSEND' >/dev/null 2>&1
+        if gnss_on; then echo "ERROR_STOP_FAILED"; exit 1; fi
+        echo "OK_STOPPED"
+        ;;
+
+    show)
+        if ! gnss_on; then
+            printf '%s\n' "🛰️ <b>GNSS 定位</b>" "" \
+                "📍 <b>状态</b>：未开启" \
+                "<i>点「▶️ 开启定位」后模组开始搜星（首次定位通常 30~90 秒，室内可能收不到）。</i>"
+            exit 0
+        fi
+
+        line="$(at 'AT+QGPSLOC?' | grep '+QGPSLOC:' | head -n 1)"
+        if [ -z "$line" ]; then
+            printf '%s\n' "🛰️ <b>GNSS 定位</b>" "" \
+                "📡 <b>状态</b>：已开启，正在搜星…" \
+                "<i>还没拿到定位，稍等一下再刷新。</i>"
+            exit 0
+        fi
+
+        # +QGPSLOC: <UTC>,<lat>,<lon>,<HDOP>,<alt>,<fix>,...
+        vals="$(printf '%s' "$line" | sed 's/.*+QGPSLOC: //')"
+        utc="$(printf '%s' "$vals" | cut -d, -f1)"
+        lat="$(printf '%s' "$vals" | cut -d, -f2)"
+        lon="$(printf '%s' "$vals" | cut -d, -f3)"
+        hdop="$(printf '%s' "$vals" | cut -d, -f4)"
+        alt="$(printf '%s' "$vals" | cut -d, -f5)"
+        fix="$(printf '%s' "$vals" | cut -d, -f6)"
+
+        if [ -z "$lat" ] || [ -z "$lon" ]; then
+            printf '%s\n' "🛰️ <b>GNSS 定位</b>" "" "⚠️ <b>读取失败</b>：模组返回内容无法解析"
+            exit 0
+        fi
+
+        extra=""
+        if [ -n "${2:-}" ]; then
+            ref_lat="${2%%,*}"
+            ref_lon="${2#*,}"
+            if [ -n "$ref_lat" ] && [ -n "$ref_lon" ]; then
+                km="$(distance_km "$lat" "$lon" "$ref_lat" "$ref_lon" 2>/dev/null)"
+                [ -n "$km" ] && extra="$(printf '\n📏 <b>距参考点</b>：约 <code>%s</code> km' "$km")"
+            fi
+        fi
+
+        printf '%s\n' \
+            "🛰️ <b>GNSS 定位</b>" "" \
+            "📍 <b>坐标</b>：<code>${lat}, ${lon}</code>" \
+            "🗺️ <b>地图</b>：<a href=\"https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=16/${lat}/${lon}\">在 OpenStreetMap 查看</a>" \
+            "⛰️ <b>海拔</b>：<code>${alt:-未知}</code> m　🎯 <b>精度</b>：HDOP <code>${hdop:-未知}</code>　🛰️ <b>定位类型</b>：<code>${fix:-未知}</code>${extra}" \
+            "🕰️ <b>UTC</b>：<code>${utc:-未知}</code>"
+        ;;
+
+    *)
+        echo "Usage: $0 {show [lat,lon] | start | stop}"
+        exit 1
+        ;;
+esac
