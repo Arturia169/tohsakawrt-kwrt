@@ -208,6 +208,10 @@ local function handle_callback(cb_id, msg_id, data_str)
         modm.band_lock(data_str:sub(9), msg_id, cb_id)
     elseif data_str == "band_restore" then
         modm.band_restore(msg_id, cb_id)
+    elseif data_str == "clash_status" then
+        net.cmd_clash()
+    elseif data_str == "nodes_menu" then
+        net.cmd_nodes()
     elseif data_str == "proxy_menu" then
         net.cmd_proxy_menu(msg_id, cb_id)
     elseif data_str == "direct_list" then

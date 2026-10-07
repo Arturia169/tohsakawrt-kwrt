@@ -174,7 +174,7 @@ function M.cmd_proxy_menu(msg_id, cb_id)
         },
         {
             { text = "☁️ Clash 状态", callback_data = "clash_status" },
-            { text = "🔄 重启 Clash", callback_data = "clash_restart" }
+            { text = "🔄 重启 Clash", callback_data = "do_clash_restart" }
         },
         {
             { text = "📊 返回看板", callback_data = "refresh_status" }
