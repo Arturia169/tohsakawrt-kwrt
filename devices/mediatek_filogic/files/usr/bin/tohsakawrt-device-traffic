@@ -78,6 +78,6 @@ END {
         printf "%d. <code>%s</code>  <code>[%s]</code>\n   ↓%s ↑%s\n", i, mac[i], bar, human(rx[i]), human(tx[i])
     }
     print "━━━━━━━━━━━━━━━━━━"
-    print "💡 <i>数据来自 nlbwmon；在机器人里给设备设备注后会显示名字。</i>"
+    print "💡 <i>数据来自 nlbwmon；名字取自静态租约与 DHCP 租约，也可在「在线设备」里手动备注。</i>"
 }' "$ROWS"
 rm -f "$ROWS"
