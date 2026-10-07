@@ -247,6 +247,11 @@ EOF_NODATA
         # 探测成功，重置失败计数
         rm -f "$fail_count_file" 2>/dev/null
         rm -f "$first_fail_file" 2>/dev/null
+        # 若此前因 5G 掉线临时回落到宽带，现在 5G 恢复 → 切回期望出口
+        # （resume 自己判断有没有回落标记：没有就什么都不做，可以无条件调用）
+        if [ -x /usr/bin/tohsakawrt-uplink ]; then
+            /usr/bin/tohsakawrt-uplink resume >/dev/null 2>&1 || true
+        fi
         say "5G data keepalive ping OK"
         return 0
     fi
@@ -267,8 +272,31 @@ EOF_NODATA
             local last_alert="$(cat "$active_alert_file" 2>/dev/null)"
             case "$last_alert" in *[!0-9]*) last_alert=0 ;; esac
             if [ -z "$last_alert" ] || [ "$((now - last_alert))" -ge 1800 ]; then
+                # 尝试临时回落到宽带：只在宽带"前提就绪"时动作，
+                # 且用 KEEP_DESIRED 保证不改动用户选择的期望出口
+                local fell_back=0
+                local auto_fb="$(uci -q get tohsakawrt-tgbot.main.uplink_auto_fallback 2>/dev/null)"
+                if [ "$auto_fb" != "0" ] && [ -x /usr/bin/tohsakawrt-uplink ]; then
+                    if [ "$(/usr/bin/tohsakawrt-uplink check wan 2>/dev/null)" = "READY" ]; then
+                        TOHSAKA_UPLINK_KEEP_DESIRED=1 /usr/bin/tohsakawrt-uplink set wan >/dev/null 2>&1
+                        case "$(/usr/bin/tohsakawrt-uplink status 2>/dev/null)" in
+                            ACTIVE:wan*) fell_back=1 ;;
+                        esac
+                        if [ "$fell_back" -eq 1 ]; then
+                            logger -t tohsakawrt-modem-heal "5G down as main uplink; temporarily fell back to WAN"
+                        else
+                            logger -t tohsakawrt-modem-heal "5G down as main uplink; WAN fallback attempted but failed"
+                        fi
+                    else
+                        logger -t tohsakawrt-modem-heal "5G down as main uplink; WAN not ready, staying put"
+                    fi
+                fi
                 if command -v send_tg >/dev/null 2>&1; then
-                    send_tg "⚠️ <b>5G 主出口探测超时</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>探测结果</b>：5G 正在承载主出口，探测超时，已按策略不做动作\n━━━━━━━━━━━━━━━━━━\n\n🕰️ <i>$(date '+%Y-%m-%d %H:%M:%S')</i>" "HTML"
+                    if [ "$fell_back" -eq 1 ]; then
+                        send_tg "♻️ <b>5G 掉线，已临时切到有线宽带</b>\n━━━━━━━━━━━━━━━━━━\n📊 <b>探测结果</b>：连续 ${fails} 次数据探测超时\n🔄 <b>已执行动作</b>：临时回落到宽带\n🎯 <b>你的期望出口</b>：仍是原选择，5G 恢复后会自动切回\n━━━━━━━━━━━━━━━━━━\n\n🕰️ <i>$(date '+%Y-%m-%d %H:%M:%S')</i>" "HTML" "$TG_KB_STATUS_UPLINK"
+                    else
+                        send_tg "⚠️ <b>5G 主出口探测超时</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>探测结果</b>：5G 正在承载主出口，探测超时\n⛔ <b>未执行动作</b>：宽带未就绪或回落未成功\n━━━━━━━━━━━━━━━━━━\n\n🕰️ <i>$(date '+%Y-%m-%d %H:%M:%S')</i>" "HTML" "$TG_KB_STATUS_UPLINK"
+                    fi
                 fi
                 echo "$now" > "$active_alert_file"
             fi

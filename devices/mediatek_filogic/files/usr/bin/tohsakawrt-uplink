@@ -49,6 +49,40 @@ acquire_uplink_lock() {
     return 0
 }
 
+# 回落标记与冷却：都在 /tmp（重启即清，符合"临时状态"的语义）
+FALLBACK_MARK="${TOHSAKA_UPLINK_FALLBACK:-/tmp/tohsakawrt/state/uplink_fallback}"
+RECONCILE_FAIL="${TOHSAKA_UPLINK_RECONCILE_FAIL:-/tmp/tohsakawrt/state/uplink_reconcile_failed}"
+FALLBACK_MAX_AGE=3600
+RECONCILE_COOLDOWN=600
+
+mark_fallback() {
+    mkdir -p "$(dirname "$FALLBACK_MARK")" 2>/dev/null
+    date +%s > "$FALLBACK_MARK" 2>/dev/null || true
+}
+
+clear_fallback() {
+    rm -f "$FALLBACK_MARK" 2>/dev/null || true
+}
+
+# 回落标记是否仍然有效（超过 1 小时视为失效，避免标记卡死后自愈永久失效）
+fallback_active() {
+    [ -r "$FALLBACK_MARK" ] || return 1
+    local ts="$(cat "$FALLBACK_MARK" 2>/dev/null)"
+    case "$ts" in ''|*[!0-9]*) return 1 ;; esac
+    local now="$(date +%s)"
+    [ "$((now - ts))" -le "$FALLBACK_MAX_AGE" ] || return 1
+    return 0
+}
+
+# reconcile 失败后的冷却（避免期望线路长期不通时每分钟重试造成抖动）
+reconcile_cooling() {
+    [ -r "$RECONCILE_FAIL" ] || return 1
+    local ts="$(cat "$RECONCILE_FAIL" 2>/dev/null)"
+    case "$ts" in ''|*[!0-9]*) return 1 ;; esac
+    local now="$(date +%s)"
+    [ "$((now - ts))" -lt "$RECONCILE_COOLDOWN" ]
+}
+
 read_desired() {
     [ -r "$DESIRED_FILE" ] || return 0
     sed -n '1p' "$DESIRED_FILE" 2>/dev/null | tr -d ' \r\n'
@@ -113,7 +147,13 @@ switch_to_wan() {
     fi
 
     normalize_metrics
-    write_desired wan
+    if [ "${TOHSAKA_UPLINK_KEEP_DESIRED:-0}" = "1" ]; then
+        # 临时回落：期望出口保持不变（否则 reconcile 会与回落互相打架）
+        mark_fallback
+    else
+        clear_fallback
+        write_desired wan
+    fi
     logger -t TohsakaWrt-Uplink "Uplink switched to WAN (eth0)"
     echo "SUCCESS_WAN"
 }
@@ -160,9 +200,80 @@ switch_to_5g() {
     fi
 
     normalize_metrics
-    write_desired 5g
+    if [ "${TOHSAKA_UPLINK_KEEP_DESIRED:-0}" = "1" ]; then
+        # 临时回落：期望出口保持不变（否则 reconcile 会与回落互相打架）
+        mark_fallback
+    else
+        clear_fallback
+        write_desired 5g
+    fi
     logger -t TohsakaWrt-Uplink "Uplink switched to 5G (usb0)"
     echo "SUCCESS_5G"
+}
+
+# 出口对账主体（reconcile 与 resume 共用）
+do_reconcile() {
+    local reason="${1:-出口被改动}"
+    local desired="$(read_desired)"
+    [ -n "$desired" ] || return 0
+    if [ "$(uci -q get tohsakawrt-tgbot.main.uplink_enforce 2>/dev/null)" = "0" ]; then
+        return 0
+    fi
+    # 临时回落期间不纠偏：否则会与回落互相打架，来回切网
+    if fallback_active; then
+        logger -t TohsakaWrt-Uplink "Reconcile skipped: temporary fallback is active"
+        return 0
+    fi
+    # 上次纠正失败后的冷却：避免期望线路长期不通时每分钟重试
+    if reconcile_cooling; then
+        logger -t TohsakaWrt-Uplink "Reconcile skipped: cooling down after a failed attempt"
+        return 0
+    fi
+
+    local actual="$(get_active_uplink)"
+    [ "$actual" = "$desired" ] && return 0
+
+    logger -t TohsakaWrt-Uplink "Uplink drift detected (want ${desired}, actual ${actual}), re-applying"
+    local result
+    case "$desired" in
+        wan|eth0) result="$(switch_to_wan)" ;;
+        5g|usb0) result="$(switch_to_5g)" ;;
+        *) return 0 ;;
+    esac
+    echo "$result"
+    case "$result" in
+        SUCCESS_*)
+            rm -f "$RECONCILE_FAIL" 2>/dev/null || true
+            if command -v send_tg >/dev/null 2>&1; then
+                send_tg "♻️ <b>出口已自动纠正</b>
+━━━━━━━━━━━━━━━━━━
+🎯 <b>期望出口</b>：<code>${desired}</code>
+📡 <b>纠正前实际</b>：<code>${actual}</code>
+🧭 <b>触发原因</b>：${reason}
+━━━━━━━━━━━━━━━━━━
+<i>已按你的选择改回；期望出口不会被自动改动。</i>
+
+🕰️ <i>$(date '+%Y-%m-%d %H:%M:%S')</i>" "HTML" "$TG_KB_STATUS_UPLINK" || true
+            fi
+            return 0
+            ;;
+        *)
+            # 切不过去（例如期望的线路确实不通）：记冷却，避免每分钟重试造成抖动，并告知用户
+            date +%s > "$RECONCILE_FAIL" 2>/dev/null || true
+            if command -v send_tg >/dev/null 2>&1; then
+                send_tg "⚠️ <b>出口纠正失败</b>
+━━━━━━━━━━━━━━━━━━
+🎯 <b>期望出口</b>：<code>${desired}</code>
+📡 <b>当前实际</b>：<code>${actual}</code>
+📄 <b>返回</b>：<code>${result:-no_result}</code>
+━━━━━━━━━━━━━━━━━━
+<i>该线路当前探测不通，已保持现状，${RECONCILE_COOLDOWN} 秒后才会再次尝试。</i>
+
+🕰️ <i>$(date '+%Y-%m-%d %H:%M:%S')</i>" "HTML" "$TG_KB_STATUS_UPLINK" || true
+            fi
+            return 1
+            ;;
+    esac
 }
 
 case "$1" in
@@ -187,37 +298,17 @@ case "$1" in
         exit 0
         ;;
     reconcile)
-        # 由巡检调用：实际出口与"期望出口"不一致时自动纠正（uci uplink_enforce=0 可关闭）
+        # 由巡检调用：实际出口与"期望出口"不一致时自动纠正
         acquire_uplink_lock || { echo "ERROR_BUSY"; exit 1; }
-        desired="$(read_desired)"
-        [ -n "$desired" ] || exit 0
-        if [ "$(uci -q get tohsakawrt-tgbot.main.uplink_enforce 2>/dev/null)" = "0" ]; then
-            exit 0
-        fi
-        actual="$(get_active_uplink)"
-        [ "$actual" = "$desired" ] && exit 0
-        logger -t TohsakaWrt-Uplink "Uplink drift detected (want ${desired}, actual ${actual}), re-applying"
-        case "$desired" in
-            wan|eth0) result="$(switch_to_wan)" ;;
-            5g|usb0) result="$(switch_to_5g)" ;;
-            *) exit 0 ;;
-        esac
-        echo "$result"
-        case "$result" in
-            SUCCESS_*)
-                if command -v send_tg >/dev/null 2>&1; then
-                    send_tg "♻️ <b>出口已自动纠正</b>
-━━━━━━━━━━━━━━━━━━
-🎯 <b>期望出口</b>：<code>${desired}</code>
-📡 <b>纠正前实际</b>：<code>${actual}</code>
-━━━━━━━━━━━━━━━━━━
-<i>通常是重启或网络服务重载把出口打乱了，已按你的选择改回。</i>
-
-🕰️ <i>$(date '+%Y-%m-%d %H:%M:%S')</i>" "HTML" "$TG_KB_STATUS_UPLINK" || true
-                fi
-                ;;
-            *) exit 1 ;;
-        esac
+        do_reconcile "出口被改动"
+        ;;
+    resume)
+        # 5G 恢复后由 modem-heal 调用：有回落标记就清掉并切回期望出口，否则什么都不做
+        acquire_uplink_lock || { echo "ERROR_BUSY"; exit 1; }
+        fallback_active || exit 0
+        clear_fallback
+        rm -f "$RECONCILE_FAIL" 2>/dev/null || true
+        do_reconcile "5G 已恢复"
         ;;
     set)
         acquire_uplink_lock || { echo "ERROR_BUSY: 另一个出口切换正在进行"; exit 1; }
@@ -236,7 +327,7 @@ case "$1" in
         switch_to_5g
         ;;
     *)
-        echo "Usage: $0 {status | check <wan|5g> | reconcile | wan | 5g}"
+        echo "Usage: $0 {status | check <wan|5g> | reconcile | resume | wan | 5g}"
         exit 1
         ;;
 esac

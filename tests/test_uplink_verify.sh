@@ -23,6 +23,8 @@ CALLS="$TMP/calls.log"
 export CALLS
 export TOHSAKA_UPLINK_DESIRED="$TMP/uplink.desired"
 export TOHSAKA_UPLINK_LOCK="$TMP/uplink.lock"
+export TOHSAKA_UPLINK_FALLBACK="$TMP/uplink_fallback"
+export TOHSAKA_UPLINK_RECONCILE_FAIL="$TMP/uplink_reconcile_failed"
 
 # 桩件：ip —— 用 TEST_ROUTE_GET_DEV 控制"当前出口"，并可切换"切换后"的取值
 cat > "$BIN/ip" <<'EOF'
@@ -181,6 +183,43 @@ check 'check wan：网关 ping 不通 → UNREACHABLE' "$([ "$out" = "UNREACHABL
 out="$("$SCRIPT" check 5g 2>&1)"
 check 'check 不产生任何路由变更（只读预检）' \
     "$(grep -Eq '^ip route (replace|del|add) ' "$CALLS" && echo 0 || echo 1)"
+
+# ---------- 第 4 项：临时回落（不改期望值）+ 回落期间不纠偏 + resume + 失败冷却 ----------
+: > "$CALLS"
+printf '5g\n' > "$TOHSAKA_UPLINK_DESIRED"
+rm -f "$TOHSAKA_UPLINK_FALLBACK" "$TOHSAKA_UPLINK_RECONCILE_FAIL"
+TEST_ROUTE_GET_DEV=towan TEST_USB_IP=1 TEST_USB_GW=1 TOHSAKA_UPLINK_KEEP_DESIRED=1 \
+    "$SCRIPT" wan > "$TMP/fb.out" 2>&1
+check '临时回落切到宽带成功' "$(grep -Fq 'SUCCESS_WAN' "$TMP/fb.out" && echo 1 || echo 0)"
+check '临时回落不覆盖期望出口（仍是 5g）' \
+    "$([ "$(cat "$TOHSAKA_UPLINK_DESIRED" 2>/dev/null)" = "5g" ] && echo 1 || echo 0)"
+check '临时回落会写下回落标记' "$([ -f "$TOHSAKA_UPLINK_FALLBACK" ] && echo 1 || echo 0)"
+
+: > "$CALLS"
+TEST_ROUTE_GET_DEV=eth0 TEST_USB_IP=1 TEST_USB_GW=1 "$SCRIPT" reconcile > "$TMP/fb-rec.out" 2>&1
+check '回落期间 reconcile 不纠偏（否则会来回切网）' \
+    "$(grep -Eq '^ip route (replace|del) ' "$CALLS" && echo 0 || echo 1)"
+
+: > "$CALLS"
+TEST_ROUTE_GET_DEV=to5g TEST_USB_IP=1 TEST_USB_GW=1 "$SCRIPT" resume > "$TMP/fb-resume.out" 2>&1
+check 'resume：清掉回落标记并切回期望出口 5g' \
+    "$(grep -Fq 'SUCCESS_5G' "$TMP/fb-resume.out" && [ ! -f "$TOHSAKA_UPLINK_FALLBACK" ] && echo 1 || echo 0)"
+
+: > "$CALLS"
+rm -f "$TOHSAKA_UPLINK_FALLBACK"
+TEST_ROUTE_GET_DEV=usb0 "$SCRIPT" resume > "$TMP/fb-noop.out" 2>&1
+check 'resume：没有回落标记时什么都不做' \
+    "$(grep -Eq '^ip route (replace|del) ' "$CALLS" && echo 0 || echo 1)"
+
+: > "$CALLS"
+printf '5g\n' > "$TOHSAKA_UPLINK_DESIRED"
+rm -f "$TOHSAKA_UPLINK_FALLBACK" "$TOHSAKA_UPLINK_RECONCILE_FAIL"
+TEST_ROUTE_GET_DEV=to5g TEST_USB_IP=0 TEST_USB_GW=1 "$SCRIPT" reconcile > "$TMP/rec-cd1.out" 2>&1
+check 'reconcile 失败时记下冷却时间戳' "$([ -f "$TOHSAKA_UPLINK_RECONCILE_FAIL" ] && echo 1 || echo 0)"
+: > "$CALLS"
+TEST_ROUTE_GET_DEV=to5g TEST_USB_IP=1 TEST_USB_GW=1 "$SCRIPT" reconcile > "$TMP/rec-cd2.out" 2>&1
+check 'reconcile 冷却期内不再重试（避免每分钟抖动）' \
+    "$(grep -q 'addr show' "$CALLS" && echo 0 || echo 1)"
 
 printf 'PASS=%s FAIL=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
