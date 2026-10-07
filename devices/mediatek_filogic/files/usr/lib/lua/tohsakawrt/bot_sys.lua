@@ -80,6 +80,82 @@ function M.cmd_flowcard(msg_id, cb_id)
     return tg.send_msg(body, kb)
 end
 
+-- 🔗 直连清单：给"套了优化 CDN、走代理反而更慢"的站点加直连规则
+function M.cmd_direct_list(msg_id, cb_id)
+    local raw = tostring(core.exec("/usr/bin/tohsakawrt-clash-direct list 2>/dev/null") or ""):gsub("%s+$", "")
+    local lines = { "🔗 <b>Clash 强制直连清单</b>", "━━━━━━━━━━━━━━━━━━" }
+    local kb_rows = {}
+    local n = 0
+    for d in raw:gmatch("[^\n]+") do
+        n = n + 1
+        local dom = d:gsub("^%s+", ""):gsub("%s+$", "")
+        if dom ~= "" then
+            lines[#lines + 1] = string.format("%d. <code>%s</code>", n, html_escape(dom))
+            if n <= 5 then
+                kb_rows[#kb_rows + 1] = { { text = "🗑 撤销 " .. dom:sub(1, 22), callback_data = "direct_del:" .. dom } }
+            end
+        end
+    end
+    if n == 0 then lines[#lines + 1] = "<i>清单为空 —— 用 /direct 域名 添加</i>" end
+    lines[#lines + 1] = "━━━━━━━━━━━━━━━━━━"
+    lines[#lines + 1] = "💡 <i>这些域名走直连；改完会自动热重载（不断线）。</i>"
+    kb_rows[#kb_rows + 1] = { { text = "🔄 刷新清单", callback_data = "direct_list" } }
+    local text, kb = table.concat(lines, "\n"), kb_rows
+    if msg_id and cb_id then return tg.answer_and_edit(cb_id, "正在读取清单...", msg_id, text, kb) end
+    if msg_id then return tg.edit_msg(msg_id, text, kb) end
+    return tg.send_msg(text, kb)
+end
+
+-- 域名白名单校验：与脚本侧同规则（双重防护，非法输入连脚本都不调）
+local function valid_domain(d)
+    if type(d) ~= "string" or #d < 4 or #d > 253 then return false end
+    if not d:match("^[%w][%w%.%-]*[%w]$") then return false end
+    if not d:find("%.") then return false end
+    return true
+end
+
+function M.direct_add(domain, msg_id, cb_id)
+    domain = tostring(domain or ""):gsub("%s", "")
+    if not valid_domain(domain) then
+        local t = "⚠️ <b>域名格式不正确</b>\n\n<i>示例：<code>/direct blog.example.com</code></i>"
+        if msg_id and cb_id then return tg.answer_and_edit(cb_id, "格式不正确", msg_id, t) end
+        return tg.send_msg(t)
+    end
+    local out = tostring(core.exec("/usr/bin/tohsakawrt-clash-direct add " .. domain .. " 2>/dev/null") or ""):gsub("%s+$", "")
+    local body
+    if out == "ADDED" then
+        body = string.format("✅ <b>已加入直连</b>\n\n🔗 <code>%s</code>\n⚡ <b>已热重载</b>（保留现有连接）\n\n<i>下次这条路径就走直连了。</i>", html_escape(domain))
+    elseif out == "ALREADY" then
+        body = string.format("ℹ️ <b>本来就在直连清单里</b>\n\n🔗 <code>%s</code>", html_escape(domain))
+    else
+        body = string.format("⚠️ <b>添加失败</b>\n\n<code>%s</code>", html_escape(out ~= "" and out or "无返回"))
+    end
+    local kb = {
+        { { text = "🔗 看清单", callback_data = "direct_list" }, { text = "🗑 撤销", callback_data = "direct_del:" .. domain } },
+        { { text = "📊 返回看板", callback_data = "refresh_status" } }
+    }
+    if msg_id and cb_id then return tg.answer_and_edit(cb_id, out == "ADDED" and "已加入直连" or "完成", msg_id, body, kb) end
+    if msg_id then return tg.edit_msg(msg_id, body, kb) end
+    return tg.send_msg(body, kb)
+end
+
+function M.direct_del(domain, msg_id, cb_id)
+    domain = tostring(domain or ""):gsub("%s", "")
+    if not valid_domain(domain) then
+        if cb_id then tg.answer_callback(cb_id, "域名不合法") end
+        return tg.send_msg("⚠️ <b>域名格式不正确</b>")
+    end
+    local out = tostring(core.exec("/usr/bin/tohsakawrt-clash-direct del " .. domain .. " 2>/dev/null") or ""):gsub("%s+$", "")
+    local body = string.format("🗑 <b>已撤销直连</b>\n\n🔗 <code>%s</code>\n⚡ <i>已热重载</i>", html_escape(domain))
+    if out ~= "DELETED" then
+        body = string.format("⚠️ <b>撤销返回异常</b>：<code>%s</code>", html_escape(out))
+    end
+    local kb = { { { text = "🔗 看清单", callback_data = "direct_list" } } }
+    if msg_id and cb_id then return tg.answer_and_edit(cb_id, "已撤销", msg_id, body, kb) end
+    if msg_id then return tg.edit_msg(msg_id, body, kb) end
+    return tg.send_msg(body, kb)
+end
+
 function M.cmd_status(msg_id)
     local text, inline_kb = build_status_card()
     if msg_id then
