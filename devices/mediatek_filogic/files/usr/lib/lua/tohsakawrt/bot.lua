@@ -43,7 +43,6 @@ local function cmd_help()
 /trend - 📈 5G 信号趋势（最近 60 分钟，含频段跳变统计）
 /band - 📻 5G 频段设置（锁定/恢复，带自动回退）
 /gnss - 🛰️ GNSS 定位（坐标 / 地图链接 / 开关）
-/flow - 📊 流量卡实时用量（剩余 / 已用 / 可用天数）
 /top - 📱 各设备流量排行（本周期累计，抓偷跑流量的设备）
 /cards - 📇 查看卡内号码
 /switch <序号或关键词> - 🔀 切换 eSIM 号码
@@ -207,8 +206,6 @@ local function handle_callback(cb_id, msg_id, data_str)
         modm.band_restore(msg_id, cb_id)
     elseif data_str == "dev_traffic" then
         sysm.cmd_device_traffic(msg_id, cb_id)
-    elseif data_str == "flowcard_now" then
-        sysm.cmd_flowcard(msg_id, cb_id)
     elseif data_str == "signal_trend" then
         modm.cmd_signal_trend(msg_id, cb_id)
     elseif data_str == "refresh_modem" then
@@ -324,8 +321,6 @@ local function handle_command(text)
         sysm.cmd_temp()
     elseif cmd == "/top" or cmd == "/devices" or full:find("排行") or full:find("各设备流量") then
         sysm.cmd_device_traffic()
-    elseif cmd == "/flow" or cmd == "/data" or full:find("查流量") or full:find("流量卡") then
-        sysm.cmd_flowcard()
     elseif cmd == "/gnss" or cmd == "/gps" or full:find("定位") or full:find("GPS") then
         modm.cmd_gnss()
     elseif cmd == "/band" or cmd == "/bands" or full:find("频段") then

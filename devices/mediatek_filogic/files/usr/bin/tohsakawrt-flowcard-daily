@@ -168,10 +168,7 @@ local ok, err = pcall(function()
     state.last_updated_at = os.time()
     if delta_mb then state.last_delta_mb = delta_mb end
     state.urgent_state = urgent and "1" or "0"
-    -- 只查询模式（机器人点「查流量」）不能写台账：否则当晚日报的"今日消耗"差值会被算错
-    if os.getenv("FLOWCARD_PRINT_ONLY") ~= "1" then
-        save_state(state)
-    end
+    save_state(state)
 
     -- 4. 组装并发送 Telegram HTML 报表
     local icon = quota_icon(percent)
@@ -201,11 +198,6 @@ local ok, err = pcall(function()
     end
     local kb = { { { text = "🩺 查状态", callback_data = "refresh_status" },
                     { text = "📶 查模组", callback_data = "refresh_modem" } } }
-    if os.getenv("FLOWCARD_PRINT_ONLY") == "1" then
-        -- 只把报表打到标准输出，交给机器人转发
-        print(table.concat(lines, "\n"))
-        os.exit(0)
-    end
     assert(tg.send_msg(table.concat(lines, "\n"), kb) ~= nil, "Telegram report send failed")
 
     -- 紧急预警额外单独推一条（只在"从正常变为紧急"时发一次，不会天天骚扰）
