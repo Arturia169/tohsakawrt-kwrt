@@ -12,7 +12,7 @@ package.preload["tohsakawrt.core"] = function()
         if option == "token" then return "dummy-token" end
         if option == "chat_id" then return "77" end
         return default
-    end, get_state = function(_, default) return default end, set_state = function() end, log = function() end }
+    end, get_state = function(_, default) return default end, set_state = function() end, log = function() end, exec_line = function() return "" end }
 end
 package.preload["tohsakawrt.tg"] = function()
     return {

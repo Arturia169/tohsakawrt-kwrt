@@ -7,6 +7,17 @@ local html_escape, ask_confirm = bc.html_escape, bc.ask_confirm
 
 local M = {}
 
+-- 预检某条线路是否"就绪"：调用切换脚本的 check（本地探测，不在 Lua 里另写一份）
+local function uplink_health(target)
+    local raw = core.exec_line("/usr/bin/tohsakawrt-uplink check " .. target .. " 2>/dev/null") or ""
+    raw = tostring(raw):gsub("%s+$", "")
+    if raw == "READY" then return "🟢 就绪" end
+    if raw == "NO_IP" then return "🟡 未取得 IP" end
+    if raw == "NO_GATEWAY" then return "🟡 无网关" end
+    if raw == "UNREACHABLE" then return "🔴 网关不可达" end
+    return "⚪ 未知"
+end
+
 function M.build_uplink_menu()
     local uplink = sys.uplink_status()
     local cur_name = (uplink.type == "wan") and "有线宽带 (eth0)" or ((uplink.type == "5g") and "5G 蜂窝网络 (usb0)" or (tostring(uplink.dev or "unknown") .. " (未知接口)"))
@@ -54,19 +65,23 @@ function M.build_uplink_menu()
 ━━━━━━━━━━━━━━━━━━
 %s <b>当前主力出口</b>：<code>%s</code>
 ━━━━━━━━━━━━━━━━━━
-🌐 <b>有线宽带 (eth0)</b>
+🌐 <b>有线宽带 (eth0)</b>  %s
 ├ 物理内网：<code>%s</code> (光猫分配)
 %s
 
-📶 <b>5G 模组 (usb0)</b>
+📶 <b>5G 模组 (usb0)</b>  %s
 ├ 虚拟网卡：<code>%s</code> (模组网关)
 ├ 蜂窝分配：<code>%s</code>
 %s%s
 ━━━━━━━━━━━━━━━━━━
 💡 <i>说明：光猫/5G网卡为设备内网IP；公网归属/蜂窝为运营商真实出口。</i>
+🩺 <i>状态含义：🟢 就绪（有 IP 且网关可达）／🟡 前提不满足／🔴 网关不可达。</i>
 👇 <b>点击下方按钮平滑倒换主力上网通道：</b>
 
-🕰️ <i>%s</i>]], cur_icon, html_escape(cur_name), html_escape(ip_wan), wan_pub_line, html_escape(ip_5g), html_escape(m_info.sim_ip), cell_mode_line, cell_pub_line, html_escape(now))
+🕰️ <i>%s</i>]], cur_icon, html_escape(cur_name),
+        uplink_health("wan"), html_escape(ip_wan), wan_pub_line,
+        uplink_health("5g"), html_escape(ip_5g), html_escape(m_info.sim_ip), cell_mode_line, cell_pub_line,
+        html_escape(now))
 
     return text, inline_kb
 end

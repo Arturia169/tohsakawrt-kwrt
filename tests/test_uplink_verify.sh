@@ -54,6 +54,7 @@ case "$*" in
     'route show default dev usb0') [ "${TEST_USB_GW:-1}" = 1 ] && echo 'default via 192.168.225.1 dev usb0 proto static metric 20' ;;
     'route show default dev eth0') [ "${TEST_ETH_GW:-1}" = 1 ] && echo 'default via 192.168.1.1 dev eth0 proto static metric 10' ;;
     '-4 addr show usb0') [ "${TEST_USB_IP:-1}" = 1 ] && echo '2: usb0 inet 192.168.225.43/24 scope global usb0' ;;
+    '-4 addr show eth0') [ "${TEST_ETH_IP:-1}" = 1 ] && echo '3: eth0 inet 192.168.1.2/24 brd 192.168.1.255 scope global eth0' ;;
 esac
 EOF
 
@@ -158,6 +159,28 @@ check 'reconcile：没有期望记录时完全不干预' \
     "$(grep -Eq '^ip route (replace|del) ' "$CALLS" && echo 0 || echo 1)"
 
 check '脚本通过 sh -n' "$(sh -n "$SCRIPT" && echo 1 || echo 0)"
+
+# ---------- 第 5 项：菜单预检 check <wan|5g> ----------
+: > "$CALLS"
+out="$(TEST_USB_IP=1 TEST_USB_GW=1 "$SCRIPT" check 5g 2>&1)"
+check 'check 5g：有 IP 且网关可达 → READY' "$([ "$out" = "READY" ] && echo 1 || echo 0)"
+
+: > "$CALLS"
+out="$(TEST_USB_IP=0 "$SCRIPT" check 5g 2>&1)"
+check 'check 5g：未取得 IP → NO_IP' "$([ "$out" = "NO_IP" ] && echo 1 || echo 0)"
+
+: > "$CALLS"
+out="$(TEST_USB_IP=1 TEST_USB_GW=0 "$SCRIPT" check 5g 2>&1)"
+check 'check 5g：无默认网关 → NO_GATEWAY' "$([ "$out" = "NO_GATEWAY" ] && echo 1 || echo 0)"
+
+: > "$CALLS"
+out="$(TEST_ETH_IP=1 TEST_ETH_GW=1 TEST_PROBE_FAIL=1 "$SCRIPT" check wan 2>&1)"
+check 'check wan：网关 ping 不通 → UNREACHABLE' "$([ "$out" = "UNREACHABLE" ] && echo 1 || echo 0)"
+
+: > "$CALLS"
+out="$("$SCRIPT" check 5g 2>&1)"
+check 'check 不产生任何路由变更（只读预检）' \
+    "$(grep -Eq '^ip route (replace|del|add) ' "$CALLS" && echo 0 || echo 1)"
 
 printf 'PASS=%s FAIL=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

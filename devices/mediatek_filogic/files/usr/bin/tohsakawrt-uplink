@@ -171,6 +171,21 @@ case "$1" in
         dev="$(get_active_dev)"
         echo "ACTIVE:${cur}|${dev}"
         ;;
+    check)
+        # 供机器人菜单做"切换前预检"：只看线路前提（接口有 IP + 网关可达），
+        # 本地探测、不耗公网流量、不经过代理。输出：READY / NO_IP / NO_GATEWAY / UNREACHABLE
+        case "$2" in
+            wan|eth0) check_dev=eth0 ;;
+            5g|usb0) check_dev=usb0 ;;
+            *) echo "USAGE"; exit 1 ;;
+        esac
+        check_ip="$(ip -4 addr show "$check_dev" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -n 1)"
+        if [ -z "$check_ip" ]; then echo "NO_IP"; exit 0; fi
+        check_gw="$(get_gateway "$check_dev")"
+        if [ -z "$check_gw" ]; then echo "NO_GATEWAY"; exit 0; fi
+        if ping -c 1 -W 2 "$check_gw" >/dev/null 2>&1; then echo "READY"; else echo "UNREACHABLE"; fi
+        exit 0
+        ;;
     reconcile)
         # 由巡检调用：实际出口与"期望出口"不一致时自动纠正（uci uplink_enforce=0 可关闭）
         acquire_uplink_lock || { echo "ERROR_BUSY"; exit 1; }
@@ -221,7 +236,7 @@ case "$1" in
         switch_to_5g
         ;;
     *)
-        echo "Usage: $0 {status | reconcile | wan | 5g}"
+        echo "Usage: $0 {status | check <wan|5g> | reconcile | wan | 5g}"
         exit 1
         ;;
 esac
