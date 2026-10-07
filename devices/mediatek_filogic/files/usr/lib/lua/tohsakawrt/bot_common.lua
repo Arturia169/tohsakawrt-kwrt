@@ -18,6 +18,12 @@ function M.html_escape(value)
     return escaped
 end
 
+-- 统一的"返回上一级"按钮：所有子卡片都用它，保证导航一致、不各写一份
+-- parent_cb 缺省回看板；label 可指定更贴切的说法（如"⬅️ 返回代理"）
+function M.back_row(parent_cb, label)
+    return { { text = label or "⬅️ 返回上一级", callback_data = parent_cb or "refresh_status" } }
+end
+
 function M.ask_confirm(title, desc, impact, confirm_action)
     local text = string.format([[⚠️ <b>敏感操作确认</b>
 ━━━━━━━━━━━━━━━━━━

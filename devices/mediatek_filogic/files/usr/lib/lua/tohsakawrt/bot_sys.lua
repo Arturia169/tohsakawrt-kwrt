@@ -100,7 +100,10 @@ function M.cmd_direct_list(msg_id, cb_id)
     if n == 0 then lines[#lines + 1] = "<i>清单为空 —— 用 /direct 域名 添加</i>" end
     lines[#lines + 1] = "━━━━━━━━━━━━━━━━━━"
     lines[#lines + 1] = "💡 <i>这些域名走直连；改完会自动热重载（不断线）。</i>"
-    kb_rows[#kb_rows + 1] = { { text = "🔄 刷新清单", callback_data = "direct_list" } }
+    kb_rows[#kb_rows + 1] = {
+        { text = "🔄 刷新清单", callback_data = "direct_list" },
+        { text = "⬅️ 返回代理", callback_data = "proxy_menu" }
+    }
     local text, kb = table.concat(lines, "\n"), kb_rows
     if msg_id and cb_id then return tg.answer_and_edit(cb_id, "正在读取清单...", msg_id, text, kb) end
     if msg_id then return tg.edit_msg(msg_id, text, kb) end
