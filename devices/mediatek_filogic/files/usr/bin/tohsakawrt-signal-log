@@ -21,14 +21,16 @@ local function sample()
     if not ok or type(modem) ~= "table" or type(modem.info) ~= "function" then return nil end
     local ok2, m = pcall(modem.info)
     if not ok2 or type(m) ~= "table" then return nil end
-    local function f(v)
+    local function f(v, strip_unit)
         local s = tostring(v == nil and "-" or v):gsub("%s+", "")
+        if strip_unit then s = s:gsub("dBm$", ""):gsub("dB$", "") end
         if s == "" then s = "-" end
         return s
     end
     return string.format("%d %s %s %s %s %s %s",
-        os.time(), f(m.band), f(m.rsrp_num or m.rsrp), f(m.sinr_num or m.sinr),
-        f(m.rsrq), f(m.pci), f(m.cell_id))
+        os.time(), f(m.band),
+        f(m.rsrp_num or m.rsrp, true), f(m.sinr_num or m.sinr, true),
+        f(m.rsrq, true), f(m.pci), f(m.cell_id))
 end
 
 local function record()

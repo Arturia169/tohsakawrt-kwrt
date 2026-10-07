@@ -11,7 +11,9 @@ for cand in \
     "$ROOT/files/usr/bin/tohsakawrt-signal-log" ; do
     [ -f "$cand" ] && SCRIPT="$cand" && break
 done
+SCRIPT="${SIGNAL_SCRIPT_OVERRIDE:-${SCRIPT:-}}"
 [ -n "${SCRIPT:-}" ] || { echo "FAIL: 找不到 tohsakawrt-signal-log"; exit 1; }
+[ -f "$SCRIPT" ] || { echo "FAIL: SIGNAL_SCRIPT_OVERRIDE 指向的文件不存在: $SCRIPT"; exit 1; }
 
 LUA_ROOT=""
 for cand in "$ROOT/devices/mediatek_filogic/files/usr/lib/lua" "$ROOT/files/usr/lib/lua"; do
@@ -83,6 +85,24 @@ check '无模组时 record 不写出任何样本（不写脏数据）' \
     "$([ ! -s "$LOG" ] && echo 1 || echo 0)"
 
 check '脚本可执行位已设置' "$([ -x "$SCRIPT" ] && echo 1 || echo 0)"
+
+# 用桩件模组验证 record 写出的样本格式（info() 返回的是 "-10 dB" 这类带单位的字符串，必须剥掉）
+STUB="$TMP/luastub"
+mkdir -p "$STUB/tohsakawrt"
+cat > "$STUB/tohsakawrt/modem.lua" <<'LUA'
+return { info = function()
+    return { band = "n78", rsrp = "-79 dBm", rsrp_num = -79, sinr = "17 dB", sinr_num = 17,
+             rsrq = "-10 dB", pci = "534", cell_id = "170951101" }
+end }
+LUA
+rm -f "$LOG"
+LUA_PATH="$STUB/?.lua;$LUA_ROOT/?.lua;$LUA_ROOT/?/init.lua;;" lua "$SCRIPT" record >/dev/null 2>&1
+check '桩件模组下 record 写出样本' "$([ -s "$LOG" ] && echo 1 || echo 0)"
+LINE="$(cat "$LOG" 2>/dev/null)"
+check '样本字段顺序为 epoch band rsrp sinr rsrq pci cid' \
+    "$(printf '%s' "$LINE" | grep -Eq '^[0-9]+ n78 -79 17 -10 534 170951101$' && echo 1 || echo 0)"
+check '样本里不残留 dB / dBm 单位' \
+    "$(printf '%s' "$LINE" | grep -q 'dB' && echo 0 || echo 1)"
 
 printf 'PASS=%s FAIL=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
