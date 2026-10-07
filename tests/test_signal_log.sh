@@ -19,8 +19,12 @@ LUA_ROOT=""
 for cand in "$ROOT/devices/mediatek_filogic/files/usr/lib/lua" "$ROOT/files/usr/lib/lua"; do
     [ -f "$cand/tohsakawrt/core.lua" ] && LUA_ROOT="$cand" && break
 done
-[ -n "$LUA_ROOT" ] || { echo "FAIL: 找不到 lua 负载"; exit 1; }
-export LUA_PATH="$LUA_ROOT/?.lua;$LUA_ROOT/?/init.lua;;"
+if [ -z "${LUA_ROOT:-}" ]; then
+    # 在设备上用 /usr/bin 下的真实脚本运行时，Lua 模块走系统默认路径即可
+    [ -n "${SIGNAL_SCRIPT_OVERRIDE:-}" ] || { echo "FAIL: 找不到 lua 负载"; exit 1; }
+else
+    export LUA_PATH="$LUA_ROOT/?.lua;$LUA_ROOT/?/init.lua;;"
+fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
@@ -103,6 +107,20 @@ check '样本字段顺序为 epoch band rsrp sinr rsrq pci cid' \
     "$(printf '%s' "$LINE" | grep -Eq '^[0-9]+ n78 -79 17 -10 534 170951101$' && echo 1 || echo 0)"
 check '样本里不残留 dB / dBm 单位' \
     "$(printf '%s' "$LINE" | grep -q 'dB' && echo 0 || echo 1)"
+
+# 条状外观：RSRP 迷你走势（每格一个方块，越差格子越低）
+check '趋势里出现 RSRP 迷你走势' "$(printf '%s' "$OUT" | grep -q 'RSRP 走势' && echo 1 || echo 0)"
+SP="$(printf '%s' "$OUT" | sed -n '/RSRP 走势/{n;s/<code>\(.*\)<\/code>/\1/p;}' | head -n 1)"
+# 一个方块字符在 UTF-8 下是 3 字节：必须用 LC_ALL=C 让 awk 按字节取，否则会取成多个方块
+FIRST="$(LC_ALL=C awk -v s="$SP" 'BEGIN{ print substr(s,1,3) }')"
+LAST="$(LC_ALL=C awk -v s="$SP" 'BEGIN{ n=length(s); print substr(s,n-2,3) }')"
+check '走势图由方块字符组成' \
+    "$(printf '%s' "$SP" | grep -q '[▁▂▃▄▅▆▇█]' && echo 1 || echo 0)"
+check '信号变差时格子变低（-75 的首格高于 -92 的末格）' \
+    "$(LC_ALL=C awk -v a="$FIRST" -v b="$LAST" \
+        'BEGIN{ exit (index("▁▂▃▄▅▆▇█", a) > index("▁▂▃▄▅▆▇█", b)) ? 0 : 1 }' && echo 1 || echo 0)"
+check '走势图与统计同行显示（含"越低越差"提示）' \
+    "$(printf '%s' "$OUT" | grep -q '越低越差' && echo 1 || echo 0)"
 
 printf 'PASS=%s FAIL=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

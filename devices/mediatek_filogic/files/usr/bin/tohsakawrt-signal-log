@@ -55,6 +55,39 @@ local function record()
     return 0
 end
 
+local BLOCKS = { "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" }
+
+local function level8(v, lo, hi)
+    if v == nil then return nil end
+    local t = (v - lo) / (hi - lo)
+    if t < 0 then t = 0 end
+    if t > 1 then t = 1 end
+    return math.floor(t * 7 + 0.5) + 1
+end
+
+-- 把样本按时间分桶（最多 width 桶），每桶取"最差值" → 容易看出什么时候掉过
+local function sparkline(values, lo, hi, width)
+    local n = #values
+    if n == 0 then return "", 0 end
+    width = width or 60
+    local per = math.ceil(n / width)
+    local out, count = {}, 0
+    local i = 1
+    while i <= n do
+        local vmin
+        local last = math.min(i + per - 1, n)
+        for j = i, last do
+            local v = values[j]
+            if v ~= nil and (vmin == nil or v < vmin) then vmin = v end
+        end
+        local lv = level8(vmin, lo, hi)
+        out[#out + 1] = lv and BLOCKS[lv] or "·"
+        count = count + 1
+        i = i + per
+    end
+    return table.concat(out), count
+end
+
 local function pct(v, suffix)
     if v == nil then return "-" end
     return string.format("%d%s", math.floor(v + 0.5), suffix or "")
@@ -76,6 +109,7 @@ local function show(minutes)
     local rmin, rmax, rsum, rn = nil, nil, 0, 0
     local smin, smax, ssum, sn = nil, nil, 0, 0
     local first_ts, last_ts, last_pci, last_cid = nil, nil, "-", "-"
+    local rsrp_series, sinr_series = {}, {}
 
     for line in f:lines() do
         -- 容忍多余空白：字段之间允许任意多个空格/制表符
@@ -97,12 +131,14 @@ local function show(minutes)
                 rmin = (not rmin or r < rmin) and r or rmin
                 rmax = (not rmax or r > rmax) and r or rmax
                 rsum, rn = rsum + r, rn + 1
+                rsrp_series[#rsrp_series + 1] = r
             end
             local s = tonumber(sinr)
             if s then
                 smin = (not smin or s < smin) and s or smin
                 smax = (not smax or s > smax) and s or smax
                 ssum, sn = ssum + s, sn + 1
+                sinr_series[#sinr_series + 1] = s
             end
         end
     end
@@ -123,7 +159,18 @@ local function show(minutes)
     end
 
     local function hm(ts) return os.date("%H:%M", ts) end
+    local spark_r, buckets_r = sparkline(rsrp_series, -110, -70, 60)
+    local spark_s = sparkline(sinr_series, -5, 30, 60)
+    local step_text = ""
+    if buckets_r > 0 and buckets_r < n then
+        step_text = string.format("每格约 %d 分钟", math.max(1, math.floor(minutes / buckets_r)))
+    end
     print(string.format([[📈 <b>5G 信号趋势</b>（最近 %d 分钟）
+━━━━━━━━━━━━━━━━━━
+📶 <b>RSRP 走势</b>（%s越低越差）
+<code>%s</code>
+📊 <b>SINR 走势</b>
+<code>%s</code>
 ━━━━━━━━━━━━━━━━━━
 🧪 <b>样本</b>：<code>%d</code> 条 · %s → %s
 📻 <b>驻留频段</b>：%s
@@ -132,7 +179,7 @@ local function show(minutes)
 📍 <b>最近小区</b>：PCI <code>%s</code> · CellID <code>%s</code>
 ━━━━━━━━━━━━━━━━━━
 💡 <i>频段频繁跳变或 RSRP 明显下滑时，可考虑锁定更稳的频段。</i>]],
-        minutes, n, hm(first_ts), hm(last_ts), band_line,
+        minutes, step_text, spark_r, spark_s, n, hm(first_ts), hm(last_ts), band_line,
         pct(rmin), pct(rn > 0 and rsum / rn or nil), pct(rmax),
         pct(smin), pct(sn > 0 and ssum / sn or nil), pct(smax),
         last_pci, last_cid))

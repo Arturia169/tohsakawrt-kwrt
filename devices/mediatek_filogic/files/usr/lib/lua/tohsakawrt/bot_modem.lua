@@ -26,7 +26,10 @@ function M.cmd_modem(msg_id, cb_id)
         elseif r <= -85 then r_icon = "🟡"; r_eval = "中等"
         elseif r <= -75 then r_icon = "🟢"; r_eval = "良好"
         else r_icon = "🟢"; r_eval = "极佳" end
-        rsrp_line = string.format("<code>%s</code> (%s) %s", html_escape(m.rsrp), r_eval, r_icon)
+        -- RSRP 映射到 10 格条：-110 dBm 最差 → -70 dBm 最好
+        local r_bar = core.progress_bar(((r + 110) / 40) * 100, 10)
+        rsrp_line = string.format("<code>%s</code> <code>%s</code> (%s) %s",
+            r_bar, html_escape(m.rsrp), r_eval, r_icon)
     end
 
     local sinr_line = "未获取"
@@ -38,7 +41,10 @@ function M.cmd_modem(msg_id, cb_id)
         elseif s <= 5 then s_icon = "🟠"; s_eval = "较弱"
         elseif s <= 13 then s_icon = "🟡"; s_eval = "良好"
         else s_icon = "🟢"; s_eval = "极佳" end
-        sinr_line = string.format("<code>%s</code> (%s) %s", html_escape(m.sinr), s_eval, s_icon)
+        -- SINR 映射到 10 格条：-5 dB 最差 → 30 dB 最好
+        local s_bar = core.progress_bar(((s + 5) / 35) * 100, 10)
+        sinr_line = string.format("<code>%s</code> <code>%s</code> (%s) %s",
+            s_bar, html_escape(m.sinr), s_eval, s_icon)
     end
 
     local rsrq_line = m.rsrq and string.format("<code>%s</code>", html_escape(m.rsrq)) or "未获取"

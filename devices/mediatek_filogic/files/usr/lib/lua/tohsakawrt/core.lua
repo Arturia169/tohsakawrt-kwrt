@@ -151,7 +151,8 @@ function M.progress_bar(percent, width)
     local filled = math.floor((percent / 100) * width + 0.5)
     if filled > width then filled = width end
     local empty = width - filled
-    return string.rep("■", filled) .. string.rep("░", empty)
+    -- 与流量卡日报保持一致：█ 填充 + ░ 空白（原先用的是 ■，全项目没有第二个调用者）
+    return string.rep("█", filled) .. string.rep("░", empty)
 end
 
 M.init()
