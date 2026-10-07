@@ -1,6 +1,27 @@
 -- TohsakaWrt Telegram Engine (High Performance & Resilient)
 local M = {}
 
+-- 导航兜底：所有内联键盘若没有"返回"类按钮，自动补一个「⬅️ 返回看板」。
+-- 这样每张子卡片都点得回去，且只在这里实现一份（不再逐张卡片手写）。
+-- 已有返回（按钮文字含"返回"）或已有回看板按钮（refresh_status）时不重复添加。
+function M.with_back(inline_kb)
+    if type(inline_kb) ~= "table" then return inline_kb end
+    for _, row in ipairs(inline_kb) do
+        if type(row) == "table" then
+            for _, btn in ipairs(row) do
+                if type(btn) == "table" then
+                    local txt = tostring(btn.text or "")
+                    if btn.callback_data == "refresh_status" or txt:find("返回", 1, true) then
+                        return inline_kb
+                    end
+                end
+            end
+        end
+    end
+    inline_kb[#inline_kb + 1] = { { text = "⬅️ 返回看板", callback_data = "refresh_status" } }
+    return inline_kb
+end
+
 local core = require("tohsakawrt.core")
 local json = require("luci.jsonc")
 
@@ -168,7 +189,7 @@ function M.send_msg(text, inline_kb, reply_kb)
         if i == #chunks then
             -- 键盘挂在最后一段，按钮才会出现在最下方
             if inline_kb then
-                payload.reply_markup = { inline_keyboard = inline_kb }
+                payload.reply_markup = { inline_keyboard = M.with_back(inline_kb) }
             else
                 payload.reply_markup = reply_kb or M.DEFAULT_KEYBOARD
             end
@@ -204,7 +225,7 @@ function M.edit_msg(msg_id, text, inline_kb)
     end
 
     if inline_kb then
-        payload.reply_markup = { inline_keyboard = inline_kb }
+        payload.reply_markup = { inline_keyboard = M.with_back(inline_kb) }
     end
 
     return api_request("editMessageText", payload, 8)
@@ -232,7 +253,7 @@ function M.answer_and_edit(cb_id, toast, msg_id, text, inline_kb)
         disable_web_page_preview = true
     }
     if inline_kb then
-        payload_b.reply_markup = { inline_keyboard = inline_kb }
+        payload_b.reply_markup = { inline_keyboard = M.with_back(inline_kb) }
     end
 
     local fa = io.open(a_file, "w")
