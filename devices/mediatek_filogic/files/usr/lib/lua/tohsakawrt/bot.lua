@@ -47,6 +47,7 @@ local function cmd_help()
 /direct <域名> - 🔗 加入强制直连（套了优化 CDN、代理反而慢的站点）
 /undirect <域名> - 🗑 撤销直连；/direct-list 查看清单
 /smart <域名> - 🔎 实测代理 vs 直连哪个快，并给一键建议
+/proxy - 🌐 代理与分流面板（直连规则 / 节点分流 / Clash 状态）
 /cards - 📇 查看卡内号码
 /switch <序号或关键词> - 🔀 切换 eSIM 号码
 /download <激活码> [确认码] - 📥 下载并写入新 eSIM Profile
@@ -207,6 +208,8 @@ local function handle_callback(cb_id, msg_id, data_str)
         modm.band_lock(data_str:sub(9), msg_id, cb_id)
     elseif data_str == "band_restore" then
         modm.band_restore(msg_id, cb_id)
+    elseif data_str == "proxy_menu" then
+        netm.cmd_proxy_menu(msg_id, cb_id)
     elseif data_str == "direct_list" then
         sysm.cmd_direct_list(msg_id, cb_id)
     elseif data_str:match("^direct_add_do:") then
@@ -328,6 +331,8 @@ local function handle_command(text)
         net.cmd_wan()
     elseif cmd == "/temp" or full:find("温度") then
         sysm.cmd_temp()
+    elseif cmd == "/proxy" or full:find("代理面板") or full:find("代理设置") then
+        netm.cmd_proxy_menu()
     elseif cmd == "/smart" or cmd == "/direct-test" then
         local d = full:match("^/%S+%s+([%w%.%-]+)")
         if d then sysm.direct_smart(d) else sysm.cmd_direct_list() end

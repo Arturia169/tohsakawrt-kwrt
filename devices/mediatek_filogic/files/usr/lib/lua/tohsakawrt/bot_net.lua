@@ -142,6 +142,49 @@ function M.cmd_ping()
     tg.send_msg(text, inline_kb)
 end
 
+-- 🌐 代理面板：把代理相关功能收在一处（直连规则 / 智能直连 / 节点分流 / Clash 状态）
+function M.cmd_proxy_menu(msg_id, cb_id)
+    local st = (clash.status and clash.status()) or {}
+    local state = st.running and "🟢 运行中" or "🔴 未运行"
+    local ver = tostring(st.version or "未知")
+    local direct_n = "0"
+    local raw = tostring(core.exec_line("/usr/bin/tohsakawrt-clash-direct status 2>/dev/null") or "")
+    local n = raw:match("DIRECT_RULES:(%d+)")
+    if n then direct_n = n end
+    local text = string.format([[🌐 <b>代理与分流面板</b>
+
+━━━━━━━━━━━━━━━━━━
+☁️ <b>OpenClash</b>：%s
+🧩 <b>内核版本</b>：<code>%s</code>
+🔗 <b>强制直连</b>：<code>%s</code> 条
+━━━━━━━━━━━━━━━━━━
+💡 <b>遇到"套了优化 CDN、走代理反而慢"的站点</b>：
+发 <code>/smart 域名</code> 实测两路，直连更快时一键加入 ✓
+· <code>/direct 域名</code>　直接加入直连
+· <code>/undirect 域名</code> 撤销
+· <code>/direct-list</code>　查看清单
+━━━━━━━━━━━━━━━━━━
+🕰️ <i>%s</i>]],
+        state, html_escape(ver), direct_n, os.date("%Y-%m-%d %H:%M:%S"))
+
+    local kb = {
+        {
+            { text = "🔗 直连清单", callback_data = "direct_list" },
+            { text = "🧭 节点分流", callback_data = "nodes_menu" }
+        },
+        {
+            { text = "☁️ Clash 状态", callback_data = "clash_status" },
+            { text = "🔄 重启 Clash", callback_data = "clash_restart" }
+        },
+        {
+            { text = "📊 返回看板", callback_data = "refresh_status" }
+        }
+    }
+    if msg_id and cb_id then return tg.answer_and_edit(cb_id, "正在读取代理状态...", msg_id, text, kb) end
+    if msg_id then return tg.edit_msg(msg_id, text, kb) end
+    return tg.send_msg(text, kb)
+end
+
 function M.cmd_nodes(arg)
     if arg == "test" or arg == "测速" then
         tg.send_msg("⚡ <b>正在测速分流节点...</b>\n\n请稍候约 2 秒...")

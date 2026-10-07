@@ -53,7 +53,8 @@ local function build_status_card()
             { text = "📡 模组状态", callback_data = "refresh_modem" }
         },
         {
-            { text = "📊 查流量", callback_data = "flowcard_now" }
+            { text = "📊 查流量", callback_data = "flowcard_now" },
+            { text = "🌐 代理面板", callback_data = "proxy_menu" }
         }
     }
 
