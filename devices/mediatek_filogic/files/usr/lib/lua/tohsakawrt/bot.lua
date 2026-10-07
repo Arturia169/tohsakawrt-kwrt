@@ -209,9 +209,9 @@ local function handle_callback(cb_id, msg_id, data_str)
     elseif data_str == "band_restore" then
         modm.band_restore(msg_id, cb_id)
     elseif data_str == "clash_status" then
-        net.cmd_clash()
+        net.cmd_clash(msg_id, cb_id)
     elseif data_str == "nodes_menu" then
-        net.cmd_nodes()
+        net.cmd_nodes(nil, msg_id, cb_id)
     elseif data_str == "proxy_menu" then
         net.cmd_proxy_menu(msg_id, cb_id)
     elseif data_str == "direct_list" then
@@ -236,7 +236,7 @@ local function handle_callback(cb_id, msg_id, data_str)
 
     elseif data_str == "test_nodes" then
         tg.answer_callback(cb_id, "⚡ 正在测速分流节点...")
-        net.cmd_nodes("test")
+        net.cmd_nodes("test", msg_id, cb_id)
 
     elseif data_str == "restart_clash" then
         tg.answer_callback(cb_id, "请确认是否重启核心")

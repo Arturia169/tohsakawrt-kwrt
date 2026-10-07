@@ -185,7 +185,7 @@ function M.cmd_proxy_menu(msg_id, cb_id)
     return tg.send_msg(text, kb)
 end
 
-function M.cmd_nodes(arg)
+function M.cmd_nodes(arg, msg_id, cb_id)
     if arg == "test" or arg == "测速" then
         tg.send_msg("⚡ <b>正在测速分流节点...</b>\n\n请稍候约 2 秒...")
         clash.test_nodes()
@@ -229,7 +229,13 @@ function M.cmd_nodes(arg)
 
 🕰️ <i>%s</i>]], html_escape(mode), body, html_escape(now))
 
-    tg.send_msg(text, inline_kb)
+    if msg_id and cb_id then
+        return tg.answer_and_edit(cb_id, "正在刷新...", msg_id, text, inline_kb)
+    end
+    if msg_id then
+        return tg.edit_msg(msg_id, text, inline_kb)
+    end
+    return tg.send_msg(text, inline_kb)
 end
 
 function M.cmd_mode(target)
@@ -273,7 +279,7 @@ function M.cmd_mode(target)
     tg.send_msg(string.format("✅ OpenClash 模式已切换为 <code>%s</code>。", html_escape(target)))
 end
 
-function M.cmd_clash()
+function M.cmd_clash(msg_id, cb_id)
     local st = clash.full_status()
     local now = os.date("%Y-%m-%d %H:%M:%S")
     local inline_kb = {
@@ -296,7 +302,13 @@ function M.cmd_clash()
 
 🕰️ <i>%s</i>]], st.enabled and "已启用" or "未启用", st.running and "✅ 正常运行 (Mihomo)" or "🔴 未运行", html_escape(st.pid), html_escape(st.ports), html_escape(st.version), html_escape(now))
 
-    tg.send_msg(text, inline_kb)
+    if msg_id and cb_id then
+        return tg.answer_and_edit(cb_id, "正在刷新...", msg_id, text, inline_kb)
+    end
+    if msg_id then
+        return tg.edit_msg(msg_id, text, inline_kb)
+    end
+    return tg.send_msg(text, inline_kb)
 end
 
 function M.cmd_clash_restart(confirmed)
