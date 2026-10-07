@@ -3,8 +3,9 @@
 #   show   输出可直接发 Telegram 的 HTML 排行（前 N 名，带条形）
 #   raw    输出 machine-readable：mac<TAB>rx_kb<TAB>tx_kb<TAB>total_kb（按总量降序）
 #
-# 重要：busybox 的 awk 是 32 位整数，字节级数值（1e10）会溢出成 2147483647，
-# 所以**先在 shell 里换算成 KB**（ash 用 64 位），再交给 awk 做显示运算。
+# 两个 busybox 坑（都已在实机踩过）：
+#  1) awk 是 32 位整数：字节级数值（1e10）会溢出 → 先在 shell 换算成 KB（ash 是 64 位）
+#  2) sort 的 -t/-k 组合在这台设备上没生效（结果未排序）→ 排序改在 awk 里做
 set -u
 TOPN="${TWR_TRAFFIC_TOPN:-8}"
 TAB="$(printf '\t')"
@@ -19,8 +20,8 @@ fetch() {
 RAW="$(fetch)"
 [ -n "$RAW" ] || { echo "TRAFFIC_UNAVAILABLE"; exit 1; }
 
-TMP="/tmp/devtraffic.$$"
-: > "$TMP"
+ROWS="/tmp/devtraffic.$$"
+: > "$ROWS"
 printf '%s\n' "$RAW" | tail -n +2 | while IFS="$TAB" read -r mac conns rx rxpk tx txpk; do
     mac="$(printf '%s' "${mac:-}" | tr -d '"')"
     case "$mac" in *:*) ;; *) continue ;; esac
@@ -30,51 +31,53 @@ printf '%s\n' "$RAW" | tail -n +2 | while IFS="$TAB" read -r mac conns rx rxpk t
     rxk=$((rx / 1024))
     txk=$((tx / 1024))
     [ $((rxk + txk)) -gt 0 ] || continue
-    printf '%s\t%d\t%d\t%d\n' "$mac" "$rxk" "$txk" "$((rxk + txk))" >> "$TMP"
+    printf '%s\t%d\t%d\t%d\n' "$mac" "$rxk" "$txk" "$((rxk + txk))" >> "$ROWS"
 done
 
-sort -t"$TAB" -k4 -nr "$TMP" > "$TMP.s" 2>/dev/null
-[ -s "$TMP.s" ] && mv "$TMP.s" "$TMP"
-
-TOTAL_KB="$(awk -F'\t' '{ s += $4 } END { printf "%d", s + 0 }' "$TMP" 2>/dev/null)"
-[ -n "$TOTAL_KB" ] || TOTAL_KB=0
-
 if [ "${1:-show}" = "raw" ]; then
-    cat "$TMP"
-    rm -f "$TMP" "$TMP.s"
+    awk -F'\t' '{ r[NR] = $0; t[NR] = $4 } END {
+        n = NR
+        for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (t[j] > t[i]) {
+            tmp = t[i]; t[i] = t[j]; t[j] = tmp
+            tmpr = r[i]; r[i] = r[j]; r[j] = tmpr
+        }
+        for (i = 1; i <= n; i++) print r[i]
+    }' "$ROWS"
+    rm -f "$ROWS"
     exit 0
 fi
 
-TOP1="$(head -n 1 "$TMP" 2>/dev/null | cut -f4)"
-[ -n "$TOP1" ] || TOP1=1
-[ "$TOP1" -gt 0 ] 2>/dev/null || TOP1=1
-
-awk -F'\t' -v top="$TOP1" -v n="$TOPN" -v tot="$TOTAL_KB" '
+awk -F'\t' -v n="$TOPN" '
 function human(kb) {
     if (kb >= 1048576) return sprintf("%.2f GB", kb / 1048576)
     if (kb >= 1024) return sprintf("%.1f MB", kb / 1024)
     return sprintf("%d KB", kb)
 }
-BEGIN {
+{ cnt++; mac[cnt] = $1; rx[cnt] = $2 + 0; tx[cnt] = $3 + 0; tot[cnt] = $4 + 0; grand += $4 }
+END {
+    # 选择排序（设备数很少），按总量降序
+    for (i = 1; i <= cnt; i++) for (j = i + 1; j <= cnt; j++) if (tot[j] > tot[i]) {
+        v = tot[i]; tot[i] = tot[j]; tot[j] = v
+        v = rx[i]; rx[i] = rx[j]; rx[j] = v
+        v = tx[i]; tx[i] = tx[j]; tx[j] = v
+        s = mac[i]; mac[i] = mac[j]; mac[j] = s
+    }
+    top = (cnt > 0 && tot[1] > 0) ? tot[1] : 1
     print "<b>📱 各设备流量排行</b>"
     print "━━━━━━━━━━━━━━━━━━"
-    print "📦 本计费周期累计：<code>" human(tot + 0) "</code>"
+    print "📦 本计费周期累计：<code>" human(grand) "</code>"
     print "━━━━━━━━━━━━━━━━━━"
-    cnt = 0
-}
-{
-    cnt++
-    if (cnt > n) next
-    filled = int((($4 + 0) / (top + 0)) * 10 + 0.5)
-    if (filled < 1) filled = 1
-    if (filled > 10) filled = 10
-    bar = ""
-    for (i = 0; i < filled; i++) bar = bar "█"
-    for (i = filled; i < 10; i++) bar = bar "░"
-    printf "%d. <code>%s</code>  <code>[%s]</code>\n   ↓%s ↑%s\n", cnt, $1, bar, human($2 + 0), human($3 + 0)
-}
-END {
+    lim = (cnt < n) ? cnt : n
+    for (i = 1; i <= lim; i++) {
+        filled = int((tot[i] / top) * 10 + 0.5)
+        if (filled < 1) filled = 1
+        if (filled > 10) filled = 10
+        bar = ""
+        for (k = 0; k < filled; k++) bar = bar "█"
+        for (k = filled; k < 10; k++) bar = bar "░"
+        printf "%d. <code>%s</code>  <code>[%s]</code>\n   ↓%s ↑%s\n", i, mac[i], bar, human(rx[i]), human(tx[i])
+    }
     print "━━━━━━━━━━━━━━━━━━"
     print "💡 <i>数据来自 nlbwmon；在机器人里给设备设备注后会显示名字。</i>"
-}' "$TMP"
-rm -f "$TMP" "$TMP.s"
+}' "$ROWS"
+rm -f "$ROWS"
