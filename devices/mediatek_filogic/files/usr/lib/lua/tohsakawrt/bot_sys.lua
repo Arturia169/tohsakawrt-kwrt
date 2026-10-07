@@ -88,10 +88,29 @@ function M.cmd_device_traffic(msg_id, cb_id)
     if body == "" or body:find("TRAFFIC_UNAVAILABLE", 1, true) then
         body = "📱 <b>各设备流量排行</b>\n\n<i>暂时读不到 nlbwmon 数据，稍后再试。</i>"
     else
+        -- 名字来源（优先级从高到低）：手动备注 → 静态租约 → DHCP 动态租约主机名
         local aliases = (sys.load_aliases and sys.load_aliases()) or {}
+        local leases = {}
+        for mac, name in tostring(core.exec("cat /tmp/dhcp.leases 2>/dev/null") or "")
+            :gmatch("(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+(%S+)") do
+            leases[mac:lower()] = name
+        end
+        local statics = {}
+        for line in tostring(core.exec("uci show dhcp 2>/dev/null") or ""):gmatch("[^\n]+") do
+            local idx, key, val = line:match("dhcp%.@host%[(%d+)%]%.(%w+)='([^']*)'")
+            if idx then
+                statics[idx] = statics[idx] or {}
+                statics[idx][key] = val
+            end
+        end
+        for _, h in pairs(statics) do
+            if h.mac and h.mac ~= "" and h.name and h.name ~= "" then
+                leases[h.mac:lower()] = h.name
+            end
+        end
         local function name_of(mac)
             local key = tostring(mac):lower()
-            local nm = aliases[key] or aliases[tostring(mac)] or aliases[tostring(mac):upper()]
+            local nm = aliases[key] or leases[key]
             if type(nm) == "table" then nm = nm.name or nm.alias end
             return nm
         end
