@@ -164,4 +164,5 @@ function M.cmd_usb()
 end
 
 
+M.build_status_card = build_status_card
 return M
