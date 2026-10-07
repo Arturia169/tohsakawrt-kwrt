@@ -1,10 +1,13 @@
 #!/bin/sh
 # 各设备流量排行（数据来自 nlbwmon 的 nlbw 客户端）
-#   show        输出可直接发 Telegram 的 HTML 排行（取前 N 名，带条形）
-#   raw         输出 machine-readable 行：mac<TAB>rx<TAB>tx<TAB>total（按总量降序）
-# MAC→名称的映射由机器人侧负责（复用已有的设备备注），这里只管取数与格式化。
+#   show   输出可直接发 Telegram 的 HTML 排行（前 N 名，带条形）
+#   raw    输出 machine-readable：mac<TAB>rx_kb<TAB>tx_kb<TAB>total_kb（按总量降序）
+#
+# 重要：busybox 的 awk 是 32 位整数，字节级数值（1e10）会溢出成 2147483647，
+# 所以**先在 shell 里换算成 KB**（ash 用 64 位），再交给 awk 做显示运算。
 set -u
 TOPN="${TWR_TRAFFIC_TOPN:-8}"
+TAB="$(printf '\t')"
 
 fetch() {
     out="$(nlbw -c csv -g mac -o -t 1 2>/dev/null)"
@@ -17,53 +20,61 @@ RAW="$(fetch)"
 [ -n "$RAW" ] || { echo "TRAFFIC_UNAVAILABLE"; exit 1; }
 
 TMP="/tmp/devtraffic.$$"
-printf '%s\n' "$RAW" | awk -F'\t' '
-    NR > 1 {
-        mac = $1; gsub(/"/, "", mac)
-        rx = $3 + 0; tx = $5 + 0
-        if (mac == "" || (rx + tx) <= 0) next
-        printf "%s\t%d\t%d\t%d\n", mac, rx, tx, rx + tx
-    }' | sort -t"	" -k4 -nr > "$TMP"
+: > "$TMP"
+printf '%s\n' "$RAW" | tail -n +2 | while IFS="$TAB" read -r mac conns rx rxpk tx txpk; do
+    mac="$(printf '%s' "${mac:-}" | tr -d '"')"
+    case "$mac" in *:*) ;; *) continue ;; esac
+    rx="${rx:-0}"; tx="${tx:-0}"
+    case "$rx" in ''|*[!0-9]*) rx=0 ;; esac
+    case "$tx" in ''|*[!0-9]*) tx=0 ;; esac
+    rxk=$((rx / 1024))
+    txk=$((tx / 1024))
+    [ $((rxk + txk)) -gt 0 ] || continue
+    printf '%s\t%d\t%d\t%d\n' "$mac" "$rxk" "$txk" "$((rxk + txk))" >> "$TMP"
+done
 
-human() {
-    awk -v b="${1:-0}" 'BEGIN{
-        if (b >= 1073741824) printf "%.2f GB", b / 1073741824
-        else if (b >= 1048576) printf "%.1f MB", b / 1048576
-        else printf "%.0f KB", b / 1024
-    }'
-}
+sort -t"$TAB" -k4 -nr "$TMP" > "$TMP.s" 2>/dev/null
+[ -s "$TMP.s" ] && mv "$TMP.s" "$TMP"
 
-TOTAL=$(awk -F'\t' '{ s += $4 } END { printf "%d", s + 0 }' "$TMP")
+TOTAL_KB="$(awk -F'\t' '{ s += $4 } END { printf "%d", s + 0 }' "$TMP" 2>/dev/null)"
+[ -n "$TOTAL_KB" ] || TOTAL_KB=0
 
 if [ "${1:-show}" = "raw" ]; then
     cat "$TMP"
-    rm -f "$TMP"
+    rm -f "$TMP" "$TMP.s"
     exit 0
 fi
 
-TOP1=$(head -n 1 "$TMP" | cut -f4)
-[ -n "$TOP1" ] && [ "$TOP1" -gt 0 ] 2>/dev/null || TOP1=1
+TOP1="$(head -n 1 "$TMP" 2>/dev/null | cut -f4)"
+[ -n "$TOP1" ] || TOP1=1
+[ "$TOP1" -gt 0 ] 2>/dev/null || TOP1=1
 
-echo "<b>📱 各设备流量排行</b>"
-echo "━━━━━━━━━━━━━━━━━━"
-echo "📦 本计费周期累计：<code>$(human "$TOTAL")</code>"
-echo "━━━━━━━━━━━━━━━━━━"
-awk -F'\t' -v top="$TOP1" -v n="$TOPN" -v tmpfile="$TMP" '
-BEGIN { while ((getline line < tmpfile) > 0) { split(line, f, "\t"); cnt++; if (cnt > n) break;
-        filled = int((f[4] / top) * 10 + 0.5); if (filled < 1) filled = 1; if (filled > 10) filled = 10;
-        bar = ""; for (i = 0; i < filled; i++) bar = bar "█"; for (i = filled; i < 10; i++) bar = bar "░";
-        printf "%d. <code>%s</code>  <code>[%s]</code>\n   ↓%s ↑%s\n", cnt, f[1], bar, human(f[2]), human(f[3]) } }
-function human(b) { if (b >= 1073741824) return sprintf("%.2f GB", b / 1073741824); else if (b >= 1048576) return sprintf("%.1f MB", b / 1048576); else return sprintf("%.0f KB", b / 1024) }
-' 2>/dev/null || {
-    # awk 的 getline 方案不兼容时退回 shell 循环
-    i=0
-    while IFS="	" read -r mac rx tx tot; do
-        i=$((i + 1))
-        [ "$i" -gt "$TOPN" ] && break
-        [ -n "${mac:-}" ] || continue
-        echo "$i. <code>$mac</code>  ↓$(human "$rx") ↑$(human "$tx")"
-    done < "$TMP"
+awk -F'\t' -v top="$TOP1" -v n="$TOPN" -v tot="$TOTAL_KB" '
+function human(kb) {
+    if (kb >= 1048576) return sprintf("%.2f GB", kb / 1048576)
+    if (kb >= 1024) return sprintf("%.1f MB", kb / 1024)
+    return sprintf("%d KB", kb)
 }
-echo "━━━━━━━━━━━━━━━━━━"
-echo "💡 <i>数据来自 nlbwmon；设备名可在机器人里设置备注后显示。</i>"
-rm -f "$TMP"
+BEGIN {
+    print "<b>📱 各设备流量排行</b>"
+    print "━━━━━━━━━━━━━━━━━━"
+    print "📦 本计费周期累计：<code>" human(tot + 0) "</code>"
+    print "━━━━━━━━━━━━━━━━━━"
+    cnt = 0
+}
+{
+    cnt++
+    if (cnt > n) next
+    filled = int((($4 + 0) / (top + 0)) * 10 + 0.5)
+    if (filled < 1) filled = 1
+    if (filled > 10) filled = 10
+    bar = ""
+    for (i = 0; i < filled; i++) bar = bar "█"
+    for (i = filled; i < 10; i++) bar = bar "░"
+    printf "%d. <code>%s</code>  <code>[%s]</code>\n   ↓%s ↑%s\n", cnt, $1, bar, human($2 + 0), human($3 + 0)
+}
+END {
+    print "━━━━━━━━━━━━━━━━━━"
+    print "💡 <i>数据来自 nlbwmon；在机器人里给设备设备注后会显示名字。</i>"
+}' "$TMP"
+rm -f "$TMP" "$TMP.s"
