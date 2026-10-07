@@ -3,7 +3,7 @@
 local bc = require("tohsakawrt.bot_common")
 local core, tg, sys, modem, clash, esim, nixio =
     bc.core, bc.tg, bc.sys, bc.modem, bc.clash, bc.esim, bc.nixio
-local html_escape = bc.html_escape
+local html_escape, ask_confirm = bc.html_escape, bc.ask_confirm
 
 local M = {}
 
@@ -99,7 +99,8 @@ function M.cmd_modem(msg_id, cb_id)
             { text = "🔄 重载模组", callback_data = "do_modem_reload" }
         },
         {
-            { text = "📈 信号趋势", callback_data = "signal_trend" }
+            { text = "📈 信号趋势", callback_data = "signal_trend" },
+            { text = "📻 频段设置", callback_data = "band_menu" }
         }
     }
 
@@ -111,6 +112,116 @@ function M.cmd_modem(msg_id, cb_id)
     end
     return tg.send_msg(text, inline_kb)
 end
+-- 频段设置的常用组合（按需增删；都用冒号分隔的 NR 频段号）
+local BAND_PRESETS = {
+    { label = "🔒 只锁 n78", list = "78" },
+    { label = "🔒 锁 n78 + n1", list = "78:1" },
+    { label = "🔒 锁 n78 + n41", list = "78:41" }
+}
+
+-- 把 "1:2:3:...:79" 归纳成可读文本
+local function band_summary(raw)
+    raw = tostring(raw or ""):gsub("%s+$", "")
+    if raw == "" then return "读取失败" end
+    local names, n = {}, 0
+    for b in raw:gmatch("[^:]+") do
+        n = n + 1
+        if n <= 4 then names[#names + 1] = "n" .. b end
+    end
+    if n == 0 then return "读取失败" end
+    if n > 4 then return string.format("%s 等 %d 个频段", table.concat(names, " / "), n) end
+    return table.concat(names, " / ")
+end
+
+function M.cmd_band_menu(msg_id, cb_id)
+    local raw = core.exec_line("/usr/bin/tohsakawrt-band show 2>/dev/null") or ""
+    local note = core.exec_line("/usr/bin/tohsakawrt-band note 2>/dev/null") or ""
+    note = tostring(note):gsub("%s+$", "")
+    local m = modem.info()
+    local text = string.format([[📻 <b>5G 频段设置</b>
+
+━━━━━━━━━━━━━━━━━━
+⚙️ <b>当前允许频段</b>：<code>%s</code>
+📡 <b>当前驻留频段</b>：<code>%s</code>
+%s━━━━━━━━━━━━━━━━━━
+⚠️ <i>锁定后模组会重新注册网络（5G 短暂断开约 1 分钟）。若 %s 分钟内探测不通，
+系统会**自动恢复**原来的设置并通知你，不会把你留在没有信号的状态。</i>
+🕰️ <i>%s</i>]],
+        html_escape(band_summary(raw)),
+        html_escape(tostring(m.band or "未知")),
+        (note ~= "" and ("↩️ <b>上次自动回退</b>：" .. html_escape(note) .. "\n") or ""),
+        "3", os.date("%Y-%m-%d %H:%M:%S"))
+
+    local row1, row2 = {}, {}
+    for _, p in ipairs(BAND_PRESETS) do
+        row1[#row1 + 1] = { text = p.label, callback_data = "band_confirm:" .. p.list }
+    end
+    row2[#row2 + 1] = { text = "🔓 恢复原设置", callback_data = "band_restore" }
+    row2[#row2 + 1] = { text = "📡 返回模组", callback_data = "refresh_modem" }
+
+    local kb = { row1, row2 }
+    if msg_id and cb_id then
+        return tg.answer_and_edit(cb_id, "正在读取频段设置...", msg_id, text, kb)
+    end
+    if msg_id then return tg.edit_msg(msg_id, text, kb) end
+    return tg.send_msg(text, kb)
+end
+
+-- 锁定前二次确认（会短暂断网，必须让用户明确同意）
+function M.band_confirm(list, msg_id, cb_id)
+    list = tostring(list or "")
+    if not list:match("^[0-9]+(:[0-9]+)*$") then
+        if cb_id then tg.answer_callback(cb_id, "频段格式不正确") end
+        return tg.send_msg("⚠️ <b>频段格式不正确</b>\n\n<i>应形如 <code>78</code> 或 <code>78:1</code>。</i>")
+    end
+    local pretty = {}
+    for b in list:gmatch("[^:]+") do pretty[#pretty + 1] = "n" .. b end
+    local subject = table.concat(pretty, " + ")
+    local impact = "锁定后模组将重新注册网络，5G 会短暂断开约 1 分钟；" ..
+        "若 3 分钟内探测不通，系统会自动恢复原设置并通知你。"
+    if cb_id then tg.answer_callback(cb_id, "请确认") end
+    return ask_confirm("锁定 5G 频段", subject, impact, "do_band:" .. list)
+end
+
+-- 真正执行锁定
+function M.band_lock(list, msg_id, cb_id)
+    local out = core.exec_line("/usr/bin/tohsakawrt-band lock " .. tostring(list) .. " 2>/dev/null") or ""
+    out = tostring(out):gsub("%s+$", "")
+    local ok = (out == "OK_LOCKED")
+    local body
+    if ok then
+        local pretty = {}
+        for b in tostring(list):gmatch("[^:]+") do pretty[#pretty + 1] = "n" .. b end
+        body = string.format([[✅ <b>已提交频段锁定</b>
+
+━━━━━━━━━━━━━━━━━━
+📻 <b>锁定频段</b>：<code>%s</code>
+⏳ <b>观察期</b>：3 分钟（期间 5G 会重新注册）
+🛡️ <b>保底</b>：探测不通会自动恢复原设置并通知你
+━━━━━━━━━━━━━━━━━━
+🕰️ <i>%s</i>]], html_escape(table.concat(pretty, " + ")), os.date("%Y-%m-%d %H:%M:%S"))
+    else
+        body = string.format("⚠️ <b>频段锁定失败</b>\n\n<code>%s</code>\n\n<i>未做任何改动。</i>",
+            html_escape(out ~= "" and out or "无返回（模组可能未就绪）"))
+    end
+    local kb = { { { text = "📻 频段设置", callback_data = "band_menu" } } }
+    if msg_id and cb_id then return tg.answer_and_edit(cb_id, ok and "已提交锁定" or "锁定失败", msg_id, body, kb) end
+    if msg_id then return tg.edit_msg(msg_id, body, kb) end
+    return tg.send_msg(body, kb)
+end
+
+function M.band_restore(msg_id, cb_id)
+    local out = core.exec_line("/usr/bin/tohsakawrt-band restore 2>/dev/null") or ""
+    out = tostring(out):gsub("%s+$", "")
+    local ok = (out == "OK_RESTORED")
+    local body = ok and "🔓 <b>已恢复原频段设置</b>\n\n<i>模组会重新注册网络，约 1 分钟。</i>"
+        or string.format("⚠️ <b>恢复失败</b>\n\n<code>%s</code>", html_escape(out ~= "" and out or "无返回"))
+    local kb = { { { text = "📻 频段设置", callback_data = "band_menu" } } }
+    if msg_id and cb_id then return tg.answer_and_edit(cb_id, ok and "已恢复" or "恢复失败", msg_id, body, kb) end
+    if msg_id then return tg.edit_msg(msg_id, body, kb) end
+    return tg.send_msg(body, kb)
+end
+
 -- 5G 信号趋势：交给脚本汇总（解析与格式化只有一份实现），这里只负责转发
 function M.cmd_signal_trend(msg_id, cb_id)
     local body = core.exec("/usr/bin/tohsakawrt-signal-log show 60 2>/dev/null") or ""

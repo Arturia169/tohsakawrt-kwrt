@@ -41,6 +41,7 @@ local function cmd_help()
 /sms [条数] - ✉️ 模组短信息与验证码提取
 /modemreload - 🔄 重载 5G 模组
 /trend - 📈 5G 信号趋势（最近 60 分钟，含频段跳变统计）
+/band - 📻 5G 频段设置（锁定/恢复，带自动回退）
 /cards - 📇 查看卡内号码
 /switch <序号或关键词> - 🔀 切换 eSIM 号码
 /download <激活码> [确认码] - 📥 下载并写入新 eSIM Profile
@@ -189,6 +190,14 @@ local function handle_callback(cb_id, msg_id, data_str)
     elseif data_str == "refresh_direct" then
         dirt.cmd_direct_list(msg_id, cb_id)
 
+    elseif data_str == "band_menu" then
+        modm.cmd_band_menu(msg_id, cb_id)
+    elseif data_str:match("^band_confirm:") then
+        modm.band_confirm(data_str:sub(14), msg_id, cb_id)
+    elseif data_str:match("^do_band:") then
+        modm.band_lock(data_str:sub(9), msg_id, cb_id)
+    elseif data_str == "band_restore" then
+        modm.band_restore(msg_id, cb_id)
     elseif data_str == "signal_trend" then
         modm.cmd_signal_trend(msg_id, cb_id)
     elseif data_str == "refresh_modem" then
@@ -302,6 +311,9 @@ local function handle_command(text)
         net.cmd_wan()
     elseif cmd == "/temp" or full:find("温度") then
         sysm.cmd_temp()
+    elseif cmd == "/band" or cmd == "/bands" or full:find("频段") then
+        local list = full:match("^/band%s+([0-9:]+)") or full:match("^/bands%s+([0-9:]+)")
+        if list then modm.band_confirm(list) else modm.cmd_band_menu() end
     elseif cmd == "/trend" or cmd == "/signal" or full:find("信号") then
         modm.cmd_signal_trend()
     elseif cmd == "/modem" or full:find("5G") or full:find("5g") or full:find("模组") then

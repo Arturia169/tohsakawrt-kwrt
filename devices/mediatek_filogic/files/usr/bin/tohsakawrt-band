@@ -1,0 +1,167 @@
+#!/bin/sh
+# TohsakaWrt 5G 频段锁定（带自动回退的安全模式）
+#
+#   show              输出当前 NR 频段列表（一行，供机器人渲染；空表示读取失败）
+#   lock <列表>       锁定到指定频段（冒号分隔，如 78 或 78:1），写观察期记录
+#   restore           恢复锁定前保存的列表
+#   verify            由巡检每分钟调用：观察期结束仍未通 → 自动恢复原设置
+#   note              输出上一次自动回退的说明（没有则空）
+#
+# 安全设计：
+# * 锁定前**先保存**当前列表到持久文件（/etc/tohsakawrt，重启不丢）；
+# * 观察期记录同样持久：即使锁定后重启，巡检仍能把它回退回来；
+# * verify 只在观察期结束后判断一次，探测走 usb0（不依赖当前主出口），失败即恢复；
+# * 列表格式先校验，非法输入直接拒绝，绝不把模组置于"没有频段"的状态。
+set -u
+
+[ -r /usr/lib/tohsakawrt/common.sh ] && . /usr/lib/tohsakawrt/common.sh
+
+SAVED_FILE="${TWR_BAND_SAVED:-/etc/tohsakawrt/band-saved}"
+PENDING_FILE="${TWR_BAND_PENDING:-/etc/tohsakawrt/band-pending}"
+REVERTED_FILE="${TWR_BAND_REVERTED:-/etc/tohsakawrt/band-reverted}"
+# RM500Q-GL 全频段（仅在缺少保存文件时兜底）
+FULL_BANDS="1:2:3:5:7:8:12:20:25:28:38:40:41:48:66:71:77:78:79"
+OBSERVE_SECONDS="${TWR_BAND_OBSERVE:-180}"
+
+AT_PORT="${TWR_BAND_AT_PORT:-$(uci -q get modem.modem0.at_port 2>/dev/null || echo '/dev/ttyUSB3')}"
+[ -e "$AT_PORT" ] || AT_PORT="/dev/ttyUSB3"
+[ -e "$AT_PORT" ] || AT_PORT="/dev/ttyUSB2"
+AT_SCRIPT="${TWR_BAND_AT_SCRIPT:-/usr/share/modem/modem_at.sh}"
+AT_FAKE="${TWR_BAND_AT_FAKE:-0}"
+PING_IFACE="${TWR_BAND_PING_IFACE:-usb0}"
+
+at_cmd() {
+    [ -x "$AT_SCRIPT" ] || return 1
+    { [ -e "$AT_PORT" ] || [ "$AT_FAKE" = "1" ]; } || return 1
+    AT_TIMEOUT="${AT_TIMEOUT:-6}" sh "$AT_SCRIPT" "$AT_PORT" "$1" 2>/dev/null | tr -d '\r'
+}
+
+notify() {
+    command -v send_tg >/dev/null 2>&1 && send_tg "$1" "HTML" "${2:-}" || true
+}
+
+current_bands() {
+    at_cmd 'AT+QNWPREFCFG="nr5g_band"' | sed -n 's/.*"nr5g_band",//p' | head -n 1 | tr -d ' '
+}
+
+# 只看数字与冒号，且至少一个频段号，避免把模组锁成"无频段"
+valid_bands() {
+    case "$1" in
+        ''|*[!0-9:]*) return 1 ;;
+    esac
+    printf '%s' "$1" | grep -Eq '^[0-9]+(:[0-9]+)*$'
+}
+
+apply_bands() {
+    local list="$1"
+    valid_bands "$list" || return 1
+    at_cmd "AT+QNWPREFCFG=\"nr5g_band\",${list}" >/dev/null 2>&1 || return 1
+    # 软复位让频段设置真正生效（约 20~40 秒断网，已在确认步骤告知用户）
+    at_cmd 'AT+CFUN=0' >/dev/null 2>&1
+    sleep 3
+    at_cmd 'AT+CFUN=1' >/dev/null 2>&1
+    return 0
+}
+
+# 5G 数据面是否可用：直接走 usb0 探测，与当前主出口无关
+data_ok() {
+    ping -c 1 -W 2 -I "$PING_IFACE" 223.5.5.5 >/dev/null 2>&1 && return 0
+    ping -c 1 -W 2 -I "$PING_IFACE" 119.29.29.29 >/dev/null 2>&1 && return 0
+    return 1
+}
+
+mkdir -p "$(dirname "$SAVED_FILE")" 2>/dev/null
+
+case "${1:-}" in
+    show)
+        current_bands
+        ;;
+
+    note)
+        [ -r "$REVERTED_FILE" ] && cat "$REVERTED_FILE" 2>/dev/null
+        ;;
+
+    lock)
+        list="${2:-}"
+        if ! valid_bands "$list"; then
+            echo "ERROR_BAD_BAND"
+            exit 1
+        fi
+        cur="$(current_bands)"
+        if [ -z "$cur" ]; then
+            echo "ERROR_AT_FAILED"
+            exit 1
+        fi
+        # 先保存原设置（只在没有未完成的观察期时覆盖，避免保存到"锁定中"的值）
+        if [ ! -r "$PENDING_FILE" ] && [ ! -r "$SAVED_FILE" ]; then
+            printf '%s\n' "$cur" > "$SAVED_FILE" 2>/dev/null || true
+        fi
+        rm -f "$REVERTED_FILE" 2>/dev/null || true
+        if ! apply_bands "$list"; then
+            echo "ERROR_AT_FAILED"
+            exit 1
+        fi
+        # 写观察期记录：截止时间 + 目标列表（持久文件，重启后仍能回退）
+        printf '%s %s\n' "$(( $(date +%s) + OBSERVE_SECONDS ))" "$list" > "$PENDING_FILE" 2>/dev/null || true
+        logger -t TohsakaWrt-Band "Band lock applied: ${list} (was ${cur}), observing ${OBSERVE_SECONDS}s"
+        echo "OK_LOCKED"
+        ;;
+
+    restore)
+        saved="$(cat "$SAVED_FILE" 2>/dev/null)"
+        [ -n "$saved" ] || saved="$FULL_BANDS"
+        rm -f "$PENDING_FILE" 2>/dev/null || true
+        if apply_bands "$saved"; then
+            rm -f "$REVERTED_FILE" 2>/dev/null || true
+            logger -t TohsakaWrt-Band "Band restored: ${saved}"
+            echo "OK_RESTORED"
+        else
+            echo "ERROR_AT_FAILED"
+            exit 1
+        fi
+        ;;
+
+    verify)
+        [ -r "$PENDING_FILE" ] || exit 0
+        pending="$(cat "$PENDING_FILE" 2>/dev/null)"
+        deadline="${pending%% *}"
+        target="${pending#* }"
+        case "$deadline" in ''|*[!0-9]*) rm -f "$PENDING_FILE"; exit 0 ;; esac
+        now="$(date +%s)"
+        [ "$now" -lt "$deadline" ] && exit 0        # 观察期未到，先不动
+
+        if data_ok; then
+            # 锁定稳定，观察期结束
+            rm -f "$PENDING_FILE" 2>/dev/null || true
+            logger -t TohsakaWrt-Band "Band lock verified stable: ${target}"
+            notify "✅ <b>频段锁定已确认稳定</b>
+━━━━━━━━━━━━━━━━━━
+📻 <b>锁定频段</b>：<code>${target}</code>
+📊 <b>探测结果</b>：观察 $((${OBSERVE_SECONDS} / 60)) 分钟数据面正常
+━━━━━━━━━━━━━━━━━━
+<i>若以后想恢复原设置，可在「📻 频段设置」里点恢复。</i>"
+            exit 0
+        fi
+
+        # 不通 → 自动回退（这是本功能存在的意义）
+        saved="$(cat "$SAVED_FILE" 2>/dev/null)"
+        [ -n "$saved" ] || saved="$FULL_BANDS"
+        apply_bands "$saved" || true
+        rm -f "$PENDING_FILE" 2>/dev/null || true
+        printf '%s\n' "$(date '+%Y-%m-%d %H:%M:%S') 锁定 ${target} 后探测不通，已自动恢复为 ${saved}" > "$REVERTED_FILE" 2>/dev/null || true
+        logger -t TohsakaWrt-Band "Band lock failed the probe; reverted to ${saved}"
+        notify "⚠️ <b>频段锁定已自动回退</b>
+━━━━━━━━━━━━━━━━━━
+📻 <b>尝试锁定</b>：<code>${target}</code>
+⛔ <b>探测结果</b>：观察期内数据面不通
+🔄 <b>已执行动作</b>：恢复为 <code>${saved}</code>
+━━━━━━━━━━━━━━━━━━
+<i>说明该组合在你当前位置不可用，已回到原来的设置。</i>"
+        exit 0
+        ;;
+
+    *)
+        echo "Usage: $0 {show | lock <bands> | restore | verify | note}"
+        exit 1
+        ;;
+esac
