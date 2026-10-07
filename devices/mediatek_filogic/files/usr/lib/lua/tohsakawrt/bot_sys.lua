@@ -53,7 +53,8 @@ local function build_status_card()
             { text = "📡 模组状态", callback_data = "refresh_modem" }
         },
         {
-            { text = "📊 查流量", callback_data = "flowcard_now" }
+            { text = "📊 查流量", callback_data = "flowcard_now" },
+            { text = "📱 各设备流量", callback_data = "dev_traffic" }
         }
     }
 
@@ -75,6 +76,41 @@ function M.cmd_flowcard(msg_id, cb_id)
     }
     if msg_id and cb_id then
         return tg.answer_and_edit(cb_id, "正在查询流量...", msg_id, body, kb)
+    end
+    if msg_id then return tg.edit_msg(msg_id, body, kb) end
+    return tg.send_msg(body, kb)
+end
+
+-- 📱 各设备流量排行：脚本取数，这里把 MAC 换成人可读的名字
+function M.cmd_device_traffic(msg_id, cb_id)
+    local body = core.exec("/usr/bin/tohsakawrt-device-traffic show 2>/dev/null") or ""
+    body = tostring(body):gsub("%s+$", "")
+    if body == "" or body:find("TRAFFIC_UNAVAILABLE", 1, true) then
+        body = "📱 <b>各设备流量排行</b>\n\n<i>暂时读不到 nlbwmon 数据，稍后再试。</i>"
+    else
+        local aliases = (sys.load_aliases and sys.load_aliases()) or {}
+        local function name_of(mac)
+            local key = tostring(mac):lower()
+            local nm = aliases[key] or aliases[tostring(mac)] or aliases[tostring(mac):upper()]
+            if type(nm) == "table" then nm = nm.name or nm.alias end
+            return nm
+        end
+        body = body:gsub("(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)", function(mac)
+            local nm = name_of(mac)
+            if nm and tostring(nm) ~= "" then
+                return html_escape(tostring(nm)) .. " (" .. mac:sub(-8) .. ")"
+            end
+            return mac
+        end)
+    end
+    local kb = {
+        {
+            { text = "🔄 刷新排行", callback_data = "dev_traffic" },
+            { text = "📊 返回看板", callback_data = "refresh_status" }
+        }
+    }
+    if msg_id and cb_id then
+        return tg.answer_and_edit(cb_id, "正在统计各设备流量...", msg_id, body, kb)
     end
     if msg_id then return tg.edit_msg(msg_id, body, kb) end
     return tg.send_msg(body, kb)

@@ -1,0 +1,69 @@
+#!/bin/sh
+# 各设备流量排行（数据来自 nlbwmon 的 nlbw 客户端）
+#   show        输出可直接发 Telegram 的 HTML 排行（取前 N 名，带条形）
+#   raw         输出 machine-readable 行：mac<TAB>rx<TAB>tx<TAB>total（按总量降序）
+# MAC→名称的映射由机器人侧负责（复用已有的设备备注），这里只管取数与格式化。
+set -u
+TOPN="${TWR_TRAFFIC_TOPN:-8}"
+
+fetch() {
+    out="$(nlbw -c csv -g mac -o -t 1 2>/dev/null)"
+    [ -n "$out" ] || out="$(nlbw -c csv -g mac -o 2>/dev/null)"
+    [ -n "$out" ] || out="$(nlbw -c csv -g mac 2>/dev/null)"
+    printf '%s' "$out"
+}
+
+RAW="$(fetch)"
+[ -n "$RAW" ] || { echo "TRAFFIC_UNAVAILABLE"; exit 1; }
+
+TMP="/tmp/devtraffic.$$"
+printf '%s\n' "$RAW" | awk -F'\t' '
+    NR > 1 {
+        mac = $1; gsub(/"/, "", mac)
+        rx = $3 + 0; tx = $5 + 0
+        if (mac == "" || (rx + tx) <= 0) next
+        printf "%s\t%d\t%d\t%d\n", mac, rx, tx, rx + tx
+    }' | sort -t"	" -k4 -nr > "$TMP"
+
+human() {
+    awk -v b="${1:-0}" 'BEGIN{
+        if (b >= 1073741824) printf "%.2f GB", b / 1073741824
+        else if (b >= 1048576) printf "%.1f MB", b / 1048576
+        else printf "%.0f KB", b / 1024
+    }'
+}
+
+TOTAL=$(awk -F'\t' '{ s += $4 } END { printf "%d", s + 0 }' "$TMP")
+
+if [ "${1:-show}" = "raw" ]; then
+    cat "$TMP"
+    rm -f "$TMP"
+    exit 0
+fi
+
+TOP1=$(head -n 1 "$TMP" | cut -f4)
+[ -n "$TOP1" ] && [ "$TOP1" -gt 0 ] 2>/dev/null || TOP1=1
+
+echo "<b>📱 各设备流量排行</b>"
+echo "━━━━━━━━━━━━━━━━━━"
+echo "📦 本计费周期累计：<code>$(human "$TOTAL")</code>"
+echo "━━━━━━━━━━━━━━━━━━"
+awk -F'\t' -v top="$TOP1" -v n="$TOPN" -v tmpfile="$TMP" '
+BEGIN { while ((getline line < tmpfile) > 0) { split(line, f, "\t"); cnt++; if (cnt > n) break;
+        filled = int((f[4] / top) * 10 + 0.5); if (filled < 1) filled = 1; if (filled > 10) filled = 10;
+        bar = ""; for (i = 0; i < filled; i++) bar = bar "█"; for (i = filled; i < 10; i++) bar = bar "░";
+        printf "%d. <code>%s</code>  <code>[%s]</code>\n   ↓%s ↑%s\n", cnt, f[1], bar, human(f[2]), human(f[3]) } }
+function human(b) { if (b >= 1073741824) return sprintf("%.2f GB", b / 1073741824); else if (b >= 1048576) return sprintf("%.1f MB", b / 1048576); else return sprintf("%.0f KB", b / 1024) }
+' 2>/dev/null || {
+    # awk 的 getline 方案不兼容时退回 shell 循环
+    i=0
+    while IFS="	" read -r mac rx tx tot; do
+        i=$((i + 1))
+        [ "$i" -gt "$TOPN" ] && break
+        [ -n "${mac:-}" ] || continue
+        echo "$i. <code>$mac</code>  ↓$(human "$rx") ↑$(human "$tx")"
+    done < "$TMP"
+}
+echo "━━━━━━━━━━━━━━━━━━"
+echo "💡 <i>数据来自 nlbwmon；设备名可在机器人里设置备注后显示。</i>"
+rm -f "$TMP"
