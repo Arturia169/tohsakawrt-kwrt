@@ -46,6 +46,7 @@ local function cmd_help()
 /flow - 📊 流量卡实时用量（剩余 / 已用 / 可用天数）
 /direct <域名> - 🔗 加入强制直连（套了优化 CDN、代理反而慢的站点）
 /undirect <域名> - 🗑 撤销直连；/direct-list 查看清单
+/smart <域名> - 🔎 实测代理 vs 直连哪个快，并给一键建议
 /cards - 📇 查看卡内号码
 /switch <序号或关键词> - 🔀 切换 eSIM 号码
 /download <激活码> [确认码] - 📥 下载并写入新 eSIM Profile
@@ -208,6 +209,8 @@ local function handle_callback(cb_id, msg_id, data_str)
         modm.band_restore(msg_id, cb_id)
     elseif data_str == "direct_list" then
         sysm.cmd_direct_list(msg_id, cb_id)
+    elseif data_str:match("^direct_add_do:") then
+        sysm.direct_add(data_str:sub(15), msg_id, cb_id)
     elseif data_str:match("^direct_del:") then
         sysm.direct_del(data_str:sub(12), msg_id, cb_id)
     elseif data_str == "flowcard_now" then
@@ -325,6 +328,9 @@ local function handle_command(text)
         net.cmd_wan()
     elseif cmd == "/temp" or full:find("温度") then
         sysm.cmd_temp()
+    elseif cmd == "/smart" or cmd == "/direct-test" then
+        local d = full:match("^/%S+%s+([%w%.%-]+)")
+        if d then sysm.direct_smart(d) else sysm.cmd_direct_list() end
     elseif cmd == "/direct" or cmd == "/undirect" or cmd == "/direct-list" or cmd == "/directlist"
         or full:find("直连清单") or full:find("强制直连") then
         local arg = full:match("^/%S+%s+([%w%.%-]+)")

@@ -139,6 +139,56 @@ function M.direct_add(domain, msg_id, cb_id)
     return tg.send_msg(body, kb)
 end
 
+-- 实测两条路并给建议：直连更快就提供"一键加入"
+function M.direct_smart(domain, msg_id, cb_id)
+    domain = tostring(domain or ""):gsub("%s", "")
+    if not valid_domain(domain) then
+        local t = "⚠️ <b>域名格式不正确</b>\n\n<i>示例：<code>/smart blog.example.com</code></i>"
+        if msg_id and cb_id then return tg.answer_and_edit(cb_id, "格式不正确", msg_id, t) end
+        return tg.send_msg(t)
+    end
+    local out = tostring(core.exec("/usr/bin/tohsakawrt-clash-direct smart " .. domain .. " 2>/dev/null") or "")
+    local dm = out:match("DIRECT_MS:(%d+)")
+    local pm = out:match("PROXY_MS:(%d+)")
+    local verdict = out:match("VERDICT:(%w+)") or "UNKNOWN"
+    local body, kb = {}, {}
+    if dm and pm then
+        local faster, ratio = "直连", 0
+        if tonumber(dm) < tonumber(pm) then
+            ratio = math.floor((1 - tonumber(dm) / tonumber(pm)) * 100 + 0.5)
+        else
+            faster = "代理"
+            ratio = math.floor((1 - tonumber(pm) / tonumber(dm)) * 100 + 0.5)
+        end
+        local head = (verdict == "DIRECT") and "⚡ <b>走直连更快</b>" or "🌐 <b>走代理更快</b>"
+        body[#body + 1] = head
+        body[#body + 1] = ""
+        body[#body + 1] = "━━━━━━━━━━━━━━━━━━"
+        body[#body + 1] = string.format("🔗 <code>%s</code>", html_escape(domain))
+        body[#body + 1] = string.format("🚀 <b>直连</b>：<code>%s</code> ms", dm)
+        body[#body + 1] = string.format("🛰️ <b>代理</b>：<code>%s</code> ms", pm)
+        body[#body + 1] = "━━━━━━━━━━━━━━━━━━"
+        body[#body + 1] = string.format("📊 <b>%s 快约 %d%%</b>", faster, ratio)
+        body[#body + 1] = ""
+        body[#body + 1] = (verdict == "DIRECT") and "<i>点下面的按钮即可加入直连清单。</i>" or "<i>保持现状即可，无需改动。</i>"
+        if verdict == "DIRECT" then
+            kb[#kb + 1] = { { text = "➕ 加入直连", callback_data = "direct_add_do:" .. domain } }
+        end
+    else
+        body[#body + 1] = "🔎 <b>测速失败</b>"
+        body[#body + 1] = ""
+        body[#body + 1] = string.format("🔗 <code>%s</code>", html_escape(domain))
+        body[#body + 1] = string.format("📄 <code>%s</code>", html_escape(out:gsub("\n", " ")))
+        body[#body + 1] = ""
+        body[#body + 1] = "<i>该站点可能不响应 HTTPS 探测，或当前网络异常。</i>"
+    end
+    kb[#kb + 1] = { { text = "🔗 看清单", callback_data = "direct_list" }, { text = "📊 返回看板", callback_data = "refresh_status" } }
+    local text = table.concat(body, "\n")
+    if msg_id and cb_id then return tg.answer_and_edit(cb_id, "正在实测两条路...", msg_id, text, kb) end
+    if msg_id then return tg.edit_msg(msg_id, text, kb) end
+    return tg.send_msg(text, kb)
+end
+
 function M.direct_del(domain, msg_id, cb_id)
     domain = tostring(domain or ""):gsub("%s", "")
     if not valid_domain(domain) then
