@@ -53,8 +53,8 @@ push_bark() {
     local bark_api="${BARK_API:-https://api.day.app/push}"
     local title body level sound
     [ -n "$bark_key" ] || return 0
-    title="$(printf '%b' "$1")"
-    body="$(printf '%b' "$2")"
+    title="$(html_to_text "$(printf '%b' "$1")")"
+    body="$(html_to_text "$(printf '%b' "$2")")"
     level="$3"
     sound="$4"
 
@@ -142,6 +142,10 @@ send_tg() {
 
 html_escape() {
     printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
+html_to_text() {
+    printf '%s' "$1" | sed -e 's/<[^>]*>//g' -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g'
 }
 
 get_cpu_temp() {

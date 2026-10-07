@@ -124,6 +124,11 @@ fi
 
 
 # ==========================================================
+# 出口自愈：期望出口与实际不一致时自动纠正（uci uplink_enforce=0 关闭）
+# ==========================================================
+[ -x /usr/bin/tohsakawrt-uplink ] && /usr/bin/tohsakawrt-uplink reconcile >/dev/null 2>&1 || true
+
+# ==========================================================
 # WAN 状态监控
 # ==========================================================
 
@@ -537,7 +542,7 @@ if [ -n "$WAN_DEV" ] && [ "$WAN_DEV" != "未知" ]; then
                             SPEED_STR="$(format_traffic_speed "$SPEED_BPS")"
                             ALERT_BODY="🚀 <b>检测到持续高带宽下载</b>\n━━━━━━━━━━━━━━━━━━\n⬇️ <b>过去 1 分钟均速</b>：<code>$(html_escape "$SPEED_STR")</code>\n⏱️ <b>持续时间</b>：已持续 &gt; 1 分钟\n📡 <b>监控接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n━━━━━━━━━━━━━━━━━━\n<i>大流量监测中，结束后自动推送汇总。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
-                            push_bark "🚀 持续高带宽下载" "$(echo -e "$ALERT_BODY" | sed 's/<[^>]*>//g')" "timeSensitive" "minuet"
+                            push_bark "🚀 持续高带宽下载" "$ALERT_BODY" "timeSensitive" "minuet"
                             send_tg "$ALERT_BODY" HTML
                             logger -t TohsakaWrt-Watch "High traffic alert triggered: ${SPEED_STR} on ${WAN_DEV}"
                         else
@@ -558,7 +563,7 @@ if [ -n "$WAN_DEV" ] && [ "$WAN_DEV" != "未知" ]; then
 
                                 REPORT_BODY="🏁 <b>高带宽下载已结束</b>\n━━━━━━━━━━━━━━━━━━\n⏱️ <b>总持续时长</b>：<code>$(html_escape "$TOTAL_DUR")</code>\n⚡ <b>最高峰值</b>：<code>$(html_escape "$PEAK_STR")</code>\n📊 <b>全程均速</b>：<code>$(html_escape "$AVG_STR")</code>\n💾 <b>总计消耗</b>：<code>$(html_escape "$TOTAL_SIZE")</code>\n📡 <b>监控接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n━━━━━━━━━━━━━━━━━━\n<i>带宽已恢复至日常水平。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
-                                push_bark "🏁 高带宽下载已结束" "$(echo -e "$REPORT_BODY" | sed 's/<[^>]*>//g')" "active" "glass"
+                                push_bark "🏁 高带宽下载已结束" "$REPORT_BODY" "active" "glass"
                                 send_tg "$REPORT_BODY" HTML
                                 logger -t TohsakaWrt-Watch "High traffic finished: ${TOTAL_SIZE} in ${TOTAL_DUR}"
                             fi

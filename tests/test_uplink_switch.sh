@@ -46,6 +46,24 @@ case "$*" in
     '-q get network.5Ga.metric') echo 5 ;;
 esac
 EOF
+# 出口切换现在会做真实连通性探测：这里桩件化，默认"探测成功"，
+# 需要验证回滚的场景用 TEST_PROBE_FAIL=1 让它失败
+cat > "$BIN/ping" <<'EOF'
+#!/bin/sh
+printf 'ping %s\n' "$*" >> "$CALLS"
+[ "${TEST_PROBE_FAIL:-0}" = 1 ] && exit 1
+exit 0
+EOF
+cat > "$BIN/curl" <<'EOF'
+#!/bin/sh
+printf 'curl %s\n' "$*" >> "$CALLS"
+[ "${TEST_PROBE_FAIL:-0}" = 1 ] && exit 1
+exit 0
+EOF
+# 期望出口文件写到临时目录，避免污染测试机的 /etc（锁文件同理）
+export TOHSAKA_UPLINK_DESIRED="$TMP/uplink.desired"
+export TOHSAKA_UPLINK_LOCK="$TMP/uplink.lock"
+
 for cmd in ubus logger; do
     cat > "$BIN/$cmd" <<EOF
 #!/bin/sh
