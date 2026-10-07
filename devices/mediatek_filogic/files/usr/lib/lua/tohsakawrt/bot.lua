@@ -40,6 +40,7 @@ local function cmd_help()
 /modem - 📡 5G 模组与射频信号看板 (RM500Q)
 /sms [条数] - ✉️ 模组短信息与验证码提取
 /modemreload - 🔄 重载 5G 模组
+/trend - 📈 5G 信号趋势（最近 60 分钟，含频段跳变统计）
 /cards - 📇 查看卡内号码
 /switch <序号或关键词> - 🔀 切换 eSIM 号码
 /download <激活码> [确认码] - 📥 下载并写入新 eSIM Profile
@@ -188,6 +189,8 @@ local function handle_callback(cb_id, msg_id, data_str)
     elseif data_str == "refresh_direct" then
         dirt.cmd_direct_list(msg_id, cb_id)
 
+    elseif data_str == "signal_trend" then
+        modm.cmd_signal_trend(msg_id, cb_id)
     elseif data_str == "refresh_modem" then
         modm.cmd_modem(msg_id, cb_id)
 
@@ -299,6 +302,8 @@ local function handle_command(text)
         net.cmd_wan()
     elseif cmd == "/temp" or full:find("温度") then
         sysm.cmd_temp()
+    elseif cmd == "/trend" or cmd == "/signal" or full:find("信号") then
+        modm.cmd_signal_trend()
     elseif cmd == "/modem" or full:find("5G") or full:find("5g") or full:find("模组") then
         modm.cmd_modem()
     elseif cmd == "/sms" or cmd == "/msg" or full:find("短信") or full:find("验证码") then

@@ -124,6 +124,11 @@ fi
 
 
 # ==========================================================
+# 5G 信号趋势：每分钟记一条样本（落在 /tmp，不写 flash）
+# ==========================================================
+[ -x /usr/bin/tohsakawrt-signal-log ] && /usr/bin/tohsakawrt-signal-log record >/dev/null 2>&1 || true
+
+# ==========================================================
 # 出口自愈：期望出口与实际不一致时自动纠正（uci uplink_enforce=0 关闭）
 # ==========================================================
 [ -x /usr/bin/tohsakawrt-uplink ] && /usr/bin/tohsakawrt-uplink reconcile >/dev/null 2>&1 || true

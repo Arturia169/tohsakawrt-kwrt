@@ -97,6 +97,9 @@ function M.cmd_modem(msg_id, cb_id)
         {
             { text = "📇 卡内号码", callback_data = "refresh_cards" },
             { text = "🔄 重载模组", callback_data = "do_modem_reload" }
+        },
+        {
+            { text = "📈 信号趋势", callback_data = "signal_trend" }
         }
     }
 
@@ -108,6 +111,26 @@ function M.cmd_modem(msg_id, cb_id)
     end
     return tg.send_msg(text, inline_kb)
 end
+-- 5G 信号趋势：交给脚本汇总（解析与格式化只有一份实现），这里只负责转发
+function M.cmd_signal_trend(msg_id, cb_id)
+    local body = core.exec("/usr/bin/tohsakawrt-signal-log show 60 2>/dev/null") or ""
+    body = tostring(body):gsub("%s+$", "")
+    if body == "" then
+        body = "📈 <b>5G 信号趋势</b>\n\n<i>暂时读不到趋势数据（记录器可能刚开始运行）。</i>"
+    end
+    local kb = {
+        {
+            { text = "🔄 刷新趋势", callback_data = "signal_trend" },
+            { text = "📡 返回模组", callback_data = "refresh_modem" }
+        }
+    }
+    if msg_id and cb_id then
+        return tg.answer_and_edit(cb_id, "正在统计信号趋势...", msg_id, body, kb)
+    end
+    if msg_id then return tg.edit_msg(msg_id, body, kb) end
+    return tg.send_msg(body, kb)
+end
+
 function M.cmd_sms(limit, msg_id, cb_id)
     limit = tonumber(limit) or 3
     if limit > 10 then limit = 10 end

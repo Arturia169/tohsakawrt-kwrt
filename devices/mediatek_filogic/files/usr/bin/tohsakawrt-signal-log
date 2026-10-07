@@ -1,0 +1,148 @@
+#!/usr/bin/lua
+-- TohsakaWrt 5G 信号趋势记录
+--   record        记一条样本（由巡检每分钟调用一次）
+--   show [分钟]   输出可直接发到 Telegram 的 HTML 汇总（默认最近 60 分钟）
+--
+-- 设计要点：
+-- * 落在 /tmp（不写 flash，避免长期磨损），上限 3000 行 ≈ 两天；
+-- * 采集时**惰性加载**模组模块：拿不到模组信息就什么都不写，绝不写脏数据；
+--   这样 `show` 在没有模组的机器上也能用（便于测试）。
+local FILE = os.getenv("TOHSAKA_SIGNAL_LOG") or "/tmp/tohsakawrt/state/signal-trend.log"
+local MAX_LINES = 3000
+
+local function ensure_dir(path)
+    local dir = path:match("^(.*)/[^/]*$")
+    if dir then os.execute("mkdir -p '" .. dir .. "' 2>/dev/null") end
+end
+
+-- 取一条样本，返回 "epoch band rsrp sinr rsrq pci cid"（取不到返回 nil）
+local function sample()
+    local ok, modem = pcall(require, "tohsakawrt.modem")
+    if not ok or type(modem) ~= "table" or type(modem.info) ~= "function" then return nil end
+    local ok2, m = pcall(modem.info)
+    if not ok2 or type(m) ~= "table" then return nil end
+    local function f(v)
+        local s = tostring(v == nil and "-" or v):gsub("%s+", "")
+        if s == "" then s = "-" end
+        return s
+    end
+    return string.format("%d %s %s %s %s %s %s",
+        os.time(), f(m.band), f(m.rsrp_num or m.rsrp), f(m.sinr_num or m.sinr),
+        f(m.rsrq), f(m.pci), f(m.cell_id))
+end
+
+local function record()
+    local line = sample()
+    if not line then
+        io.stderr:write("no modem sample\n")
+        return 1
+    end
+    ensure_dir(FILE)
+    local f = io.open(FILE, "a")
+    if not f then return 1 end
+    f:write(line, "\n")
+    f:close()
+
+    -- 每 5 分钟才检查一次长度，避免每分钟都重写整个文件
+    if os.time() % 300 < 60 then
+        os.execute(string.format(
+            "n=$(wc -l < '%s' 2>/dev/null || echo 0); [ \"$n\" -gt %d ] && " ..
+            "(tail -n %d '%s' > '%s.tmp' && mv '%s.tmp' '%s') || true",
+            FILE, MAX_LINES, MAX_LINES, FILE, FILE, FILE, FILE))
+    end
+    return 0
+end
+
+local function pct(v, suffix)
+    if v == nil then return "-" end
+    return string.format("%d%s", math.floor(v + 0.5), suffix or "")
+end
+
+local function show(minutes)
+    minutes = tonumber(minutes) or 60
+    local f = io.open(FILE, "r")
+    if not f then
+        print("📈 <b>5G 信号趋势</b>\n\n<i>还没有样本 —— 记录器每分钟采一次，稍后再看。</i>")
+        return 0
+    end
+
+    local cutoff = os.time() - minutes * 60
+    local n = 0
+    local bands, band_order = {}, {}
+    local band_changes = 0
+    local last_band = nil
+    local rmin, rmax, rsum, rn = nil, nil, 0, 0
+    local smin, smax, ssum, sn = nil, nil, 0, 0
+    local first_ts, last_ts, last_pci, last_cid = nil, nil, "-", "-"
+
+    for line in f:lines() do
+        -- 容忍多余空白：字段之间允许任意多个空格/制表符
+        local ts, band, rsrp, sinr, rsrq, pci, cid =
+            line:match("^(%d+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s*$")
+        if ts and tonumber(ts) and tonumber(ts) >= cutoff then
+            ts = tonumber(ts)
+            n = n + 1
+            first_ts = first_ts or ts
+            last_ts = ts
+            if not bands[band] then band_order[#band_order + 1] = band end
+            bands[band] = (bands[band] or 0) + 1
+            if last_band and band ~= last_band then band_changes = band_changes + 1 end
+            last_band = band
+            last_pci, last_cid = pci, cid
+
+            local r = tonumber(rsrp)
+            if r then
+                rmin = (not rmin or r < rmin) and r or rmin
+                rmax = (not rmax or r > rmax) and r or rmax
+                rsum, rn = rsum + r, rn + 1
+            end
+            local s = tonumber(sinr)
+            if s then
+                smin = (not smin or s < smin) and s or smin
+                smax = (not smax or s > smax) and s or smax
+                ssum, sn = ssum + s, sn + 1
+            end
+        end
+    end
+    f:close()
+
+    if n == 0 then
+        print(string.format("📈 <b>5G 信号趋势</b>\n\n<i>最近 %d 分钟没有样本（模组可能未连接）。</i>", minutes))
+        return 0
+    end
+
+    local parts = {}
+    for _, b in ipairs(band_order) do
+        parts[#parts + 1] = string.format("%s <code>%d</code> 次", b, bands[b])
+    end
+    local band_line = table.concat(parts, " / ")
+    if band_changes > 0 then
+        band_line = band_line .. string.format("（跳变 <code>%d</code> 次）", band_changes)
+    end
+
+    local function hm(ts) return os.date("%H:%M", ts) end
+    print(string.format([[📈 <b>5G 信号趋势</b>（最近 %d 分钟）
+━━━━━━━━━━━━━━━━━━
+🧪 <b>样本</b>：<code>%d</code> 条 · %s → %s
+📻 <b>驻留频段</b>：%s
+📶 <b>RSRP</b>：最差 <code>%s</code> / 平均 <code>%s</code> / 最好 <code>%s</code> dBm
+📊 <b>SINR</b>：最低 <code>%s</code> / 平均 <code>%s</code> / 最高 <code>%s</code> dB
+📍 <b>最近小区</b>：PCI <code>%s</code> · CellID <code>%s</code>
+━━━━━━━━━━━━━━━━━━
+💡 <i>频段频繁跳变或 RSRP 明显下滑时，可考虑锁定更稳的频段。</i>]],
+        minutes, n, hm(first_ts), hm(last_ts), band_line,
+        pct(rmin), pct(rn > 0 and rsum / rn or nil), pct(rmax),
+        pct(smin), pct(sn > 0 and ssum / sn or nil), pct(smax),
+        last_pci, last_cid))
+    return 0
+end
+
+local cmd = arg[1] or "show"
+if cmd == "record" then
+    os.exit(record())
+elseif cmd == "show" then
+    os.exit(show(arg[2]))
+else
+    print("Usage: " .. (arg[0] or "tohsakawrt-signal-log") .. " {record | show [minutes]}")
+    os.exit(1)
+end
