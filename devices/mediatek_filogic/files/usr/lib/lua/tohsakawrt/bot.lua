@@ -209,7 +209,7 @@ local function handle_callback(cb_id, msg_id, data_str)
     elseif data_str == "band_restore" then
         modm.band_restore(msg_id, cb_id)
     elseif data_str == "proxy_menu" then
-        netm.cmd_proxy_menu(msg_id, cb_id)
+        net.cmd_proxy_menu(msg_id, cb_id)
     elseif data_str == "direct_list" then
         sysm.cmd_direct_list(msg_id, cb_id)
     elseif data_str:match("^direct_add_do:") then
@@ -332,7 +332,7 @@ local function handle_command(text)
     elseif cmd == "/temp" or full:find("温度") then
         sysm.cmd_temp()
     elseif cmd == "/proxy" or full:find("代理面板") or full:find("代理设置") then
-        netm.cmd_proxy_menu()
+        net.cmd_proxy_menu()
     elseif cmd == "/smart" or cmd == "/direct-test" then
         local d = full:match("^/%S+%s+([%w%.%-]+)")
         if d then sysm.direct_smart(d) else sysm.cmd_direct_list() end
