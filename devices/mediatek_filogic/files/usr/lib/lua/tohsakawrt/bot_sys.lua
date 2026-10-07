@@ -47,6 +47,10 @@ local function build_status_card()
         {
             { text = "🔀 切换主力出口", callback_data = "open_uplink_menu" },
             { text = "🔄 刷新看板", callback_data = "refresh_status" }
+        },
+        {
+            { text = "📈 信号趋势", callback_data = "signal_trend" },
+            { text = "📡 模组状态", callback_data = "refresh_modem" }
         }
     }
 
