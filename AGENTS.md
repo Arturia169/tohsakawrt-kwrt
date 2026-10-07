@@ -130,3 +130,17 @@ git revert <提交>
 - **桩件要与真实调用约定一致**：AT 通路是 `sh modem_at.sh <端口> <命令>`（命令在 `$2`），
   桩件写成 `$3` 会静默返回空；另外别用"空值"模拟读取失败 —— shell 的 `:-` 会把空值兜成默认值，
   要用显式开关（如 `FAKE_NO_READ=1`）。
+- **跨模块调用必须导出**：`bot_sys.lua` 里若写成 `local function foo()`，而 `bot.lua` 调的是
+  `sysm.foo()`，运行时必然是 `attempt to call field 'foo' (a nil value)`。
+  2026-10-07「🔄 刷新看板」就是这样坏了很久 —— 静态检查只扫**裸函数调用**，
+  扫不出"跨模块字段访问"，加函数时记得同时导出（`M.foo = foo`）并跑一遍机器人用例。
+- **busybox 的 awk 是 32 位整数**：字节级流量（1e10）会被截成 2147483647，
+  每台设备都显示"2.00 GB"。做法：**先在 shell 里换算**（ash 是 64 位）成 KB/MB，再交给 awk 显示。
+- **busybox 的 `sort -t/-k` 可能不生效**：实机表现为"结果没排序"，
+  需要稳定排序时改在 **awk 内部**做（数据量都很小，选择排序足够）。
+- **Clash 的配置分两处，改规则必须两处都改**：
+  · `/etc/openclash/config/config.yaml` —— 你手工维护的**模块**（含 `TG_DIRECT_RULES` 标记段）→ 保证持久；
+  · `/etc/openclash/config.yaml` —— 核心用 `-f` 实际读取的**运行配置**（注释已被剥掉）→ 保证立即生效。
+  改完调 `PUT http://127.0.0.1:9090/configs` 热重载（保留现有连接、不重启 OpenClash）。
+  另外：**代理端口启用了认证**（`/configs` 里 `authentication`），不要用 `curl -x 端口` 测代理，
+  改用原生探测 `/proxies/<分组>/delay?url=...`（分组名里的空格要写成 `%20`）。
