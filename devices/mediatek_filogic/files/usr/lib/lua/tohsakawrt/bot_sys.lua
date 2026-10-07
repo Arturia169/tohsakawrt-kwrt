@@ -51,10 +51,33 @@ local function build_status_card()
         {
             { text = "📈 信号趋势", callback_data = "signal_trend" },
             { text = "📡 模组状态", callback_data = "refresh_modem" }
+        },
+        {
+            { text = "📊 查流量", callback_data = "flowcard_now" }
         }
     }
 
     return text, inline_kb
+end
+
+-- 📊 查流量：复用流量卡脚本的查询与格式化（只打印模式，不写台账、不发通知）
+function M.cmd_flowcard(msg_id, cb_id)
+    local body = core.exec("FLOWCARD_PRINT_ONLY=1 /usr/bin/tohsakawrt-flowcard-daily 2>/dev/null") or ""
+    body = tostring(body):gsub("%s+$", "")
+    if body == "" then
+        body = "📊 <b>流量卡查询失败</b>\n\n<i>可能是网络不通或接口暂时异常，稍后再试。</i>"
+    end
+    local kb = {
+        {
+            { text = "🔄 刷新流量", callback_data = "flowcard_now" },
+            { text = "📊 返回看板", callback_data = "refresh_status" }
+        }
+    }
+    if msg_id and cb_id then
+        return tg.answer_and_edit(cb_id, "正在查询流量...", msg_id, body, kb)
+    end
+    if msg_id then return tg.edit_msg(msg_id, body, kb) end
+    return tg.send_msg(body, kb)
 end
 
 function M.cmd_status(msg_id)
