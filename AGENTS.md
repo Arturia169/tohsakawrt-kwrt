@@ -96,6 +96,10 @@ git revert <提交>
 - 云端构建：`.github/workflows/Openwrt-AutoBuild.yml`（会把 `devices/<target>/files` 打进固件；
   并在构建前跑 `tests/` 的用例，用例不过就中止发布）
 - **永远不要把凭据、号码、真实 MAC 写进仓库**
+- **提交前先跑闸门**：`sh devices/<target>/tools/guard-no-credentials.sh`（CI 第一步也会跑，命中即中止构建）。
+  ⚠️ 2026-10 出过一次事故：一次「从设备 1:1 同步」把 `etc/config/tohsakawrt-tgbot` 里的真实机器人令牌
+  写回了公开仓库，令牌被爬虫抓走、冒充机器人发广告。**每次从设备同步后必须 diff 这个文件** ——
+  它是全仓唯一「允许与设备不一致」的文件（设备留真值，仓库留空模板）。
 
 ## 8. bot.lua 的模块划分（2026-10-07 拆分完成）
 

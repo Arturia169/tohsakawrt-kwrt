@@ -1,22 +1,16 @@
+# 凭据与个人号码不入库：真实值只存在于设备 uci（tohsakawrt-tgbot.main.*）
+# 干净刷机后需在设备上重新填入 token / chat_id / bark_key / user_id / flowcard_no，并把 enabled 置 1
+# ⚠️ 本仓库是公开的：任何一次「从设备同步」都不要把真值写回来
+#    CI 会跑 devices/<target>/tools/guard-no-credentials.sh 把关，命中即中止构建
+# 注：list nodata_cards（SIM 卡标识）与 config numbers（卡内号码映射）同样只存设备 uci
 
 config bot 'main'
-	option enabled '1'
-	option token '8247787370:AAGKJGyCslZhmzJGty2y6Ml1KAk9qzlJp3A'
-	option chat_id '549828957'
-	option bark_key 'VStw74Ry2YCKgVCz9wGFXL'
+	option enabled '0'
+	option token ''
+	option chat_id ''
+	option bark_key ''
 	option modem_data_heal '1'
-	list nodata_cards '89852'
-	list nodata_cards '89372'
-	list nodata_cards '8985203103013319273'
-	list nodata_cards '8937204017270962205'
-	list nodata_cards '89995'
 	option esim_job_retain_minutes '1440'
-        option esim_enabled '1'
-	option user_id '549828957'
-	option flowcard_no '18685585'
-
-config numbers 'numbers'
-	option n_8937204017270962205 '+372****1352'
-	option n_8985203103013319273 '+852****7106'
-	option n_89995011908107987550 '+995****4668'
-
+	option esim_enabled '1'
+	option user_id ''
+	option flowcard_no ''

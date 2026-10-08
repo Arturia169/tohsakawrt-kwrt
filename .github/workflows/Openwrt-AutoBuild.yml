@@ -31,6 +31,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@main
 
+      - name: "Guard: no credentials in the overlay"
+        run: sh "$GITHUB_WORKSPACE/devices/${{ inputs.target }}/tools/guard-no-credentials.sh"
+
       - name: Run payload test suites
         run: |
           set -e
