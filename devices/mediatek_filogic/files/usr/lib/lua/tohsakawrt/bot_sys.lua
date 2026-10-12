@@ -55,6 +55,9 @@ local function build_status_card()
         {
             { text = "📊 查流量", callback_data = "flowcard_now" },
             { text = "🌐 代理面板", callback_data = "proxy_menu" }
+        },
+        {
+            { text = "📡 可用性台账", callback_data = "uptime" }
         }
     }
 
@@ -125,20 +128,31 @@ function M.direct_add(domain, msg_id, cb_id)
         if msg_id and cb_id then return tg.answer_and_edit(cb_id, "格式不正确", msg_id, t) end
         return tg.send_msg(t)
     end
-    local out = tostring(core.exec("/usr/bin/tohsakawrt-clash-direct add " .. domain .. " 2>/dev/null") or ""):gsub("%s+$", "")
+    -- 只取首行判定。脚本在热重载失败时会额外向 stdout 输出一行 RELOAD_FAILED:<code>，
+    -- 而这里原先用整体精确比较 out == "ADDED"：一旦出现第二行，已经写入成功的规则
+    -- 会被误报成"添加失败"；用户重试时 already_in 命中，输出 ALREADY+RELOAD_FAILED
+    -- 又同样判失败 —— 这条主路径会变成既无法成功、也无法撤销。
+    local raw = tostring(core.exec("/usr/bin/tohsakawrt-clash-direct add " .. domain .. " 2>/dev/null") or "")
+    local first = raw:match("^([^\r\n]+)") or ""
+    local reload_failed = raw:find("RELOAD_FAILED:", 1, true) ~= nil
     local body
-    if out == "ADDED" then
-        body = string.format("✅ <b>已加入直连</b>\n\n🔗 <code>%s</code>\n⚡ <b>已热重载</b>（保留现有连接）\n\n<i>下次这条路径就走直连了。</i>", html_escape(domain))
-    elseif out == "ALREADY" then
-        body = string.format("ℹ️ <b>本来就在直连清单里</b>\n\n🔗 <code>%s</code>", html_escape(domain))
+    if first == "ADDED" then
+        body = string.format("✅ <b>已加入直连</b>\n\n🔗 <code>%s</code>\n%s\n\n<i>下次这条路径就走直连了。</i>",
+            html_escape(domain),
+            reload_failed and "⚠️ <b>已写入配置，但热重载失败</b>（重启 OpenClash 后生效）"
+                          or "⚡ <b>已热重载</b>（保留现有连接）")
+    elseif first == "ALREADY" then
+        body = string.format("ℹ️ <b>本来就在直连清单里</b>\n\n🔗 <code>%s</code>%s",
+            html_escape(domain),
+            reload_failed and "\n\n⚠️ <i>但热重载失败，重启 OpenClash 后才会生效。</i>" or "")
     else
-        body = string.format("⚠️ <b>添加失败</b>\n\n<code>%s</code>", html_escape(out ~= "" and out or "无返回"))
+        body = string.format("⚠️ <b>添加失败</b>\n\n<code>%s</code>", html_escape(first ~= "" and first or "无返回"))
     end
     local kb = {
         { { text = "🔗 看清单", callback_data = "direct_list" }, { text = "🗑 撤销", callback_data = "direct_del:" .. domain } },
         { { text = "📊 返回看板", callback_data = "refresh_status" } }
     }
-    if msg_id and cb_id then return tg.answer_and_edit(cb_id, out == "ADDED" and "已加入直连" or "完成", msg_id, body, kb) end
+    if msg_id and cb_id then return tg.answer_and_edit(cb_id, first == "ADDED" and "已加入直连" or "完成", msg_id, body, kb) end
     if msg_id then return tg.edit_msg(msg_id, body, kb) end
     return tg.send_msg(body, kb)
 end
@@ -195,14 +209,64 @@ end
 
 function M.direct_del(domain, msg_id, cb_id)
     domain = tostring(domain or ""):gsub("%s", "")
-    if not valid_domain(domain) then
-        if cb_id then tg.answer_callback(cb_id, "域名不合法") end
-        return tg.send_msg("⚠️ <b>域名格式不正确</b>")
+    -- 卡片（bot_direct.lua:99）教用户发 /undirect 序号，但 bot.lua:349 的分支先命中
+    -- cmd == "/undirect" 并交给本函数，bot.lua:375 那个支持序号的 bot_direct.cmd_undirect
+    -- 因此永远不可达（死代码）。序号落到这里会被 valid_domain 拦下，用户照卡片操作
+    -- 只会得到"格式不正确"。所以必须在删除前把序号翻译成真实域名。
+    -- 清单来源与 /direct 的写入端同一份存储，保证序号与用户看到的清单一致。
+    local total, picked
+    local idx = tonumber(domain)
+    -- 只认 >=1 的整数：0/负数/小数都不是"第几条"的合法写法，留给下面的报错分支解释
+    if not valid_domain(domain) and idx and idx >= 1 and idx == math.floor(idx) then
+        local raw = tostring(core.exec("/usr/bin/tohsakawrt-clash-direct list 2>/dev/null") or "")
+        local n = 0
+        for line in raw:gmatch("[^\n]+") do
+            local d = line:gsub("%s", "")
+            if d ~= "" then
+                n = n + 1
+                if n == idx then picked = d break end
+            end
+        end
+        -- total 只在"真的读过清单"时才有值，用来区分"序号越界"和"清单读不到"
+        total = n
+        if picked then domain = picked end
     end
-    local out = tostring(core.exec("/usr/bin/tohsakawrt-clash-direct del " .. domain .. " 2>/dev/null") or ""):gsub("%s+$", "")
-    local body = string.format("🗑 <b>已撤销直连</b>\n\n🔗 <code>%s</code>\n⚡ <i>已热重载</i>", html_escape(domain))
-    if out ~= "DELETED" then
-        body = string.format("⚠️ <b>撤销返回异常</b>：<code>%s</code>", html_escape(out))
+    if not valid_domain(domain) then
+        local hint
+        if picked then
+            -- 序号确实命中了清单，是那一行内容自己过不了校验（例如只有 3 个字符的条目）。
+            -- 清单内容会被拼进 shell 命令，未校验的字符串不能下发，只能拒绝并说清原因，
+            -- 否则用户会以为是自己序号填错了。
+            hint = string.format("清单第 %d 条的内容不合法（<code>%s</code>），已拒绝执行。", idx, html_escape(picked))
+        elseif total then
+            if total == 0 then
+                hint = "直连清单为空或读取失败（脚本无返回），当前没有可撤销的序号。"
+            else
+                hint = string.format("序号超出范围（当前清单共 %d 条）。", total)
+            end
+        elseif idx and idx ~= math.floor(idx) then
+            hint = "序号必须是整数。"
+        elseif idx then
+            hint = "序号从 1 开始。"
+        else
+            hint = "这既不是合法域名，也不是序号。"
+        end
+        local t = string.format(
+            "⚠️ <b>无法撤销</b>\n\n%s\n\n<i>用法：<code>/undirect 序号</code>（如 <code>/undirect 1</code>）或 <code>/undirect 域名</code></i>",
+            hint)
+        if cb_id then tg.answer_callback(cb_id, "参数不合法") end
+        return tg.send_msg(t)
+    end
+    -- 同样只取首行：脚本热重载失败时会多输出一行 RELOAD_FAILED:<code>，
+    -- 用整体比较会把"已成功删除"误报成"撤销返回异常"。
+    local raw = tostring(core.exec("/usr/bin/tohsakawrt-clash-direct del " .. domain .. " 2>/dev/null") or "")
+    local first = raw:match("^([^\r\n]+)") or ""
+    local reload_failed = raw:find("RELOAD_FAILED:", 1, true) ~= nil
+    local body = string.format("🗑 <b>已撤销直连</b>\n\n🔗 <code>%s</code>\n%s", html_escape(domain),
+        reload_failed and "⚠️ <i>已从配置移除，但热重载失败（重启 OpenClash 后生效）。</i>"
+                      or "⚡ <i>已热重载</i>")
+    if first ~= "DELETED" then
+        body = string.format("⚠️ <b>撤销返回异常</b>：<code>%s</code>", html_escape(first ~= "" and first or "无返回"))
     end
     local kb = { { { text = "🔗 看清单", callback_data = "direct_list" } } }
     if msg_id and cb_id then return tg.answer_and_edit(cb_id, "已撤销", msg_id, body, kb) end
@@ -221,14 +285,121 @@ end
 function M.cmd_temp()
     local temp = sys.cpu_temp()
     local now = os.date("%Y-%m-%d %H:%M:%S")
+    -- 结论必须按真实温度分档，并与真正会推送告警的 /usr/bin/tohsakawrt-temp-watch 对齐
+    -- （WARN_TEMP=80 / CRITICAL_TEMP=90 / RECOVER_TEMP=75）。此前写死"正常"，
+    -- 会让 85°C 这种已经越过告警线、脚本正在报警的温度在看板上显示为安全。
+    -- cpu_temp() 读取失败时返回字符串"未知"，match 取不到数字、tonumber 得 nil，
+    -- 因此必须先判 nil 再比较，否则 nil 参与比较会直接抛错。
+    local temp_num = tonumber(tostring(temp):match("(%d+%.?%d*)"))
+    local verdict
+    if not temp_num then
+        verdict = "⚪ 读取失败"
+    elseif temp_num >= 90 then
+        verdict = "🚨 严重过热（已超过 90°C 告警线），请立即检查散热"
+    elseif temp_num >= 80 then
+        verdict = "🔴 过热（已超过 80°C 告警线）"
+    elseif temp_num >= 75 then
+        verdict = "🟠 偏高（接近 80°C 告警线）"
+    elseif temp_num >= 65 then
+        verdict = "🟡 略高"
+    else
+        verdict = "🟢 正常（安全范围 &lt; 75°C）"
+    end
     local text = string.format([[🌡️ <b>CPU 实时温度</b>
 
 ━━━━━━━━━━━━━━━━━━
 🔥 <b>当前核心温度</b>：<code>%s</code>
-📊 <b>状态评估</b>：正常 (安全范围 &lt; 75°C)
+📊 <b>状态评估</b>：%s
 ━━━━━━━━━━━━━━━━━━
-🕰️ <i>%s</i>]], html_escape(temp), html_escape(now))
+🕰️ <i>%s</i>]], html_escape(temp), verdict, html_escape(now))
     tg.send_msg(text)
+end
+
+-- 📡 网络可用性台账
+-- 数据由 service-watch 每分钟的连通性探测顺带写入，且【只在通断变化时写一行】，
+-- 所以这份台账本身不给路由器增加负载（详见 tohsakawrt-uptime 的头部说明）。
+function M.cmd_uptime(msg_id, cb_id)
+    local body = tostring(core.exec("/usr/bin/tohsakawrt-uptime show 2>/dev/null") or "")
+    if body == "" then
+        body = "⚠️ <b>台账读取失败</b>\n\n<i>脚本 /usr/bin/tohsakawrt-uptime 无输出，请检查是否存在。</i>"
+    end
+    local kb = {
+        { { text = "🔄 刷新", callback_data = "uptime" }, { text = "🗃️ 黑匣子", callback_data = "event_log:2" } },
+        { { text = "📊 返回看板", callback_data = "refresh_status" } }
+    }
+    if msg_id and cb_id then return tg.answer_and_edit(cb_id, "正在统计可用率...", msg_id, body, kb) end
+    if msg_id then return tg.edit_msg(msg_id, body, kb) end
+    return tg.send_msg(body, kb)
+end
+
+-- 🗃️ 网络黑匣子：统一事件时间线
+-- 把散在各处的记录（可用性台账、制式切换台账、自愈动作、你的每次操作）汇成一条线，
+-- 目的是回答"那个时间点到底发生了什么"——分开看都正常，合起来才能看出因果。
+-- 展示逻辑全部在 tohsakawrt-event-log 里（只有一份实现），这里只负责转发。
+function M.cmd_event_log(hours, msg_id, cb_id)
+    hours = tonumber(hours) or 2
+    if hours < 1 then hours = 1 end
+    if hours > 720 then hours = 720 end
+
+    local body = tostring(core.exec("/usr/bin/tohsakawrt-event-log show " .. hours .. " 2>/dev/null") or "")
+    body = body:gsub("%s+$", "")
+    if body == "" then
+        body = "🗃️ <b>网络黑匣子</b>\n\n<i>暂时读不到事件（采集器每分钟运行一次，稍后再看）。</i>"
+    end
+
+    local kb = {
+        {
+            { text = "🔄 刷新", callback_data = "event_log:" .. hours },
+            { text = "🔍 找原因", callback_data = "event_why:" .. hours }
+        },
+        {
+            { text = "🕐 12 小时", callback_data = "event_log:12" },
+            { text = "📅 7 天", callback_data = "event_log:168" }
+        },
+        {
+            { text = "📡 可用性台账", callback_data = "uptime" },
+            { text = "📊 返回看板", callback_data = "refresh_status" }
+        }
+    }
+    if msg_id and cb_id then return tg.answer_and_edit(cb_id, "正在读取事件...", msg_id, body, kb) end
+    if msg_id then return tg.edit_msg(msg_id, body, kb) end
+    return tg.send_msg(body, kb)
+end
+
+-- 🔍 因果关联：把事件列表变成因果链
+-- 回答的是"为什么会卡/断"——把断网事件与它之前几分钟内发生的事排在一起，
+-- 并按"可疑度"指出最可能的原因。展示逻辑全在 tohsakawrt-event-correlate 里。
+--
+-- 注意：脚本头部明确写了它【只陈述先后关系、不声称因果】。
+-- 所以这里的用词也是"最可疑"而不是"原因"——先后相邻不等于因果，
+-- 把猜测说成结论会误导用户（例如用户点了按钮与运营商侧断网只是碰巧相邻）。
+function M.cmd_event_correlate(hours, msg_id, cb_id)
+    hours = tonumber(hours) or 24
+    if hours < 1 then hours = 1 end
+    if hours > 720 then hours = 720 end
+
+    local body = tostring(core.exec("/usr/bin/tohsakawrt-event-correlate show " .. hours .. " 2>/dev/null") or "")
+    body = body:gsub("%s+$", "")
+    if body == "" then
+        body = "🔍 <b>因果关联</b>\n\n<i>暂时读不到分析结果（事件采集器每分钟运行一次，稍后再看）。</i>"
+    end
+
+    local kb = {
+        {
+            { text = "🔄 刷新", callback_data = "event_why:" .. hours },
+            { text = "🗃️ 看时间线", callback_data = "event_log:" .. hours }
+        },
+        {
+            { text = "🕐 24 小时", callback_data = "event_why:24" },
+            { text = "📅 7 天", callback_data = "event_why:168" }
+        },
+        {
+            { text = "📊 返回看板", callback_data = "refresh_status" }
+        }
+    }
+    if msg_id and cb_id then return tg.answer_and_edit(cb_id, "正在分析因果...", msg_id, body, kb) end
+    if msg_id then return tg.edit_msg(msg_id, body, kb) end
+    return tg.send_msg(body, kb)
 end
 
 function M.cmd_clients()

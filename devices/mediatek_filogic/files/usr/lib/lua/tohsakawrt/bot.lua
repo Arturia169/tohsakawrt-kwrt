@@ -35,6 +35,9 @@ local function cmd_help()
 /direct - 🎯 添加域名/IP到直连白名单
 /undirect - 🗑️ 从直连白名单移除域名/IP
 /temp - 🌡️ CPU 实时温度监控
+/uptime - 📡 网络可用性台账（24小时/7天/30天可用率与断网记录）
+/log - 🗃️ 网络黑匣子（统一事件时间线：可用性/制式/出口/模组/你的操作）
+/why - 🔍 因果关联（断网前发生了什么，最可疑的是什么）
 /storage - 💾 存储分区与挂载
 /usb - 🔌 USB 设备拓扑
 /modem - 📡 5G 模组与射频信号看板 (RM500Q)
@@ -44,13 +47,13 @@ local function cmd_help()
 /band - 📻 5G 频段设置（锁定/恢复，带自动回退）
 /gnss - 🛰️ GNSS 定位（坐标 / 地图链接 / 开关）
 /flow - 📊 流量卡实时用量（剩余 / 已用 / 可用天数）
-/direct <域名> - 🔗 加入强制直连（套了优化 CDN、代理反而慢的站点）
-/undirect <域名> - 🗑 撤销直连；/direct-list 查看清单
-/smart <域名> - 🔎 实测代理 vs 直连哪个快，并给一键建议
+/direct &lt;域名&gt; - 🔗 加入强制直连（套了优化 CDN、代理反而慢的站点）
+/undirect &lt;域名&gt; - 🗑 撤销直连；/direct-list 查看清单
+/smart &lt;域名&gt; - 🔎 实测代理 vs 直连哪个快，并给一键建议
 /proxy - 🌐 代理与分流面板（直连规则 / 节点分流 / Clash 状态）
 /cards - 📇 查看卡内号码
-/switch <序号或关键词> - 🔀 切换 eSIM 号码
-/download <激活码> [确认码] - 📥 下载并写入新 eSIM Profile
+/switch &lt;序号或关键词&gt; - 🔀 切换 eSIM 号码
+/download &lt;激活码&gt; [确认码] - 📥 下载并写入新 eSIM Profile
 /reboot - ⚡ 重启路由器系统 (带确认闸门)
 /poweroff - 🔌 关闭路由器电源 (带确认闸门)
 
@@ -63,35 +66,83 @@ end
 
 -- ==================== CALLBACK DISPATCH ====================
 
+-- 一次性闸门：按钮回调会被 Telegram 重发、也会被用户连点，而"重启/关机/删规则"这类
+-- 破坏性操作重复执行的代价是不可逆的（关机会直接断网）。所以按"同一条消息 + 同一个动作"
+-- 只放行一次；第二次及以后一律忽略。
+-- 状态落在 /tmp（tmpfs，重启即清空）：路由器重启后本来就该允许再次操作，不需要持久化。
+local function consume_once(msg_id, action)
+    local key = string.format("cb_used_%s_%s", tostring(msg_id), tostring(action):gsub("%W", "_"))
+    if core.get_state(key, "") == "1" then return false end
+    core.set_state(key, "1")
+    return true
+end
+
 local function handle_callback(cb_id, msg_id, data_str)
     local t0 = now_ms()
     if data_str == "cancel_action" then
         tg.answer_callback(cb_id, "操作已取消")
-        tg.edit_msg(msg_id, "🛡️ <b>操作已取消</b>\n\n未对系统或服务进行任何修改。")
+        -- 必须传第三个参数 false：editMessageText 省略 reply_markup 时旧键盘会保留，
+        -- 只改文字的话那条"🔴 确认执行"按钮还留在原地可点，用户以为取消了、再点一下
+        -- 操作照样执行（且能反复点）——取消按钮等于形同虚设。
+        tg.edit_msg(msg_id, "🛡️ <b>操作已取消</b>\n\n未对系统或服务进行任何修改。", false)
 
     elseif data_str == "do_clash_restart" then
+        -- 破坏性操作：同一条确认消息只认一次（详见 consume_once 注释）
+        if not consume_once(msg_id, data_str) then
+            tg.answer_callback(cb_id, "该操作已执行过，已忽略")
+            return
+        end
         tg.answer_callback(cb_id, "正在重启核心...")
-        tg.edit_msg(msg_id, "🔄 <b>操作已确认</b>：正在重启 OpenClash 核心，请稍候约 3~5 秒...")
+        -- 传 false 清空键盘，否则残留的确认按钮会被再点一次、核心被反复重启
+        tg.edit_msg(msg_id, "🔄 <b>操作已确认</b>：正在重启 OpenClash 核心，请稍候约 3~5 秒...", false)
         net.cmd_clash_restart(true)
 
     elseif data_str == "do_modem_reload" then
+        -- 破坏性操作：同一条确认消息只认一次（详见 consume_once 注释）
+        if not consume_once(msg_id, data_str) then
+            tg.answer_callback(cb_id, "该操作已执行过，已忽略")
+            return
+        end
         tg.answer_callback(cb_id, "正在重载模组...")
+        -- 这里不用再传 false：start_esim_job 会把键盘换成"查看结果"，
+        -- 确认按钮不会残留，重复点击只可能来自重发，已由上面的闸门挡住
         esimm.start_esim_job("reload", nil, nil, msg_id)
 
     elseif data_str:find("^do_undirect:") then
+        -- 破坏性操作：同一条确认消息只认一次（详见 consume_once 注释）
+        if not consume_once(msg_id, data_str) then
+            tg.answer_callback(cb_id, "该操作已执行过，已忽略")
+            return
+        end
         local target = data_str:gsub("^do_undirect:", "")
         tg.answer_callback(cb_id, "正在删除条目...")
-        tg.edit_msg(msg_id, "🗑️ 操作已确认：正在从直连白名单移除 <code>" .. html_escape(target) .. "</code>。")
-        dirt.cmd_undirect(target, true)
+        -- 传 false 清空键盘：否则删完按钮还在，连点会反复触发删除
+        tg.edit_msg(msg_id, "🗑️ 操作已确认：正在从直连白名单移除 <code>" .. html_escape(target) .. "</code>。", false)
+        -- 删除也必须落在新实现（config.yaml 的 TG_DIRECT_RULES 段）：
+        -- 旧实现写的是 /etc/openclash/tg_direct_rules.list，那边改了清单里看不到、规则也不生效
+        -- cb_id 传 nil：本次回调已经应答过，再答一次只会拿到 "query is invalid" 的失败日志
+        sysm.direct_del(target, msg_id, nil)
 
     elseif data_str == "do_sys_reboot" then
+        -- 破坏性操作：同一条确认消息只认一次（详见 consume_once 注释）
+        if not consume_once(msg_id, data_str) then
+            tg.answer_callback(cb_id, "该操作已执行过，已忽略")
+            return
+        end
         tg.answer_callback(cb_id, "正在重启路由器...")
-        tg.edit_msg(msg_id, "⚡ <b>正在重启路由器系统...</b>\n\n网络即将断开，请等待约 1~2 分钟系统重新上线。")
+        -- 传 false 清空键盘，否则残留按钮可被连点，触发第二次 reboot
+        tg.edit_msg(msg_id, "⚡ <b>正在重启路由器系统...</b>\n\n网络即将断开，请等待约 1~2 分钟系统重新上线。", false)
         core.exec("reboot &")
 
     elseif data_str == "do_sys_poweroff" then
+        -- 破坏性操作：同一条确认消息只认一次（详见 consume_once 注释）
+        if not consume_once(msg_id, data_str) then
+            tg.answer_callback(cb_id, "该操作已执行过，已忽略")
+            return
+        end
         tg.answer_callback(cb_id, "正在关闭路由器...")
-        tg.edit_msg(msg_id, "🔌 <b>正在关闭路由器电源...</b>\n\n系统正在安全关机，网络已停止。再次使用需手动重新通电。")
+        -- 传 false 清空键盘，否则残留按钮可被连点，关机指令会被重复下发
+        tg.edit_msg(msg_id, "🔌 <b>正在关闭路由器电源...</b>\n\n系统正在安全关机，网络已停止。再次使用需手动重新通电。", false)
         core.exec("poweroff &")
 
     elseif data_str == "refresh_cards" then
@@ -193,8 +244,20 @@ local function handle_callback(cb_id, msg_id, data_str)
             tg.send_msg(text, kb)
         end
 
+    elseif data_str == "uptime" then
+        sysm.cmd_uptime(msg_id, cb_id)
+
+    elseif data_str:find("^event_log:") then
+        -- "event_log:12" → 12 小时；sub(11) 跳过前缀
+        sysm.cmd_event_log(data_str:sub(11), msg_id, cb_id)
+
+    elseif data_str:find("^event_why:") then
+        sysm.cmd_event_correlate(data_str:sub(11), msg_id, cb_id)
+
     elseif data_str == "refresh_direct" then
-        dirt.cmd_direct_list(msg_id, cb_id)
+        -- 旧实现读的是 /etc/openclash/tg_direct_rules.list，跟 /direct 写入的 config.yaml
+        -- 是两份数据；这个"刷新"按钮在老消息上还留着，点下去必须也读新实现，否则用户看到的是过期清单
+        sysm.cmd_direct_list(msg_id, cb_id)
 
     elseif data_str == "gnss_show" then
         modm.cmd_gnss(msg_id, cb_id)
@@ -224,6 +287,8 @@ local function handle_callback(cb_id, msg_id, data_str)
         sysm.cmd_flowcard(msg_id, cb_id)
     elseif data_str == "signal_trend" then
         modm.cmd_signal_trend(msg_id, cb_id)
+    elseif data_str == "signal_long" then
+        modm.cmd_signal_long(msg_id, cb_id)
     elseif data_str == "refresh_modem" then
         modm.cmd_modem(msg_id, cb_id)
 
@@ -244,8 +309,14 @@ local function handle_callback(cb_id, msg_id, data_str)
 
     elseif data_str:find("^set_mode:") then
         local mode = data_str:gsub("^set_mode:", "")
-        clash.set_mode(mode)
-        local mode_name = mode
+        -- 先校验再渲染：非法模式由 clash.set_mode 白名单拒绝，绝不落到 shell
+        local applied, err = clash.set_mode(mode)
+        if not applied then
+            core.log("TohsakaWrt-Clash", "拒绝非法的代理模式: " .. tostring(mode))
+            tg.answer_callback(cb_id, "❌ 无效的代理模式，已拒绝")
+            return
+        end
+        local mode_name = applied
         if mode == "rule" then mode_name = "规则分流 (Rule)"
         elseif mode == "global" then mode_name = "全局代理 (Global)"
         elseif mode == "direct" then mode_name = "全局直连 (Direct)" end
@@ -335,18 +406,31 @@ local function handle_command(text)
         net.cmd_wan()
     elseif cmd == "/temp" or full:find("温度") then
         sysm.cmd_temp()
+    elseif cmd == "/uptime" or full:find("可用性") or full:find("可用率") then
+        sysm.cmd_uptime()
+    elseif cmd == "/log" or full:find("黑匣子") or full:find("事件线") then
+        -- /log 12 或 /log 12小时 或 说"黑匣子 12 小时"
+        local h = tonumber(full:match("^/log%s+(%d+)")) or tonumber(full:match("(%d+)%s*小时"))
+        sysm.cmd_event_log(h)
+    elseif cmd == "/why" or full:find("找原因") or full:find("为什么") then
+        -- 因果关联：回答"为什么卡了/断了"
+        local h = tonumber(full:match("^/why%s+(%d+)")) or tonumber(full:match("(%d+)%s*小时"))
+        sysm.cmd_event_correlate(h)
     elseif cmd == "/proxy" or full:find("代理面板") or full:find("代理设置") then
         net.cmd_proxy_menu()
     elseif cmd == "/smart" or cmd == "/direct-test" then
         local d = full:match("^/%S+%s+([%w%.%-]+)")
         if d then sysm.direct_smart(d) else sysm.cmd_direct_list() end
-    elseif cmd == "/direct" or cmd == "/undirect" or cmd == "/direct-list" or cmd == "/directlist"
-        or full:find("直连清单") or full:find("强制直连") then
-        local arg = full:match("^/%S+%s+([%w%.%-]+)")
-        if (cmd == "/undirect") and arg then
-            sysm.direct_del(arg)
-        elseif (cmd == "/direct") and arg then
-            sysm.direct_add(arg)
+    elseif cmd == "/direct" or cmd == "/bypass" or cmd == "/undirect" or cmd == "/direct-list" or cmd == "/directlist"
+        or cmd == "/direct_list" or full:find("直连清单") or full:find("强制直连") then
+        -- 直连相关入口全部收口到新实现（/usr/bin/tohsakawrt-clash-direct，数据在 config.yaml 的 TG_DIRECT_RULES 段）。
+        -- /bypass 与 /direct_list 原先落在下面的旧实现分支上，和这里的 /direct 读写的是两个文件，
+        -- 后果是"刚加的规则清单里看不到、撤销了也不生效"（运行中的 Clash 里两条都还在），所以合并到这一支。
+        local d = full:match("^/%S+%s+([%w%.%-]+)")
+        if cmd == "/undirect" and d then
+            sysm.direct_del(d)
+        elseif (cmd == "/direct" or cmd == "/bypass" or cmd == "/direct_list") and d then
+            sysm.direct_add(d)
         else
             sysm.cmd_direct_list()
         end
@@ -358,22 +442,31 @@ local function handle_command(text)
         local list = full:match("^/band%s+([0-9:]+)") or full:match("^/bands%s+([0-9:]+)")
         if list then modm.band_confirm(list) else modm.cmd_band_menu() end
     elseif cmd == "/trend" or cmd == "/signal" or full:find("信号") then
-        modm.cmd_signal_trend()
+        -- 说"长趋势/多天趋势"时直接给多天视图，否则给近 60 分钟视图
+        if full:find("长趋势") or full:find("多天") or full:find("趋势7") then
+            modm.cmd_signal_long()
+        else
+            modm.cmd_signal_trend()
+        end
     elseif cmd == "/modem" or full:find("5G") or full:find("5g") or full:find("模组") then
         modm.cmd_modem()
     elseif cmd == "/sms" or cmd == "/msg" or full:find("短信") or full:find("验证码") then
         local count = tonumber(arg:match("(%d+)")) or 3
         modm.cmd_sms(count)
-    elseif cmd == "/direct" or cmd == "/bypass" then
-        dirt.cmd_direct(arg)
-    elseif cmd == "/undirect" or full:find("删直连") then
-        dirt.cmd_undirect(arg)
-    elseif cmd == "/direct_list" or full:find("白名单") or full:find("直连") then
-        if arg and arg ~= "" then
-            dirt.cmd_direct(arg)
+    elseif full:find("删直连") then
+        -- 中文口令不以 "/" 开头，handle_command 只对 "/" 开头的文本解析 arg，
+        -- 所以目标必须自己从整句里抠（原先直接把恒为空串的 arg 传下去，这个入口实际只能打印用法）
+        local target = full:match("删直连%s*([%w%.%-]+)")
+        if target then
+            -- 保留"先确认再删"：撤销直连会让该站点重新走代理，属于用户可感知的改动
+            ask_confirm("删除直连白名单", target, "目标将不再享受免代理直连待遇，重新受 OpenClash 分流规则控制", "do_undirect:" .. target)
         else
-            dirt.cmd_direct_list()
+            sysm.cmd_direct_list()
         end
+    elseif full:find("白名单") or full:find("直连") then
+        -- 纯中文触发词不带目标，直接给清单（清单上每条都有 🗑 撤销按钮）；
+        -- 带目标的入口是 /direct、/direct_list 与"删直连 &lt;域名&gt;"，已在上面的分支统一处理
+        sysm.cmd_direct_list()
     elseif cmd == "/clients" or cmd == "/devices" or full:find("设备") or full:find("客户端") then
         sysm.cmd_clients()
     elseif cmd == "/alias" or full:find("备注") then

@@ -48,9 +48,25 @@ function M.cmd_modem(msg_id, cb_id)
     end
 
     local rsrq_line = m.rsrq and string.format("<code>%s</code>", html_escape(m.rsrq)) or "未获取"
-    local temp_line = m.temp and string.format("<code>%s</code> 🟢", html_escape(m.temp)) or "未获取"
-    local qci_line = m.qci and string.format("<code>5QI %s (标准移动宽带)</code>", html_escape(m.qci)) or "未获取"
+    -- modem.info() 对温度用 "未知" 兜底，所以 m.temp 恒非 nil —— 必须判断内容而不是判空。
+    -- 原来的写法在未知时显示"未知 🟢"：绿点是在断言"温度正常"，而事实是没读到，与事实相反。
+    local temp_val = tostring(m.temp or "")
+    local temp_line
+    if temp_val == "" or temp_val == "未知" then
+        temp_line = "未获取"
+    else
+        temp_line = string.format("<code>%s</code> 🟢", html_escape(temp_val))
+    end
+    -- CQI（信道质量指示，0–15）不是 5QI（5G QoS 标识，1–9）：旧代码把模组的 CQI DL
+    -- 标成"5QI 标准移动宽带"，读数看着合理，实际是把信道质量冒充成业务 QoS 等级。
+    local cqi_line = m.cqi and string.format("<code>CQI %s (信道质量，越大越好)</code>", html_escape(m.cqi)) or "未获取"
     local ambr_line = (m.ambr_dl and m.ambr_ul) and string.format("<code>下行 %s / 上行 %s</code>", html_escape(m.ambr_dl), html_escape(m.ambr_ul)) or "未获取"
+
+    -- 运营商/制式/频段读不到时 modem.info() 返回 nil，而 html_escape(nil) 得到空串，
+    -- 卡片会显示"运营商：<code></code>"，看不出是"没读到"还是"读到空值"。
+    local oper_line = m.oper and html_escape(m.oper) or "未获取"
+    local mode_line = m.mode and html_escape(m.mode) or "未获取"
+    local band_line = m.band and html_escape(m.band) or "未获取"
 
     local cell_extra = ""
     if m.pci and m.cell_id then
@@ -71,8 +87,8 @@ function M.cmd_modem(msg_id, cb_id)
 ├ 信号质量 (RSRQ)：%s
 └ 信噪比 (SINR)：%s%s
 ━━━━━━━━━━━━━━━━━━
-🚀 <b>网络业务签约</b>：
-├ 业务等级：%s
+🚀 <b>信道质量与业务签约</b>：
+├ 信道质量 (CQI)：%s
 └ 签约速率：%s
 ━━━━━━━━━━━━━━━━━━
 🌐 <b>蜂窝内网</b>：<code>%s</code>
@@ -80,15 +96,15 @@ function M.cmd_modem(msg_id, cb_id)
 ━━━━━━━━━━━━━━━━━━
 🕰️ <i>%s</i>]],
         modem_status, html_escape(port),
-        html_escape(m.oper),
-        html_escape(m.mode),
-        html_escape(m.band),
+        oper_line,
+        mode_line,
+        band_line,
         temp_line,
         rsrp_line,
         rsrq_line,
         sinr_line,
         cell_extra,
-        qci_line,
+        cqi_line,
         ambr_line,
         html_escape(m.sim_ip),
         html_escape(usb0),
@@ -146,7 +162,8 @@ function M.cmd_gnss(msg_id, cb_id)
 end
 
 function M.gnss_action(action, msg_id, cb_id)
-    local out = tostring(core.exec("/usr/bin/tohsakawrt-gnss " .. action .. " 2>/dev/null") or ""):gsub("%s+$", "")
+    -- 放宽到 90 秒：开启定位涉及 AT+QGPS 与卫星搜索，可能明显慢于普通命令。
+    local out = tostring(core.exec("/usr/bin/tohsakawrt-gnss " .. action .. " 2>/dev/null", 90) or ""):gsub("%s+$", "")
     local toast = (action == "start") and (out == "OK_STARTED" and "已开启，正在搜星" or "开启失败")
         or (out == "OK_STOPPED" and "已停止定位" or "停止失败")
     if cb_id then tg.answer_callback(cb_id, toast) end
@@ -226,7 +243,8 @@ end
 
 -- 真正执行锁定
 function M.band_lock(list, msg_id, cb_id)
-    local out = core.exec_line("/usr/bin/tohsakawrt-band lock " .. tostring(list) .. " 2>/dev/null") or ""
+    -- 放宽到 90 秒：频段锁定要连续下发多条 AT 并等待模组重新注网。
+    local out = core.exec_line("/usr/bin/tohsakawrt-band lock " .. tostring(list) .. " 2>/dev/null", 90) or ""
     out = tostring(out):gsub("%s+$", "")
     local ok = (out == "OK_LOCKED")
     local body
@@ -273,11 +291,39 @@ function M.cmd_signal_trend(msg_id, cb_id)
     local kb = {
         {
             { text = "🔄 刷新趋势", callback_data = "signal_trend" },
+            { text = "📈 近 7 天", callback_data = "signal_long" }
+        },
+        {
             { text = "📡 返回模组", callback_data = "refresh_modem" }
         }
     }
     if msg_id and cb_id then
         return tg.answer_and_edit(cb_id, "正在统计信号趋势...", msg_id, body, kb)
+    end
+    if msg_id then return tg.edit_msg(msg_id, body, kb) end
+    return tg.send_msg(body, kb)
+end
+
+-- 5G 信号长趋势（多天）：按"一天中的第几小时"分组，用来判断是否每晚固定时段变差。
+-- 数据来自 signal-log 的【小时聚合】（每小时才写一行 flash），所以这个视图
+-- 本身不增加负载，也不需要模组实时在线。
+function M.cmd_signal_long(msg_id, cb_id)
+    local body = core.exec("/usr/bin/tohsakawrt-signal-log show-long 168 2>/dev/null") or ""
+    body = tostring(body):gsub("%s+$", "")
+    if body == "" then
+        body = "📈 <b>5G 信号长趋势</b>\n\n<i>暂时读不到聚合数据（每小时才汇总一次，攒几小时再看）。</i>"
+    end
+    local kb = {
+        {
+            { text = "🔄 刷新", callback_data = "signal_long" },
+            { text = "📉 近 60 分钟", callback_data = "signal_trend" }
+        },
+        {
+            { text = "📡 返回模组", callback_data = "refresh_modem" }
+        }
+    }
+    if msg_id and cb_id then
+        return tg.answer_and_edit(cb_id, "正在汇总长趋势...", msg_id, body, kb)
     end
     if msg_id then return tg.edit_msg(msg_id, body, kb) end
     return tg.send_msg(body, kb)

@@ -1,0 +1,233 @@
+#!/usr/bin/lua
+-- TohsakaWrt 网络可用性台账读取与计算
+--
+--   show [--text]   输出可用率报表（默认 HTML，供 Telegram；--text 为纯文本供 CLI）
+--   raw             原样输出台账（排查用）
+--
+-- 台账由 /usr/bin/tohsakawrt-service-watch 每分钟的连通性探测顺带写入，
+-- **只在状态变化时追加一行**（网络正常时零磁盘写入），格式：
+--     <epoch> up      网络恢复
+--     <epoch> down    网络中断
+--     <epoch> boot    路由器本次开机（信息标记，不改变通断状态）
+--
+-- 为什么能从"变化点"算出可用率：
+--   通断状态在两个变化点之间保持不变，所以把落在窗口内的 "down 段" 时长累加
+--   即为断网总时长，不需要每分钟采样。
+--
+-- 已知局限（如实说明，不粉饰）：
+--   路由器断电期间无法写日志，所以"重启导致的离线"只能从开机后的首次探测起算，
+--   会少算断电到开机之间的那段（通常几十秒）。重启会在台账里留下 boot 标记，
+--   报表中单独列出重启次数，避免把重启误读成网络故障。
+
+local LOG = os.getenv("TWR_UPTIME_LOG") or "/etc/tohsakawrt/uptime.log"
+
+local function readfile(p)
+    local f = io.open(p, "r")
+    if not f then return nil end
+    local s = f:read("*a")
+    f:close()
+    return s
+end
+
+local function fmt_dur(sec)
+    sec = math.floor(tonumber(sec) or 0)
+    if sec < 0 then sec = 0 end
+    local h = math.floor(sec / 3600)
+    local m = math.floor((sec % 3600) / 60)
+    local s = sec % 60
+    if h > 0 then return string.format("%d 小时 %d 分", h, m) end
+    if m > 0 then return string.format("%d 分 %d 秒", m, s) end
+    return string.format("%d 秒", s)
+end
+
+local function fmt_ts(t)
+    return os.date("%m-%d %H:%M", t)
+end
+
+local function fmt_ts_full(t)
+    return os.date("%Y-%m-%d %H:%M", t)
+end
+
+-- 读台账
+local events = {}
+local raw_lines = 0
+do
+    local s = readfile(LOG)
+    if s then
+        for line in s:gmatch("[^\r\n]+") do
+            local t, kind = line:match("^(%d+)%s+(%a+)$")
+            if t and (kind == "up" or kind == "down" or kind == "boot") then
+                events[#events + 1] = { t = tonumber(t), kind = kind }
+                raw_lines = raw_lines + 1
+            end
+        end
+    end
+    table.sort(events, function(a, b) return a.t < b.t end)
+end
+
+-- 只取通断事件（boot 不改变状态）
+local transitions = {}
+for _, e in ipairs(events) do
+    if e.kind ~= "boot" then transitions[#transitions + 1] = e end
+end
+
+local boot_count = 0
+for _, e in ipairs(events) do
+    if e.kind == "boot" then boot_count = boot_count + 1 end
+end
+
+-- 某时刻的通断状态（默认视为通：台账之前的时段无记录，按"通"计，对可用率最保守）
+local function state_at(t)
+    local up = true
+    for _, e in ipairs(transitions) do
+        if e.t <= t then up = (e.kind == "up") else break end
+    end
+    return up
+end
+
+-- 窗口内的断网总时长
+local function downtime_in(start_t, end_t)
+    local total = 0
+    local up = state_at(start_t)
+    local cur = start_t
+    for _, e in ipairs(transitions) do
+        if e.t > start_t and e.t <= end_t then
+            if not up then total = total + (e.t - cur) end
+            up = (e.kind == "up")
+            cur = e.t
+        end
+    end
+    if not up then total = total + (end_t - cur) end
+    return total
+end
+
+-- 断网区间列表（成对匹配 down → up）
+local outages = {}
+do
+    local down_start = nil
+    for _, e in ipairs(transitions) do
+        if e.kind == "down" then
+            down_start = e.t
+        elseif e.kind == "up" and down_start then
+            outages[#outages + 1] = { from = down_start, to = e.t }
+            down_start = nil
+        end
+    end
+    if down_start then
+        outages[#outages + 1] = { from = down_start, to = os.time(), ongoing = true }
+    end
+end
+
+local function pct(down, span)
+    if span <= 0 then return nil end
+    local p = (span - down) / span * 100
+    if p < 0 then p = 0 end
+    if p > 100 then p = 100 end
+    return p
+end
+
+local mode = arg[1] or "show"
+local plain = false
+for _, a in ipairs(arg or {}) do
+    if a == "--text" then plain = true end
+end
+
+if mode == "raw" then
+    local s = readfile(LOG)
+    io.write(s or "(台账为空)\n")
+    os.exit(0)
+end
+
+if #transitions == 0 then
+    if plain then
+        print("网络可用性台账")
+        print("尚无足够数据：台账里还没有通断记录（需要等首次状态变化）。")
+        print("台账文件: " .. LOG)
+    else
+        print("📡 <b>网络可用性台账</b>\n━━━━━━━━━━━━━━━━━━\n<i>尚无足够数据：台账里还没有通断记录。</i>")
+    end
+    os.exit(0)
+end
+
+local now = os.time()
+local first_t = events[1].t
+
+local windows = {
+    { label = "最近 24 小时", span = 24 * 3600 },
+    { label = "最近 7 天",    span = 7 * 24 * 3600 },
+    { label = "最近 30 天",   span = 30 * 24 * 3600 },
+}
+
+local L = {}
+local function add(s) L[#L + 1] = s end
+
+if plain then
+    add("网络可用性台账")
+    add(string.rep("=", 46))
+    for _, w in ipairs(windows) do
+        local start = now - w.span
+        if start < first_t then start = first_t end
+        local span = now - start
+        if span >= 60 then
+            local d = downtime_in(start, now)
+            add(string.format("%-12s 可用率 %.3f%%   断网 %s", w.label, pct(d, span), fmt_dur(d)))
+        else
+            add(string.format("%-12s 数据不足（台账才建立 %s）", w.label, fmt_dur(span)))
+        end
+    end
+    local d_all = downtime_in(first_t, now)
+    add(string.format("%-12s 可用率 %.3f%%   断网 %s", "台账全程", pct(d_all, now - first_t), fmt_dur(d_all)))
+    add(string.rep("=", 46))
+    add(string.format("台账起始: %s   状态变化 %d 次   重启 %d 次", fmt_ts_full(first_t), #transitions, boot_count))
+    add(string.format("当前状态: %s", state_at(now) and "通" or "断"))
+    if #outages > 0 then
+        add("")
+        add(string.format("最近 %d 次断网:", math.min(5, #outages)))
+        for i = #outages, math.max(1, #outages - 4), -1 do
+            local o = outages[i]
+            add(string.format("  %s → %s   %s%s", fmt_ts(o.from), o.ongoing and "进行中" or fmt_ts(o.to),
+                fmt_dur(o.to - o.from), o.ongoing and "（尚未恢复）" or ""))
+        end
+    end
+else
+    add("📡 <b>网络可用性台账</b>")
+    add("━━━━━━━━━━━━━━━━━━")
+    for _, w in ipairs(windows) do
+        local start = now - w.span
+        if start < first_t then start = first_t end
+        local span = now - start
+        if span >= 60 then
+            local d = downtime_in(start, now)
+            local p = pct(d, span)
+            local icon = "🟢"
+            if p < 99 then icon = "🟡" end
+            if p < 95 then icon = "🟠" end
+            if p < 90 then icon = "🔴" end
+            add(string.format("%s <b>%s</b>：<code>%.3f%%</code>", icon, w.label, p))
+            add(string.format("    <i>断网 %s</i>", fmt_dur(d)))
+        else
+            add(string.format("⚪ <b>%s</b>：<i>数据不足（台账才建立 %s）</i>", w.label, fmt_dur(span)))
+        end
+    end
+    local d_all = downtime_in(first_t, now)
+    add("━━━━━━━━━━━━━━━━━━")
+    add(string.format("📊 <b>台账全程</b>：<code>%.3f%%</code>  <i>断网 %s</i>", pct(d_all, now - first_t), fmt_dur(d_all)))
+    add("")
+    add(string.format("📝 台账起始 <code>%s</code>", fmt_ts_full(first_t)))
+    add(string.format("   状态变化 <b>%d</b> 次 · 重启 <b>%d</b> 次 · 当前 %s",
+        #transitions, boot_count, state_at(now) and "🟢 通" or "🔴 断"))
+    if #outages > 0 then
+        add("━━━━━━━━━━━━━━━━━━")
+        add(string.format("🕰️ <b>最近 %d 次断网</b>", math.min(5, #outages)))
+        for i = #outages, math.max(1, #outages - 4), -1 do
+            local o = outages[i]
+            add(string.format("• <code>%s → %s</code>  %s%s", fmt_ts(o.from),
+                o.ongoing and "进行中" or fmt_ts(o.to), fmt_dur(o.to - o.from),
+                o.ongoing and " <b>尚未恢复</b>" or ""))
+        end
+    end
+    add("")
+    add("<i>只在通断变化时记录，正常时不产生磁盘写入；重启期间的离线无法计入。</i>")
+end
+
+print(table.concat(L, "\n"))

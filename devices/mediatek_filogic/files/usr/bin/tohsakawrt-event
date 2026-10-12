@@ -1,0 +1,69 @@
+#!/bin/sh
+# TohsakaWrt 网络黑匣子 —— 追加一条事件
+#
+# 用法: tohsakawrt-event <级别> <类别> <来源> <说明...>
+#   级别: info | warn | error | crit
+#   类别: avail | rat | uplink | modem | proxy | bot | alert | sys
+#   来源: 报告者（不含空格），如 watch / heal / uplink / bot
+#
+# 事件格式（一行一条）：
+#   <epoch> <level> <kind> <actor> <message>
+#
+# 设计取舍：
+#   * 纯文本追加写 —— grep/awk 直接可用；写到一半崩溃不会毁掉整个文件；人也能直接读
+#   * 前 4 个字段强制不含空格（非法值会被归一到安全值），所以解析永远只有一种方式；
+#     说明部分是自由文本，可以含空格和中文
+#   * 有事件才写（不是定时写）：正常一天几十到几百次小写入，对闪存无感
+#   * 按【文件大小】触发轮转：用 stat 取大小，不读整个文件内容
+#   * 任何失败都静默吞掉 —— 记录事件绝不能影响调用者的正常逻辑
+#
+# 这个脚本会被频繁调用，所以刻意保持极简（shell 解析大文件的成本与行数相关）。
+
+LOG="${TWR_EVENT_LOG:-/etc/tohsakawrt/events.log}"
+MAX_BYTES="${TWR_EVENT_MAX_BYTES:-1048576}"   # 约 1 MB 触发轮转
+KEEP_LINES="${TWR_EVENT_KEEP_LINES:-8000}"
+
+level="$1"
+kind="$2"
+actor="$3"
+[ $# -ge 4 ] && shift 3 || exit 0
+msg="$*"
+
+# 参数不全就安静退出（绝不报错，避免污染调用者的输出）
+[ -n "$level" ] && [ -n "$kind" ] && [ -n "$actor" ] && [ -n "$msg" ] || exit 0
+
+# 白名单校验：这三个字段一旦含空格就会破坏字段结构，所以非法值归一到安全值
+case "$level" in
+    info|warn|error|crit) ;;
+    *) level=info ;;
+esac
+case "$kind" in
+    *[!a-z]*|'') kind=sys ;;
+esac
+case "$actor" in
+    *[!a-z]*|'') actor=sys ;;
+esac
+
+mkdir -p "$(dirname "$LOG")" 2>/dev/null
+
+# 时间戳：默认用当前时间，但允许调用者用 TWR_EVENT_TS 指定。
+#
+# 为什么需要这个：有些来源是【历史文件】（例如代理核心的 /tmp/openclash.log），
+# 采集器读到的是几小时前的日志行。如果这里强行用当前时间，那些事件会被记成
+# "现在发生的" —— 时间线错位，比不记录更糟（会让因果关联得出完全错误的结论）。
+# 非法值一律回落到当前时间，保证任何情况下都写不出坏时间戳。
+ts="${TWR_EVENT_TS:-}"
+case "$ts" in
+    ''|*[!0-9]*) ts="$(date +%s)" ;;
+esac
+
+printf '%s %s %s %s %s\n' "$ts" "$level" "$kind" "$actor" "$msg" >> "$LOG" 2>/dev/null || exit 0
+
+# 轮转：只取文件大小（stat 不读内容），超过阈值就只保留最近 N 行
+sz="$(stat -c %s "$LOG" 2>/dev/null)"
+case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+if [ "$sz" -gt "$MAX_BYTES" ]; then
+    tail -n "$KEEP_LINES" "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG" 2>/dev/null
+fi
+
+exit 0

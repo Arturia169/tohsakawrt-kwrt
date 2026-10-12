@@ -1,9 +1,50 @@
 -- TohsakaWrt Telegram Engine (High Performance & Resilient)
 local M = {}
 
+-- 注意：这两个 require 必须放在 with_back 之前。
+-- Lua 是词法作用域，若 local core 声明在 with_back 之后，函数体里的 core 会解析成全局 nil。
+local core = require("tohsakawrt.core")
+local json = require("luci.jsonc")
+
+-- Telegram 硬限制：callback_data 为 1~64 字节。
+-- 超长时 Telegram 以 400 BUTTON_DATA_INVALID 拒绝【整条消息】（正文也发不出去），
+-- 而调用方普遍忽略 send_msg 的返回值 → 用户看到的是"点了按钮毫无反应"。
+-- 本项目动态拼接 callback_data 的三处都可能越界：
+--   bot_sys.lua   direct_del:域名 / direct_add_do:域名（域名上限 253 字符）
+--   bot_modem.lua do_band:频段串（用户可输入任意长度）
+-- 故在唯一出口 with_back 统一丢弃超长按钮，牺牲单个按钮而不是整条消息。
+-- 实测：71 字节的 callback_data 返回 {"ok":false,...,"description":"Bad Request: BUTTON_DATA_INVALID"}
+local CB_LIMIT = 64
+
+local function kb_sanitize(inline_kb)
+    if type(inline_kb) ~= "table" then return inline_kb end
+    local out = {}
+    for _, row in ipairs(inline_kb) do
+        if type(row) == "table" then
+            local newrow = {}
+            for _, btn in ipairs(row) do
+                if type(btn) == "table" then
+                    local cb = btn.callback_data
+                    if cb == nil or #tostring(cb) <= CB_LIMIT then
+                        newrow[#newrow + 1] = btn
+                    else
+                        core.log("Tg", string.format(
+                            "丢弃超长 callback_data（%d > %d 字节，否则整条消息会被 Telegram 拒收）：%s",
+                            #tostring(cb), CB_LIMIT, tostring(cb):sub(1, 60)))
+                    end
+                end
+            end
+            -- 整行按钮被丢空时不再输出空数组行（空行同样会被 Telegram 判为非法）
+            if #newrow > 0 then out[#out + 1] = newrow end
+        end
+    end
+    return out
+end
+
 -- 导航兜底：所有内联键盘若没有"返回"类按钮，自动补一个「⬅️ 返回看板」。
 -- 这样每张子卡片都点得回去，且只在这里实现一份（不再逐张卡片手写）。
 -- 已有返回（按钮文字含"返回"）或已有回看板按钮（refresh_status）时不重复添加。
+-- 出口统一经过 kb_sanitize，保证任何调用点都不会因超长 callback_data 让整条消息失败。
 function M.with_back(inline_kb)
     if type(inline_kb) ~= "table" then return inline_kb end
     for _, row in ipairs(inline_kb) do
@@ -12,18 +53,15 @@ function M.with_back(inline_kb)
                 if type(btn) == "table" then
                     local txt = tostring(btn.text or "")
                     if btn.callback_data == "refresh_status" or txt:find("返回", 1, true) then
-                        return inline_kb
+                        return kb_sanitize(inline_kb)
                     end
                 end
             end
         end
     end
     inline_kb[#inline_kb + 1] = { { text = "⬅️ 返回看板", callback_data = "refresh_status" } }
-    return inline_kb
+    return kb_sanitize(inline_kb)
 end
-
-local core = require("tohsakawrt.core")
-local json = require("luci.jsonc")
 
 local CONFIG_NAME = "tohsakawrt-tgbot"
 
@@ -147,6 +185,18 @@ local function api_request(method, payload, timeout, attempt)
             os.execute("sleep " .. tostring(wait))
             return api_request(method, payload, timeout, (attempt or 0) + 1)
         end
+        -- 400 "can't parse entities"：正文里出现了非法 HTML（例如帮助文字写成 <域名>），
+        -- Telegram 会拒收【整条消息】，用户看到的现象是"点了按钮毫无反应"。
+        -- 兜底：去掉 parse_mode 重发一次 —— 格式会丢，但消息必须送达。
+        -- 重发时 payload.parse_mode 已是 nil，不可能无限循环。
+        if code == 400 and payload and payload.parse_mode
+           and desc:find("parse entities", 1, true) then
+            core.log("Tg", "HTML 解析失败，已去掉格式重发: " .. desc)
+            local plain = {}
+            for k, v in pairs(payload) do plain[k] = v end
+            plain.parse_mode = nil
+            return api_request(method, plain, timeout, (attempt or 0) + 1)
+        end
         if code == 401 then
             core.log("Tg", "令牌无效（401），请检查 uci tohsakawrt-tgbot.main.token")
         elseif code == 409 then
@@ -224,7 +274,12 @@ function M.edit_msg(msg_id, text, inline_kb)
         payload.parse_mode = "HTML"
     end
 
-    if inline_kb then
+    if inline_kb == false then
+        -- 显式清空键盘。关键：editMessageText 省略 reply_markup 时旧键盘会【保留】
+        -- （实测返回的 Message 对象里 reply_markup 仍在），传空数组才会删除。
+        -- 确认框点"取消"后若不主动清空，残留的"确认执行"按钮仍可点击 → 取消形同虚设。
+        payload.reply_markup = { inline_keyboard = {} }
+    elseif inline_kb then
         payload.reply_markup = { inline_keyboard = M.with_back(inline_kb) }
     end
 
@@ -252,7 +307,9 @@ function M.answer_and_edit(cb_id, toast, msg_id, text, inline_kb)
         parse_mode = "HTML",
         disable_web_page_preview = true
     }
-    if inline_kb then
+    if inline_kb == false then
+        payload_b.reply_markup = { inline_keyboard = {} }
+    elseif inline_kb then
         payload_b.reply_markup = { inline_keyboard = M.with_back(inline_kb) }
     end
 

@@ -1,0 +1,592 @@
+#!/bin/sh
+# TohsakaWrt 网络黑匣子 —— 从系统日志采集事件（每分钟由巡检调用）
+#
+#   collect          增量：把系统日志里新产生的相关行翻译成事件
+#   import           一次性：把已有台账（uptime.log / 5g-history.log）回溯导入
+#   collect-all      首次运行时先 import 再 collect（供巡检无脑调用）
+#
+# 为什么"翻译系统日志"而不是"改脚本主动上报"：
+#   绝大多数事件本来就写进系统日志了，而且标签统一。翻译的好处是
+#   【完全不碰现有脚本】—— 零回归风险（我们刚修完一批东西，不该再动它们）。
+#   代价是只能看到系统日志的缓冲窗口（约 2 小时），但本脚本每分钟跑一次，
+#   所以不会漏。
+#
+# ------------------------------------------------------------------
+# 采集源维护规则（改本文件前必读）
+# ------------------------------------------------------------------
+#   翻译靠两张【必须同步】的表：
+#     ① do_collect 里 `logread | grep -E '...'` 的标签预过滤表；
+#     ② 紧随其后的 awk 翻译表。
+#   新增一个标签时必须同时改这两处 —— 只加 awk 规则而忘了 grep，日志行在进 awk
+#   之前就被滤掉了，规则永远不会触发，而且【不报任何错】，是这类改动最容易漏的
+#   一步。反过来，grep 里多列标签只是让 awk 多解析几行，没有正确性风险，所以宁可略宽。
+#
+#   已覆盖的标签（← 表示日志的实际来源）：
+#     TohsakaWrt-Watch / TohsakaWrt-Uptime / TohsakaWrt-Band / TohsakaWrt-Temp
+#         ← tohsakawrt-service-watch、tohsakawrt-watch、tohsakawrt-band、tohsakawrt-temp-watch
+#     TohsakaWrt-Uplink / tohsakawrt-modem-heal
+#         ← tohsakawrt-uplink、tohsakawrt-modem-heal、system.lua（Lua 侧转调 uplink 脚本）
+#     Tohsaka-Bot / TohsakaWrt-Clash / Tg / Flowcard
+#         ← bot.lua、tg.lua、tohsakawrt-flowcard-daily（都经 core.lua 的 core.log → logger -t）
+#     TohsakaWrt-Tg / TohsakaWrt-AtLock / TohsakaWrt-Core / TohsakaWrt
+#         ← common.sh、tohsakawrt-at-lock、core.lua（公共库/包装层的自身告警）
+#     Modem[<pid>]  ← usr/share/modem/modem_util.sh 的 m_log（第三方模组包的 hotplug 日志；
+#                     标签带 PID，所以只能按前缀匹配，见下面的 `tag ~ /^Modem\[/`）
+#     TohsakaWrt-Event  ← 本脚本自己
+#
+#   刻意【不】翻译的（噪声大于价值，逐条理由写在各规则旁边的注释里）：
+#     锁争用类 skip 消息、cron 触发、netifd 通用接口日志、
+#     TohsakaWrt-Temp 的 "Invalid CPU temperature reading"（传感器持续异常时每分钟一条）。
+#
+# 去重（本方案唯一的技术难点）：
+#   系统日志没有序号，同一条消息可能在同一秒出现多次，所以不能只靠时间戳判断。
+#   做法是双保险：
+#     ① 用 /tmp 里的"上次处理到的最大时间戳"限定扫描范围（ts >= last）；
+#     ② 生成候选事件后，与 events.log 末尾若干行做【逐行精确比对】，
+#        已存在的不再追加。
+#   ① 用 >= 而不是 >，配合 ② 的精确比对，同一秒内的多条事件既不会重复也不会漏。
+
+EVENT="${TWR_EVENT_BIN:-/usr/bin/tohsakawrt-event}"
+LOG="${TWR_EVENT_LOG:-/etc/tohsakawrt/events.log}"
+MARK="${TWR_EVENT_MARK:-/tmp/tohsakawrt/state/event-collect.mark}"
+IMPORTED="${TWR_EVENT_IMPORTED:-/tmp/tohsakawrt/state/event-imported}"
+UPTIME_LOG="${TWR_UPTIME_LOG:-/etc/tohsakawrt/uptime.log}"
+HISTORY_LOG="${TWR_HISTORY_LOG:-/root/tohsakawrt-logs/5g-history.log}"
+
+mkdir -p "$(dirname "$MARK")" 2>/dev/null
+mkdir -p "$(dirname "$LOG")" 2>/dev/null
+
+# ------------------------------------------------------------------
+# 启动自检：把"静默 0 条"变成时间线上可见的事实
+#
+# 为什么必须有这个（审计报告的第一建议）：
+#   本采集器有三种"不报错但什么都不做"的失效方式 —— awk 没有 mktime、
+#   logread 不支持 -l、events.log 不可写。三者都会让采集静默产出 0 条，
+#   而调用点又是 `>/dev/null 2>&1 || true`，于是**与"安静的夜晚"完全无法区分**。
+#   黑匣子最怕的不是漏记，而是漏记了却让人以为一切正常。
+#   所以每次开机跑一次自检，把结论写成一条事件 —— 至少让"采集器到底有没有工作"
+#   成为时间线上可以看见的事实。
+# ------------------------------------------------------------------
+CHECKED="${TWR_EVENT_CHECKED:-/tmp/tohsakawrt/state/event-selfcheck.done}"
+
+self_check() {
+    [ -e "$CHECKED" ] && return 0
+
+    ok=1; why=""
+
+    # ① awk 的 mktime —— 采集与导入的硬依赖（注意必须用【空格分隔】的形式，
+    #    带冒号的 "21:59:04" 会返回 -1，那是无效格式，不是不支持）
+    t="$(awk 'BEGIN{print mktime("2026 10 09 21 59 04")}' 2>/dev/null)"
+    case "$t" in
+        ''|*[!0-9-]*) ok=0; why="$why awk-mktime" ;;
+        -1)           ok=0; why="$why awk-mktime" ;;
+        -*)           ok=0; why="$why awk-mktime" ;;
+    esac
+
+    # ② logread -l 是否被支持
+    logread -l 1 >/dev/null 2>&1 || { ok=0; why="$why logread-l"; }
+
+    # ③ 事件台账可写
+    mkdir -p "$(dirname "$LOG")" 2>/dev/null
+    ( : >> "$LOG" ) 2>/dev/null || { ok=0; why="$why log-not-writable"; }
+
+    # ④ 系统日志里到底有没有我们关心的行（有的话说明预过滤表没写错）
+    n="$(logread -l 3000 2>/dev/null | grep -cE 'TohsakaWrt-Uplink:|tohsakawrt-modem-heal:|TohsakaWrt-Watch:|Tohsaka-Bot:|TohsakaWrt-Uptime:|TohsakaWrt-Event:|TohsakaWrt-Band:|TohsakaWrt-Tg:|TohsakaWrt-AtLock:|TohsakaWrt-Cleanup:|\[modem[0-9]+\]|netifd: Interface|EXT4-fs')"
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+
+    if [ "$ok" -eq 1 ]; then
+        "$EVENT" info sys collect "采集器自检通过（awk mktime / logread -l / 台账可写；窗口内可采行 $n 条）"
+    else
+        "$EVENT" error sys collect "采集器自检失败:$why —— 采集可能静默无效，请检查"
+    fi
+
+    : > "$CHECKED" 2>/dev/null
+    return 0
+}
+
+# 按大小触发轮转。写入端（tohsakawrt-event）也有同样的逻辑，但采集器是直接
+# 追加到 LOG 的、不经过写入端，所以这里必须自己也做一次 —— 否则当只有采集器在写时
+# events.log 会无界增长（审计发现 R1）。
+rotate_if_needed() {
+    sz="$(stat -c %s "$LOG" 2>/dev/null)"
+    case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+    if [ "$sz" -gt "${TWR_EVENT_MAX_BYTES:-1048576}" ]; then
+        tail -n "${TWR_EVENT_KEEP_LINES:-8000}" "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG" 2>/dev/null
+    fi
+}
+
+# ------------------------------------------------------------------
+# 追加：逐行精确去重后再写
+#
+# 返回值语义：0 = 追加成功（可以推进 mark）；1 = 写入失败（【不能】推进 mark）
+# ⚠️ 为什么必须区分：如果 events.log 不可写（例如闪存写满），而 mark 照常推进，
+# 这批事件就既不落盘、也永远不会被重试 —— 静默永久丢失（审计发现 S2）。
+# ------------------------------------------------------------------
+append_dedup() {
+    cand="$1"
+    [ -s "$cand" ] || { rm -f "$cand"; return 0; }
+
+    # 取 events.log 末尾若干行做"已存在"指纹。
+    # 用 1000 行：去重窗口必须【不小于】一次重扫可能产出的事件数。
+    # 早先用 300 行，而 mark 归零（重启后 /tmp 被清）时会重扫整个 logread 缓冲，
+    # 一旦缓冲里的事件数超过 300，多出来的就会被当成新事件重复写入 ——
+    # 实测 350 条事件产生 50 条重复、900 条产生 600 条重复（审计发现 D1）。
+    seen="$(mktemp)"
+    tail -n 1000 "$LOG" 2>/dev/null > "$seen"
+
+    # ⚠️ 这里不能用 `NR==FNR` 判断文件边界：当第一个文件为【空】时
+    # （首次运行、事件文件尚不存在），第二个文件的每条记录都满足 NR==FNR，
+    # 于是全部被当成"已存在"而丢掉 —— 整个采集会静默产出 0 条。
+    # 所以显式传入第一个文件的行数，用 NR<=n 划分边界。
+    n="$(wc -l < "$seen" 2>/dev/null)"
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+
+    rc=0
+    # ⚠️ 候选之间也必须互比（审计发现 D2）：
+    # 早先只把 seen 装进 s[]，候选自己从不入表，于是【同一批里两条完全相同的候选
+    # 会双双写入】。实测：两条同秒的相同系统日志被同一批翻译出来 → 台账出现重复行。
+    # 现在写入后立刻把该行记进 s[]，后续相同候选自然被 !s[$0] 挡掉。
+    awk -v n="$n" 'NR<=n { s[$0]=1; next } !s[$0] { print; s[$0]=1 }' "$seen" "$cand" >> "$LOG" 2>/dev/null || rc=1
+
+    rm -f "$seen" "$cand"
+
+    if [ "$rc" -ne 0 ]; then
+        logger -t TohsakaWrt-Event "写入事件台账失败（可能闪存已满），已保留读取位置以便下轮重试"
+        return 1
+    fi
+
+    rotate_if_needed
+    return 0
+}
+
+# ------------------------------------------------------------------
+# 回溯导入：把已有台账变成事件（只在首次运行时做一次）
+# ------------------------------------------------------------------
+do_import() {
+    [ -e "$IMPORTED" ] && return 0
+
+    tmp="$(mktemp)"
+
+    # --- uptime.log: "<epoch> boot|up|down" ---
+    # 注意格式串里字段之间【只能有一个空格】：早先为了源码对齐写成 "info  avail"
+    # （两个空格），虽然读取器容错、但会让严格解析器判为坏行，也污染了台账。
+    sources_ok=0
+    if [ -r "$UPTIME_LOG" ]; then
+        sources_ok=1
+        awk '{
+            ts = $1 + 0
+            if (ts <= 0) next
+            st = $2
+            if (st == "boot")      printf "%d info avail import 台账导入：路由器本次开机\n", ts
+            else if (st == "up")   printf "%d info avail import 台账导入：网络恢复\n", ts
+            else if (st == "down") printf "%d warn avail import 台账导入：网络中断\n", ts
+        }' "$UPTIME_LOG" >> "$tmp"
+    fi
+
+    # --- 5g-history.log: "MM-DD HH:MM:SS | STATE | 运营商 | 制式 | 频段" ---
+    # 注意：这份台账【没有年份】，所以按当前年推断；若算出的是未来时间则退一年。
+    if [ -r "$HISTORY_LOG" ]; then
+        sources_ok=1
+        awk -v now="$(date +%s)" -F'|' '
+        BEGIN { y = strftime("%Y") + 0 }
+        {
+            gsub(/^[ \t]+|[ \t]+$/, "", $1)
+            gsub(/^[ \t]+|[ \t]+$/, "", $2)
+            gsub(/^[ \t]+|[ \t]+$/, "", $4)
+            gsub(/^[ \t]+|[ \t]+$/, "", $5)
+            split($1, d, "-")      # "10-04 06:33:24" → d[1]="10"(月) d[2]="04 06:33:24"
+            split(d[2], rest, " ") # → rest[1]="04"(日) rest[2]="06:33:24"(时间)
+            split(rest[2], t, ":") # → "06" "33" "24"   （注意是 rest[2]，不是 rest[1]）
+            if (d[1] == "" || rest[1] == "" || rest[2] == "") next
+            mm = d[1] + 0
+            dd = rest[1] + 0
+            ts = mktime(sprintf("%d %d %d %s %s %s", y, mm, dd, t[1], t[2], t[3]))
+            if (ts > now) ts = mktime(sprintf("%d %d %d %s %s %s", y - 1, mm, dd, t[1], t[2], t[3]))
+            if (ts <= 0) next
+            st = $2
+            info = $4 " " $5
+            if (st == "5G_TO_4G")        printf "%d warn rat import 制式降级 5G→4G（%s）\n", ts, info
+            else if (st == "4G_TO_5G")   printf "%d info rat import 制式恢复 4G→5G（%s）\n", ts, info
+            else if (st ~ /^INITIAL_/)   printf "%d info rat import 首次记录制式 %s（%s）\n", ts, substr(st, 9), info
+        }' "$HISTORY_LOG" >> "$tmp"
+    fi
+
+    # 没有任何源可读（例如 U 盘未挂载导致 5g-history.log 读不到）：
+    # 【不创建标记】，否则会被标记成"已导入"，整个开机周期再也不重试（审计发现 I2）。
+    if [ "$sources_ok" -eq 0 ]; then
+        rm -f "$tmp" 2>/dev/null
+        return 0
+    fi
+
+    n_before="$(wc -l < "$LOG" 2>/dev/null)"
+    case "$n_before" in ''|*[!0-9]*) n_before=0 ;; esac
+
+    # 导入的事件也走同一套去重，避免与已有内容重复
+    sort -n "$tmp" 2>/dev/null > "$tmp.s" || cp "$tmp" "$tmp.s"
+    if ! append_dedup "$tmp.s"; then
+        # 写入失败：不创建标记、不推进任何状态，下轮重试（审计发现 S2 同类问题）
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+    rm -f "$tmp"
+
+    n_after="$(wc -l < "$LOG" 2>/dev/null)"
+    case "$n_after" in ''|*[!0-9]*) n_after=0 ;; esac
+    imported=$((n_after - n_before))
+
+    : > "$IMPORTED" 2>/dev/null
+
+    # 只有【真的导入了事件】才记日志。空导入也 logger 的话，采集器会把它翻译成一条
+    # 事件，于是时间线"自己给自己作伪证"说导入成功了（审计发现 I3）。
+    if [ "$imported" -gt 0 ]; then
+        logger -t TohsakaWrt-Event "已回溯导入历史台账（$imported 条）"
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------
+# 增量采集：翻译系统日志
+# ------------------------------------------------------------------
+do_collect() {
+    last="$(cat "$MARK" 2>/dev/null)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+
+    cand="$(mktemp)"
+    markout="$(mktemp)"
+
+    # 先用 grep 把无关的日志行滤掉，再交给 awk。
+    # 这一步很重要：awk 里每行都要解析日期（mktime），而日志里绝大多数行与我们无关
+    # （cron、dropbear、ucitrack 等）。grep 是 C 实现、极快，先滤一遍能让 awk 的工作量
+    # 降到 5% 左右 —— 实测巡检链因此从 1.45 秒/分钟回到 1.25 秒量级。
+    #
+    # ⚠️ 下面这张表必须与紧接着的 awk 翻译表【同步增删】。只加 awk 规则而漏了这里，
+    #    规则永远不会被触发（日志行在进 awk 之前就被滤掉了），而且【不报任何错】。
+    #
+    # 为什么分两类写法：
+    #   ① 固定标签 —— 我们自己的脚本，`logger -t` 的标签是常量，按标签滤最省、最准。
+    #   ② 消息内容片段 —— 系统组件的标签要么不可靠、要么太宽：
+    #        * ModemManager 的 syslog 标识里带 PID（形如 `[19547]:`，模组一重启就变），
+    #          按标签滤必然漏掉，所以改滤它消息体里稳定出现的对象标记 `[modem0]`。
+    #        * kernel / netifd / hostapd / procd 的标签太宽（kernel 会被 mt76/USB 刷屏、
+    #          netifd 每次 DHCP 租约都打一行、procd 每次服务启停都打），只滤我们真正
+    #          要翻译的那句短语，既不漏又不牺牲过滤效率。
+    # 刻意【不】列进表里的（纯噪声，见任务清单）：ucitrack（实测每窗口 180 条纯配置
+    # 依赖记录）、cron.info（每分钟触发）、netifd 的 udhcpc 租约、普通内核刷屏。
+    logread -l 3000 2>/dev/null \
+      | grep -E \
+          -e 'TohsakaWrt-Uplink:' \
+          -e 'tohsakawrt-modem-heal:' \
+          -e 'TohsakaWrt-Watch:' \
+          -e 'Tohsaka-Bot:' \
+          -e 'TohsakaWrt-Uptime:' \
+          -e 'TohsakaWrt-Event:' \
+          -e 'TohsakaWrt-Band:' \
+          -e 'TohsakaWrt-Temp:' \
+          -e 'TohsakaWrt-Tg:' \
+          -e 'TohsakaWrt-AtLock:' \
+          -e 'TohsakaWrt-Core:' \
+          -e 'TohsakaWrt-Clash:' \
+          -e 'TohsakaWrt-Cleanup:' \
+          -e 'TohsakaWrt:' \
+          -e 'Tg:' \
+          -e 'Flowcard:' \
+          -e 'Modem\[' \
+          -e '\[modem[0-9]+\]' \
+          -e 'netifd: Interface' \
+          -e 'EXT4-fs' \
+          -e 'mount failed' \
+          -e 'AP-STA-' \
+          -e 'not stopped on SIGTERM' \
+      | awk -v last="$last" -v markout="$markout" '
+    BEGIN {
+        split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mn, " ")
+        for (i = 1; i <= 12; i++) mon[mn[i]] = i
+        maxseen = 0
+    }
+
+    function emit(ts, lvl, knd, act, m) {
+        if (m == "") return
+        printf "%d %s %s %s %s\n", ts, lvl, knd, act, m
+    }
+
+    # 出口(uplink)规则集中在一处：同一批消息在实机上出现过两种标签 ——
+    # 较新的脚本用 TohsakaWrt-Uplink，旧版本/其它调用点用裸 TohsakaWrt。
+    # 两条标签分支共用这一份规则，避免两处各写一遍后慢慢走样。
+    # 顺序即优先级：原先验证过的 5 条规则【原样保留在最前】，新增的一律排在后面，
+    # 这样老消息的翻译结果逐字节不变。
+    function uplink_rules(ts, msg) {
+        if (msg ~ /^Uplink switched to 5G/)         { emit(ts, "info", "uplink", "uplink", "出口切到 5G"); return 1 }
+        if (msg ~ /^Uplink switched to WAN/)        { emit(ts, "info", "uplink", "uplink", "出口切到 有线宽带"); return 1 }
+        if (msg ~ /^Uplink drift detected/)         { emit(ts, "info", "uplink", "uplink", "出口漂移，已重新应用期望出口"); return 1 }
+        # ⚠️ 这里必须区分两种原因。uplink 脚本会打两种 "Reconcile skipped"：
+        #   ① temporary fallback is active  —— 临时回退生效中（正常，不校正）
+        #   ② cooling down after a failed attempt —— 上次切换失败后的冷却
+        # 早先只用 /^Reconcile skipped/ 笼统匹配，把 ② 也写成"临时回退生效中" —— 那是错标。
+        # 错标比漏标更糟：它会让人以为"只是临时回退"，而实际是"刚失败过、正在冷却"。
+        if (msg ~ /^Reconcile skipped: temporary fallback/) { emit(ts, "info", "uplink", "uplink", "临时回退生效中，暂不校正出口"); return 1 }
+        if (msg ~ /^Reconcile skipped: cooling down/)      { emit(ts, "warn", "uplink", "uplink", "上次出口切换失败，冷却中，暂不重试"); return 1 }
+        if (msg ~ /^Reconcile skipped/)                    { emit(ts, "info", "uplink", "uplink", msg); return 1 }
+        if (msg ~ /Restored 5G default routes/)     { emit(ts, "warn", "uplink", "uplink", "宽带校验失败，已恢复 5G 路由"); return 1 }
+        if (msg ~ /route validation failed/)        { emit(ts, "warn", "uplink", "uplink", msg); return 1 }
+        if (msg ~ /connectivity probe failed/)      { emit(ts, "warn", "uplink", "uplink", msg); return 1 }
+        if (msg ~ /预检未通过/)                     { emit(ts, "warn", "uplink", "uplink", msg); return 1 }
+        if (msg ~ /^Another switch is in progress/) { emit(ts, "warn", "uplink", "uplink", msg); return 1 }
+        if (msg ~ /^uplink script returned nothing/) { emit(ts, "error", "uplink", "uplink", msg); return 1 }
+        return 0
+    }
+
+    {
+        # 系统日志格式: Fri Oct  9 21:59:04 2026 user.notice TAG: message
+        m = mon[$2]
+        if (m == 0) next
+        split($4, t, ":")
+        ts = mktime(sprintf("%s %02d %02d %s %s %s", $5, m, $3, t[1], t[2], t[3]))
+        if (ts <= 0) next
+        if (ts < last) next
+        if (ts > maxseen) maxseen = ts
+
+        # 拼出 "TAG: message"
+        rest = $7
+        for (i = 8; i <= NF; i++) rest = rest " " $i
+        tag = rest; sub(/:.*$/, "", tag)
+        msg = rest; sub(/^[^:]*:[ ]*/, "", msg)
+        if (msg == "") next
+
+        # ---- 出口 / 出口脚本 ----
+        if (tag == "TohsakaWrt-Uplink") {
+            uplink_rules(ts, msg)
+        }
+        else if (tag == "TohsakaWrt") {
+            # 裸标签下混着两类消息：tohsakawrt-uplink 旧版本打的出口日志，
+            # 以及 common.sh 里 twr_timeout 的"缺少 timeout"告警。
+            # 两者都在这一个标签下，所以必须都认，否则会丢掉一半。
+            if (!uplink_rules(ts, msg)) {
+                if (msg ~ /timeout 缺失/) emit(ts, "warn", "sys", "core", msg)
+            }
+        }
+
+        # ---- 模组自愈 ----
+        else if (tag == "tohsakawrt-modem-heal") {
+            if (msg ~ /AT 端口漂移/)                   emit(ts, "info", "modem", "heal", msg)
+            else if (msg ~ /连续 [0-9]+ 次读取失败/)    emit(ts, "warn", "modem", "heal", msg)
+            else if (msg ~ /回收 [0-9]+ 个孤立/)        emit(ts, "info", "modem", "heal", msg)
+            else if (msg ~ /restarted ModemManager|enabled modem/) emit(ts, "info", "modem", "heal", "重启 ModemManager 并启用模组")
+            else if (msg ~ /被网络侧拒绝/)              emit(ts, "warn", "modem", "heal", msg)
+            else if (msg ~ /ICCID 实时读取失败/)        emit(ts, "info", "modem", "heal", msg)
+            else if (msg ~ /5G data heal \(Stage/)     emit(ts, "info", "modem", "heal", msg)
+            # ⚠️ 修正：老规则里写的是"复位额度已【用完】"，而脚本实际打的是
+            # "5G 射频复位额度已【用尽】"（modem-heal 第 554 行）—— 一字之差，
+            # 这条规则在真机上从来没命中过。现在把真实措辞并进同一条规则，
+            # 同时保留 reset-exhausted（英文变体）与旧的"已用完"以防将来措辞回退。
+            else if (msg ~ /reset-exhausted|射频复位额度已用尽|复位额度已用完/) emit(ts, "error", "modem", "heal", msg)
+            # 回落宽带 = 5G 已经不通，只能靠有线兜底，属于真实的可用性降级
+            else if (msg ~ /^已回落到有线宽带/)         emit(ts, "warn", "modem", "heal", msg)
+            # 回落失败 = 5G 不通且有线也没接上，此刻【没有任何可用出口】，是全脚本最重的一条
+            else if (msg ~ /^回落宽带失败/)             emit(ts, "error", "modem", "heal", msg)
+            else if (msg ~ /^持久化的 AT 口/)           emit(ts, "info", "modem", "heal", msg)
+            else if (msg ~ /^AT 端口候选/)              emit(ts, "warn", "modem", "heal", msg)
+            else if (msg ~ /^skipped ModemManager restart/) emit(ts, "info", "modem", "heal", msg)
+            else if (msg ~ /^No modem index found/)     emit(ts, "error", "modem", "heal", msg)
+            else if (msg ~ /^Modem [0-9]+:/)            emit(ts, "info", "modem", "heal", msg)
+            else if (msg ~ /^5G data heal paused|^接码卡已识别|^ICCID 读取失败，按数据卡处理|^已恢复数据自愈/) emit(ts, "info", "modem", "heal", msg)
+            # 5G 正在承载主出口却又探测不通时，脚本按策略不动手 —— 这是"看着坏但不救"的状态，
+            # 时间线上必须留痕（否则事后完全看不出这段时间 5G 是断的）。
+            else if (msg ~ /^5G data heal skipped/)     emit(ts, "warn", "modem", "heal", msg)
+            else if (msg ~ /^Lock held by LIVE pid|^Dead lock pid is recent/) emit(ts, "warn", "sys", "heal", msg)
+            else if (msg ~ /^Unable to (create|reacquire|write|remove)/) emit(ts, "error", "sys", "heal", msg)
+        }
+
+        # ---- 巡检 / 服务看门狗 ----
+        else if (tag == "TohsakaWrt-Watch") {
+            if (msg ~ /^5G degraded to 4G/)            emit(ts, "warn", "rat", "watch", "制式降级 5G→4G（" substr(msg, 19) "）")
+            else if (msg ~ /^5G recovered/)            emit(ts, "info", "rat", "watch", "制式恢复 4G→5G（" substr(msg, 14) "）")
+            else if (msg ~ /^WAN interface switched/)  emit(ts, "info", "uplink", "watch", msg)
+            else if (msg ~ /网络已恢复|WAN recovered/)  emit(ts, "info", "avail", "watch", msg)
+            # ⚠️ 修正：OpenClash 写进系统日志的消息是【英文】的
+            # （"OpenClash recovered after 3m12s"），中文"已恢复"只出现在 TG 正文里，
+            # 所以老规则 /OpenClash 已恢复/ 在真机上从来没命中过。
+            # 现在把英文措辞并进同一条规则，同时保留中文以防将来措辞变化。
+            else if (msg ~ /OpenClash 已恢复|^OpenClash recovered after/) emit(ts, "info", "proxy", "watch", msg)
+            else if (msg ~ /^WAN offline after/)       emit(ts, "warn", "avail", "watch", msg)
+            else if (msg ~ /^OpenClash core process disappeared/) emit(ts, "error", "proxy", "watch", msg)
+            else if (msg ~ /^Boot notification processed/) emit(ts, "info", "avail", "watch", "设备上线（开机自检完成）")
+            else if (msg ~ /^Mobile initial state/)    emit(ts, "info", "rat", "watch", msg)
+            else if (msg ~ /^WAN IP changed|^WAN IPv6 changed/) emit(ts, "info", "uplink", "watch", msg)
+            else if (msg ~ /^New device detected/)     emit(ts, "info", "sys", "watch", msg)
+            else if (msg ~ /^High traffic alert triggered|^High traffic finished/) emit(ts, "info", "sys", "watch", msg)
+            else if (msg ~ /^Lock held by LIVE pid|^Dead lock pid is recent/) emit(ts, "warn", "sys", "watch", msg)
+            else if (msg ~ /^Unable to (create|reacquire|write|remove)/) emit(ts, "error", "sys", "watch", msg)
+        }
+
+        # ---- 机器人：用户操作可追溯 ----
+        else if (tag == "Tohsaka-Bot") {
+            if (msg ~ /用时 [0-9.]+ 秒/)                emit(ts, "info", "bot", "bot", msg)
+            else if (msg ~ /Starting TohsakaWrt Telegram Bot/) emit(ts, "info", "bot", "bot", "机器人已启动")
+            # "Command: /xxx 参数" 是【带参数】的原始命令（长数字已被机器人自己脱敏成
+            # [masked-number]），而上面那条"用时"只记了命令名、丢了参数。
+            # 事后追查"谁在几点加了哪条直连规则"只能靠这一条，所以宁可多留一行。
+            else if (msg ~ /^Command: /)                emit(ts, "info", "bot", "bot", msg)
+            else if (msg ~ /^Rejected update from unauthorized chat/) emit(ts, "warn", "bot", "bot", msg)
+            else if (msg ~ /^Callback error:|^Command error:/) emit(ts, "error", "bot", "bot", msg)
+            else if (msg ~ /^Bot disabled or unconfigured/) emit(ts, "info", "bot", "bot", "机器人未启用或未配置，进程退出")
+        }
+
+        # ---- 可用性台账 ----
+        else if (tag == "TohsakaWrt-Uptime") {
+            if (msg ~ /网络状态变化/)                   emit(ts, "info", "avail", "uptime", msg)
+        }
+
+        # ---- 本采集器自己 ----
+        else if (tag == "TohsakaWrt-Event") {
+            if (msg ~ /已回溯导入/)                     emit(ts, "info", "sys", "event", "已回溯导入历史台账")
+        }
+
+        # ---- 频段锁定 ----
+        else if (tag == "TohsakaWrt-Band") {
+            if (msg ~ /^Band lock applied/)             emit(ts, "info", "rat", "band", msg)
+            else if (msg ~ /^Band lock verified stable/) emit(ts, "info", "rat", "band", msg)
+            else if (msg ~ /^Band lock failed the probe/) emit(ts, "warn", "rat", "band", msg)
+            else if (msg ~ /^Band restored/)            emit(ts, "info", "rat", "band", msg)
+        }
+
+        # ---- CPU 温度 ----
+        # 归 alert 而不是 sys：这是唯一会直接导致设备降频/重启的硬件告警。
+        else if (tag == "TohsakaWrt-Temp") {
+            if (msg ~ /^CRITICAL CPU temperature/)      emit(ts, "crit", "alert", "temp", msg)
+            else if (msg ~ /^WARNING CPU temperature/)  emit(ts, "warn", "alert", "temp", msg)
+            else if (msg ~ /^CPU temperature recovered to/) emit(ts, "info", "alert", "temp", msg)
+            # "Invalid CPU temperature reading" 刻意不翻译：传感器持续异常时会每分钟一条
+            # （1440 条/天），而它本身没有可运维的动作价值。
+        }
+
+        # ---- 告警投递通道本身 ----
+        # 归 alert：投递失败意味着"用户以为会收到告警却什么都没收到"，
+        # 这类静默失效必须能事后从时间线上看出来。
+        else if (tag == "TohsakaWrt-Tg") {
+            if (msg ~ /^send_tg 未发送/)                emit(ts, "warn", "alert", "tg", msg)
+            else if (msg ~ /^send_tg 投递失败/)         emit(ts, "warn", "alert", "tg", msg)
+        }
+
+        # ---- AT 串口互斥锁 ----
+        # 归 modem 而不是 sys：AT 锁争用曾经是真实的故障源（拿不到锁 → 模组操作全部失败）。
+        else if (tag == "TohsakaWrt-AtLock") {
+            if (msg ~ /^警告: / || msg ~ /等待 AT 锁超时/) emit(ts, "warn", "modem", "atlock", msg)
+        }
+
+        # ---- 公共库自身的降级告警 ----
+        else if (tag == "TohsakaWrt-Core") {
+            if (msg ~ /timeout 缺失/)                   emit(ts, "warn", "sys", "core", msg)
+        }
+
+        # ---- 代理核心 ----
+        else if (tag == "TohsakaWrt-Clash") {
+            if (msg ~ /拒绝非法的代理模式/)             emit(ts, "warn", "proxy", "bot", msg)
+        }
+
+        # ---- U 盘陈旧 rootfs 清理 ----
+        # 该标签是专用标签、只有这一条消息，所以整条标签无条件翻译，不做消息匹配 ——
+        # 少一处正则就少一处编码/措辞变化导致静默失效的机会。
+        else if (tag == "TohsakaWrt-Cleanup") {
+            emit(ts, "info", "sys", "cleanup", msg)
+        }
+
+        # ---- 机器人调用 Telegram API 的自身错误 ----
+        else if (tag == "Tg") {
+            if (msg ~ /令牌无效（401）/)                emit(ts, "error", "sys", "tg", msg)
+            else if (msg ~ /getUpdates 冲突（409）/)    emit(ts, "error", "sys", "tg", msg)
+            else if (msg ~ /被限流（429）/)             emit(ts, "warn", "sys", "tg", msg)
+            else if (msg ~ /^API response parse error/) emit(ts, "warn", "sys", "tg", msg)
+            else if (msg ~ /^API error: /)              emit(ts, "warn", "sys", "tg", msg)
+            else if (msg ~ /^answer_and_edit: /)        emit(ts, "warn", "sys", "tg", msg)
+            else if (msg ~ /丢弃超长 callback_data/)    emit(ts, "warn", "sys", "tg", msg)
+        }
+
+        # ---- 流量卡日报 ----
+        # 只采"日报失败/未配置"：余额与用量的异常判定结果只推 TG，不写系统日志，
+        # 所以那部分数据这个采集器拿不到（见文件头注释与交付报告）。
+        else if (tag == "Flowcard") {
+            if (msg ~ /^流量卡号未配置/)                emit(ts, "warn", "sys", "flowcard", msg)
+            else if (msg ~ /^Daily report failed/)      emit(ts, "error", "sys", "flowcard", msg)
+        }
+
+        # ---- 系统组件：接口 up/down ----
+        else if (tag == "netifd") {
+            if (msg ~ /is now down/)                    emit(ts, "warn", "avail", "netifd", msg)
+            else if (msg ~ /is now up/)                 emit(ts, "info", "avail", "netifd", msg)
+        }
+
+        # ---- 系统组件：WiFi 客户端上下线 ----
+        else if (tag == "hostapd") {
+            if (msg ~ /AP-STA-CONNECTED/)               emit(ts, "info", "sys", "hostapd", msg)
+            else if (msg ~ /AP-STA-DISCONNECTED/)       emit(ts, "info", "sys", "hostapd", msg)
+        }
+
+        # ---- 系统组件：文件系统 / USB 存储 ----
+        # 普通挂载成功的消息刻意不翻译（每次插拔/开机都有，纯噪声）。
+        else if (tag == "kernel") {
+            if (msg ~ /EXT4-fs error/)                  emit(ts, "crit", "sys", "kernel", msg)
+            else if (msg ~ /mount failed/)              emit(ts, "error", "sys", "kernel", msg)
+        }
+
+        # ---- 系统组件：服务启停异常 ----
+        # 正常的 started/stopped 不翻译（每次重启一大串），只翻译"杀不掉"这种异常。
+        else if (tag == "procd") {
+            if (msg ~ /not stopped on SIGTERM/)         emit(ts, "warn", "sys", "procd", msg)
+        }
+
+        # ---- 第三方模组包的 hotplug 日志（usr/share/modem/modem_util.sh 的 m_log）----
+        # 标签形如 Modem[12345]（带 PID），所以按前缀匹配。
+        # 这几条直接回答"模组/USB 网卡什么时候被摘掉、什么时候重新配置好"，
+        # 是 AT 口漂移、5G 掉线类故障的关键上下文。
+        else if (tag ~ /^Modem\[[0-9]+\]$/) {
+            if (msg ~ /Configuration Modem.* successful/) emit(ts, "info", "modem", "hotplug", msg)
+            else if (msg ~ / removed$/)                 emit(ts, "warn", "modem", "hotplug", msg)
+            else if (msg ~ /Try again to configure|Successfully retrying to configure/) emit(ts, "warn", "modem", "hotplug", msg)
+        }
+
+        # ---- ModemManager ----
+        # 它的 syslog 标识里带 PID（模组一重启就变），所以上面的 tag == 比较全都匹配不到它，
+        # 只能靠消息体里稳定出现的 [modem0] 对象标记识别。
+        # 这一支必须放在【最后】：只有前面所有固定标签都没命中时才轮到它，
+        # 这样绝不会误吃自家脚本的消息（自家消息里不含 [modemN]）。
+        else if (tag ~ /^\[[0-9]+\]$/ || tag ~ /^ModemManager\[/ || msg ~ /\[modem[0-9]+\]/) {
+            # "consolidated registration state" 是每次状态汇总都打一行的噪声，显式排除。
+            if (msg !~ /consolidated registration state/) {
+                # 只认箭头【右侧】的新状态：写成 (attached -> detached) 才是掉线，
+                # 反向的 (detached -> attached) 是恢复，不能因为出现 detached 就报 warn。
+                if (msg ~ /forced PS detach|-> *(detached|searching|registering|denied)/)
+                    emit(ts, "warn", "modem", "mm", msg)
+                else if (msg ~ /state changed|technology changed|enabled modem|disabled modem/)
+                    emit(ts, "info", "modem", "mm", msg)
+            }
+        }
+
+    }
+
+    END { if (maxseen > 0) print maxseen > markout }
+    ' > "$cand" 2>/dev/null
+
+    # ⚠️ 只有写入成功才推进 mark。若 events.log 不可写（例如闪存写满）却推进了 mark，
+    # 这批事件就既不落盘、也永远不会被重试 —— 静默永久丢失（审计发现 S2）。
+    if append_dedup "$cand"; then
+        if [ -s "$markout" ]; then
+            mv "$markout" "$MARK" 2>/dev/null || cp "$markout" "$MARK" 2>/dev/null
+        fi
+    else
+        logger -t TohsakaWrt-Event "本轮事件未写入，保留读取位置待下轮重试"
+    fi
+    rm -f "$markout"
+
+    return 0
+}
+
+case "${1:-collect-all}" in
+    import)      do_import ;;
+    collect)     do_collect ;;
+    # 每次开机先自检一次（自检结果本身就是时间线上的一条事件），再导入、再增量采集
+    collect-all) self_check; do_import; do_collect ;;
+    selfcheck)   rm -f "$CHECKED" 2>/dev/null; self_check ;;
+    *)           echo "用法: $0 {import|collect|collect-all|selfcheck}" >&2; exit 1 ;;
+esac
+
+exit 0

@@ -140,6 +140,62 @@ send_tg() {
     return 1
 }
 
+# ==========================================================
+# 有界执行：任何外部命令都应经此包装，绝不裸调
+# ==========================================================
+# 必须用 -s KILL 而不是默认的 SIGTERM：阻塞在驱动 read 中的子进程会忽略 SIGTERM，
+# BusyBox timeout 转而一直等待子进程，把阻塞传染给父进程 —— 那不是真兜底。
+# 实测：timeout -s KILL 2 sh -c 'cat </dev/ttyUSB3' 在 2.004 秒内成功打断串口读。
+twr_timeout() {
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -s KILL "$secs" "$@"
+    else
+        # 不静默降级：缺少 timeout 时必须留痕，否则会退化成无界执行且无人知晓
+        logger -t TohsakaWrt "警告: timeout 缺失，本次为无界执行: $*"
+        "$@"
+    fi
+}
+
+# ==========================================================
+# 锁回收：识别"仍然活着但已经卡死"的持锁者
+# ==========================================================
+# 三个锁实现原先都只检查 kill -0：进程活着就无条件跳过。
+# 于是一个活着但永久阻塞的进程会永久占住锁，只能靠重启路由器恢复。
+# 这里叠加一个年龄硬上限作为兜底（配合有界执行，正常单次运行远不会达到）。
+TWR_LOCK_MAX_AGE="${TWR_LOCK_MAX_AGE:-300}"
+
+twr_lock_age() {
+    local dir="$1" mtime now
+    mtime="$(stat -c %Y "$dir" 2>/dev/null)"
+    now="$(date +%s 2>/dev/null)"
+    case "$mtime:$now" in
+        *[!0-9:]*) echo 0 ;;
+        *) echo $((now - mtime)) ;;
+    esac
+}
+
+twr_lock_is_hung() {
+    [ "$(twr_lock_age "$1")" -ge "$TWR_LOCK_MAX_AGE" ]
+}
+
+# ==========================================================
+# 非阻塞告警投递
+# ==========================================================
+# 告警恰恰在网络故障时触发，而 send_tg 最坏约 21 秒（curl -m 10 重试 2 次 + sleep 1）。
+# service-watch 一次运行可顺序触发多条告警（公网 IP 变更、IPv6 变更、新设备接入互不排斥），
+# 串行投递会超过 60 秒 cron 间隔，导致 crond 拒绝重入、整套巡检停摆。
+# 后台投递保留 send_tg 原有的重试与送达校验，只是不再阻塞调用方。
+send_tg_bg() {
+    send_tg "$@" &
+}
+
+# push_bark 同样是同步阻塞（curl -m 10）。与 send_tg_bg 配对使用，
+# 避免"告警投递"把持锁中的巡检拖过 cron 间隔。
+push_bark_bg() {
+    push_bark "$@" &
+}
+
 html_escape() {
     printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
 }

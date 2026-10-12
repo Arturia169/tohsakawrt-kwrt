@@ -7,14 +7,15 @@ package.preload["tohsakawrt.core"] = function()
             commands[#commands + 1] = command
             return "OK"
         end,
-        exec = function() return "" end
+        -- 新实现把直连管理统一到 /usr/bin/tohsakawrt-clash-direct，且用 core.exec 调用
+        exec = function(command) commands[#commands + 1] = command; return "OK" end
     }
 end
 package.preload["luci.jsonc"] = function() return { parse = function() return {} end } end
 
 local clash = require("tohsakawrt.clash")
 assert(clash.direct_add("example.com") == "OK", "valid target must be passed to the helper")
-assert(commands[1] == "/usr/bin/tohsaka-direct add 'example.com' 2>/dev/null",
+assert(commands[1] == "/usr/bin/tohsakawrt-clash-direct add 'example.com' 2>/dev/null",
     "accepted target must be passed as a single-quoted shell argument")
 
 local malicious = "$(id) `id`'"
@@ -25,9 +26,9 @@ for _, target in ipairs({ "example domain", "example.com;id", "$(id)", "`id`", "
     assert(clash.direct_add(target) == "ERROR:invalid_target", "direct_add must reject target: " .. target)
     assert(clash.direct_del(target) == "ERROR:invalid_target", "direct_del must reject target: " .. target)
 end
-assert(#commands == 1, "invalid add/delete targets must never reach exec_line")
+assert(#commands == 1, "invalid add/delete targets must never reach the helper")
 assert(clash.direct_del("2001:db8::1/64") == "OK", "valid IPv6 CIDR target must be accepted")
-assert(commands[2] == "/usr/bin/tohsaka-direct del '2001:db8::1/64' 2>/dev/null",
+assert(commands[2] == "/usr/bin/tohsakawrt-clash-direct del '2001:db8::1/64' 2>/dev/null",
     "valid CIDR target must be passed as a single-quoted shell argument")
 
 print("PASS: clash direct targets are shell-quoted and invalid targets never execute")

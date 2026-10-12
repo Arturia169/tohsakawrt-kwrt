@@ -1,0 +1,950 @@
+#!/bin/sh
+# TohsakaWrt 网络黑匣子 —— 异常检测与主动告警（第二步）
+#
+# 用法：
+#   tohsakawrt-event-watch run            巡检每分钟调用；静默运行，只在检测到异常时告警
+#   tohsakawrt-event-watch check [小时]   只检测不告警，输出人类可读结果（排查 / 机器人展示）
+#   tohsakawrt-event-watch status         输出当前冷却状态与今日计数（排查）
+#
+# 环境变量（全部可选）：
+#   TWR_EVENT_LOG           事件文件（默认 /etc/tohsakawrt/events.log）
+#   TWR_EVENT_WATCH_STATE   冷却/计数目录（默认 /tmp/tohsakawrt/state/event-watch，tmpfs）
+#   TWR_EVENT_WATCH_NOW     伪造"现在"（仅测试用，让结果可复现）
+#   TWR_EVENT_WATCH_DRY     1 = 只打印告警正文、不投递（仅测试用）
+#   其余阈值 / 冷却 / 上限见下面"规则参数"一节，全部可用环境变量覆盖。
+#
+# ============================== 为什么这么设计 ==============================
+# 用户最反感两件事：①自动化失控 ②告警刷屏。所以本脚本的每一个取舍都偏向
+# "宁可漏报，不可刷屏"：
+#
+#   1) 每类异常【各自】有冷却时间。冷却期内重复触发只写系统日志、不发通知。
+#      冷却状态放 /tmp（tmpfs），重启即清 —— 重启后本来就该允许重新告警。
+#   2) 每类异常【各自】有每日上限。极端情况（模组整晚抽风）也不会无限刷屏。
+#   3) 常态【零写入、零通知】：没有异常时不产生任何磁盘写入或网络请求。
+#      为此检测过程刻意【不落任何临时文件】—— awk 的结果直接用命令替换接进变量，
+#      其余全是管道（管道不碰磁盘）。
+#      只有"真的发了告警"那一刻才会写盘：两个状态文件（冷却时间戳 + 今日计数）
+#      和一条 kind=alert 的事件（让时间线上看得见"哪一刻报过警"）。
+#   4) 告警一律走 send_tg_bg / push_bark_bg（后台投递）：巡检链绝不被网络请求阻塞。
+#      send_tg 最坏约 21 秒（curl -m 10 重试 2 次 + sleep 1），同步发送会把
+#      每分钟一次的巡检拖过 cron 间隔，进而让整套巡检停摆。
+#   5) 任何失败都静默吞掉：全脚本不设 set -e、所有外部命令都重定向掉输出、
+#      末尾永远 exit 0 —— 本脚本出任何问题都不能影响调用它的巡检。
+#
+# ==================== 必须【不】被当成异常的正常现象 ====================
+# 下面几条是用户明确交代过或实测存在的日常规律，一旦误判就是刷屏：
+#
+#   * 每天约 05:00 5G 基站关闭、约 07:00 恢复 —— 这是日常规律，不是故障。
+#     处理方式：04:30~07:30 定为"每日静默窗"，窗内把阈值整体抬高
+#     （而不是完全不检测：窗内真出大事仍然要报）。
+#   * 出口处于"临时回退"期间，tohsakawrt-uplink 每分钟都会写一行
+#     "Reconcile skipped: temporary fallback is active"（采集器翻译成
+#     "临时回退生效中，暂不校正出口"）。这是每分钟一条的常态噪声，
+#     必须从"出口反复切换"里剔除，否则整段回退期间都会被判成抖动。
+#   * 用户手动切出口会紧跟一条 uplink 事件 —— 紧跟 bot（用户操作）120 秒内的
+#     出口事件不计入抖动，避免把"用户自己在试"当成线路不稳。
+#   * 刚开机时模组重枚举、出口重切、可用性变化，事件天然密集 ——
+#     开机 10 分钟内（TWR_EVENT_BOOT_GRACE）不告警，交给"已上线"通知。
+#   * AT 口一时读不到卡时，tohsakawrt-modem-heal 每分钟都会写一条
+#     "ICCID 实时读取失败，沿用上次成功值"。它同样是每分钟一条的常态噪声，
+#     不计入"模组自愈风暴"（同一故障必然还会产生 warn 级的
+#     "AT 口 X 连续 N 次读取失败"，那一条会计入）。
+# ==========================================================================
+
+LOG="${TWR_EVENT_LOG:-/etc/tohsakawrt/events.log}"
+STATE="${TWR_EVENT_WATCH_STATE:-/tmp/tohsakawrt/state/event-watch}"
+EVENT_BIN="${TWR_EVENT_BIN:-/usr/bin/tohsakawrt-event}"
+# 只把事件文件的【尾部】交给 awk：事件写入器本身把文件轮转在 8000 行 / 1MB 以内，
+# 但 8000 行对这颗 A53 来说仍是每分钟一次的实打实开销。本脚本所有窗口加起来
+# 只要最近 45 分钟，而事件是稀疏的（实测 6 天 57 条）—— 2000 行足够覆盖
+# 33 小时的"每分钟一条"极端情况。真出现超过 2000 行的风暴时，截断的只是最老的
+# 那部分，阈值早就被顶穿了，不影响判定。
+TAIL_LINES="${TWR_EVENT_TAIL_LINES:-2000}"
+NOW_OVERRIDE="${TWR_EVENT_WATCH_NOW:-}"
+DRY="${TWR_EVENT_WATCH_DRY:-0}"
+MAX_EV="${TWR_EVENT_MAX_EVENTS:-6000}"
+
+# ------------------------------------------------------------------
+# 安全护栏：事件文件不是生产路径时，强制不投递
+#
+# 为什么必须加这道护栏（真事故，2026-10-10 03:30）：
+#   我用临时事件文件测阈值，**却忘了设 TWR_EVENT_WATCH_DRY=1**，
+#   结果"读的是我编造的假数据、发的是真 Telegram" —— 用户凭空收到 3 条误报
+#   （2 条"制式抖动 4 次"+ 1 条"6 次"），而真实网络那段时间根本没发生过切换。
+#
+#   根因是"数据源"与"投递通道"两件事没有绑定：隔离了前者、漏了后者。
+#   现在把它们绑起来：**读非生产数据时，绝不允许发真实通知**。
+#   确实需要跨路径投递时，显式设 TWR_EVENT_WATCH_ALLOW_REAL=1 才放行。
+if [ "$EVENT_LOG" != "/etc/tohsakawrt/events.log" ] && [ "${TWR_EVENT_WATCH_ALLOW_REAL:-0}" != "1" ]; then
+    DRY=1
+fi
+
+# ------------------------------------------------------------------
+# 规则参数
+# ------------------------------------------------------------------
+# 窗口/阈值怎么定的，报告里逐条给了理由；这里只写结论。
+W_RAT="${TWR_EVENT_RAT_WINDOW:-1800}"          # 制式抖动观察窗：30 分钟
+MIN_RAT="${TWR_EVENT_RAT_MIN:-4}"              # 常态阈值：≥4 次
+MIN_RAT_Q="${TWR_EVENT_RAT_MIN_QUIET:-6}"      # 每日静默窗内：≥6 次
+W_MODEM="${TWR_EVENT_MODEM_WINDOW:-900}"       # 模组自愈观察窗：15 分钟
+MIN_MODEM="${TWR_EVENT_MODEM_MIN:-3}"
+MIN_MODEM_Q="${TWR_EVENT_MODEM_MIN_QUIET:-5}"
+W_UPLINK="${TWR_EVENT_UPLINK_WINDOW:-1800}"    # 出口抖动观察窗：30 分钟
+MIN_UPLINK="${TWR_EVENT_UPLINK_MIN:-4}"
+MIN_UPLINK_Q="${TWR_EVENT_UPLINK_MIN_QUIET:-5}"
+W_DOWN="${TWR_EVENT_DOWN_WINDOW:-600}"         # 断网事件只关心最近 10 分钟内的
+LOOKBACK="${TWR_EVENT_CAUSE_LOOKBACK:-300}"    # 断网前回溯 5 分钟找前因
+BOT_GUARD="${TWR_EVENT_BOT_GUARD:-120}"        # 用户操作后 120 秒内的出口事件不算抖动
+BOOT_GRACE="${TWR_EVENT_BOOT_GRACE:-600}"      # 开机宽限期 10 分钟
+QUIET_WINDOW="${TWR_EVENT_QUIET_WINDOW-0430-0730}"   # 每日静默窗（空串=关闭）
+
+CD_RAT="${TWR_EVENT_CD_RAT:-3600}"             # 冷却时间
+CD_MODEM="${TWR_EVENT_CD_MODEM:-1800}"
+CD_UPLINK="${TWR_EVENT_CD_UPLINK:-1800}"
+CD_DOWN="${TWR_EVENT_CD_DOWN:-7200}"
+CAP_RAT="${TWR_EVENT_CAP_RAT:-4}"              # 每日上限
+CAP_MODEM="${TWR_EVENT_CAP_MODEM:-4}"
+CAP_UPLINK="${TWR_EVENT_CAP_UPLINK:-4}"
+CAP_DOWN="${TWR_EVENT_CAP_DOWN:-2}"
+
+# "长时间无事件"默认【关闭】。理由见 do_status 里的说明与报告：
+# events.log 是事件驱动的（没有心跳行），网络稳定且无人操作时本来就长时间不增长，
+# 所以"文件不增长"不能作为故障证据，开着它只会误报。
+SILENCE_HOURS="${TWR_EVENT_SILENCE_HOURS:-0}"
+CD_SILENCE="${TWR_EVENT_CD_SILENCE:-21600}"
+CAP_SILENCE="${TWR_EVENT_CAP_SILENCE:-1}"
+
+# 数值参数统一校验：非法值一律回落到默认值。
+# 为什么需要：这些值直接参与 $(( )) 算术，一个手滑的 env（例如 "30m"）会算出荒唐的窗口。
+# 用 eval 是因为 POSIX sh 没有引用传参，而这里的变量名都是脚本里写死的字面量，安全。
+fixnum() {
+    eval "_fv=\$$1"
+    case "$_fv" in
+        ''|*[!0-9]*) eval "$1=\$2" ;;
+    esac
+}
+
+fixnum W_RAT 1800
+fixnum MIN_RAT 4
+fixnum MIN_RAT_Q 6
+fixnum W_MODEM 900
+fixnum MIN_MODEM 3
+fixnum MIN_MODEM_Q 5
+fixnum W_UPLINK 1800
+fixnum MIN_UPLINK 4
+fixnum MIN_UPLINK_Q 5
+fixnum W_DOWN 600
+fixnum LOOKBACK 300
+fixnum BOT_GUARD 120
+fixnum BOOT_GRACE 600
+fixnum CD_RAT 3600
+fixnum CD_MODEM 1800
+fixnum CD_UPLINK 1800
+fixnum CD_DOWN 7200
+fixnum CAP_RAT 4
+fixnum CAP_MODEM 4
+fixnum CAP_UPLINK 4
+fixnum CAP_DOWN 2
+fixnum SILENCE_HOURS 0
+fixnum CD_SILENCE 21600
+fixnum CAP_SILENCE 1
+fixnum TAIL_LINES 2000
+fixnum MAX_EV 6000
+
+# ------------------------------------------------------------------
+# 公共库与兜底实现
+# ------------------------------------------------------------------
+# 告警函数（send_tg / send_tg_bg / push_bark / push_bark_bg / html_escape / format_duration）
+# 都在 common.sh 里。这里必须【兜底】：本机（开发机）没有这个文件，
+# 缺了它脚本仍然要能跑完、不能因为一个缺失的库把巡检搞崩。
+[ -r /usr/lib/tohsakawrt/common.sh ] && . /usr/lib/tohsakawrt/common.sh
+
+if ! command -v html_escape >/dev/null 2>&1; then
+    html_escape() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+fi
+
+if ! command -v format_duration >/dev/null 2>&1; then
+    format_duration() {
+        _s="${1:-0}"
+        case "$_s" in ''|*[!0-9]*) _s=0 ;; esac
+        if [ "$_s" -ge 3600 ]; then
+            printf '%s小时%s分钟' "$((_s / 3600))" "$(((_s % 3600) / 60))"
+        elif [ "$_s" -ge 60 ]; then
+            printf '%s分钟' "$((_s / 60))"
+        else
+            printf '%s秒' "$_s"
+        fi
+    }
+fi
+
+# 投递兜底：没有 common.sh 时不留"静默什么都不做"的假象 —— 记一条日志，
+# 这样开发机上跑测试时能看见"本来会发什么"。
+if ! command -v send_tg_bg >/dev/null 2>&1; then
+    send_tg_bg() {
+        logger -t TohsakaWrt-EventWatch "告警未投递（缺少 send_tg_bg）: $(printf '%s' "$1" | tr '\n' ' ' | cut -c1-300)" 2>/dev/null || true
+    }
+fi
+if ! command -v push_bark_bg >/dev/null 2>&1; then
+    push_bark_bg() { :; }
+fi
+
+# ------------------------------------------------------------------
+# 时间与静默窗
+# ------------------------------------------------------------------
+strip0() {
+    _v="$1"
+    while :; do
+        case "$_v" in
+            0?*) _v="${_v#0}" ;;
+            *) break ;;
+        esac
+    done
+    [ -n "$_v" ] || _v=0
+    printf '%s' "$_v"
+}
+
+fmt_hm() {
+    _v="$(strip0 "$1")"
+    printf '%02d:%02d' "$((_v / 100))" "$((_v % 100))"
+}
+
+# 取"现在"的各个表示。TWR_EVENT_WATCH_NOW 只在测试时用：
+# 注意 BusyBox 的 date -d 对 "@epoch" 支持不可靠，所以伪造 now 时改用 awk 的 strftime
+# （采集器已经在用 strftime，说明这台上肯定有）。
+#
+# 性能：正常路径只 fork 一次 date（五个字段用 | 拼一行再按 IFS 切开）。
+# 早先的写法是五次 $(date ...)，在 A53 上每次 fork+exec 都是实打实的开销，
+# 而本脚本每分钟都要跑一次。
+now_vars() {
+    case "$NOW_OVERRIDE" in
+        ''|*[!0-9]*) NOW_OVERRIDE="" ;;
+    esac
+    _saved_ifs="$IFS"
+    IFS='|'
+    set -- $(
+        if [ -n "$NOW_OVERRIDE" ]; then
+            # 注意：字段数必须与下面 date 那条【完全一致】（5 个），
+            # 且最后一个字段是"日期 时间"整体（含一个空格）——
+            # IFS 已切成 |，所以字段内的空格不会再被拆开。
+            awk -v t="$NOW_OVERRIDE" 'BEGIN {
+                printf "%s|%s|%s|%s|%s\n", t, strftime("%Y%m%d", t), strftime("%H", t), \
+                    strftime("%M", t), strftime("%Y-%m-%d %H:%M:%S", t)
+            }' 2>/dev/null
+        else
+            date '+%s|%Y%m%d|%H|%M|%Y-%m-%d %H:%M:%S' 2>/dev/null
+        fi
+    )
+    IFS="$_saved_ifs"
+    NOW="$1"
+    TODAY="$2"
+    NOW_H="$3"
+    NOW_M="$4"
+    NOW_STR="$5"
+    case "$NOW" in ''|*[!0-9]*) NOW=0 ;; esac
+    case "$TODAY" in ''|*[!0-9]*) TODAY=19700101 ;; esac
+    [ -n "$NOW_STR" ] || NOW_STR="(时间未知)"
+    # 去掉时/分的前导零：下面 NOW_HM 用 $(( )) 算，而 "0730" 会被当成八进制。
+    while :; do case "$NOW_H" in 0?*) NOW_H="${NOW_H#0}" ;; *) break ;; esac; done
+    while :; do case "$NOW_M" in 0?*) NOW_M="${NOW_M#0}" ;; *) break ;; esac; done
+    [ -n "$NOW_H" ] || NOW_H=0
+    [ -n "$NOW_M" ] || NOW_M=0
+    NOW_HM=$((NOW_H * 100 + NOW_M))
+}
+
+# 判断当前是否处于"每日静默窗"（默认 04:30~07:30：5G 基站每天关站/恢复的时段）。
+# 这里刻意不拼任何给人看的字符串（那要 fork 子 shell），run 路径只用到 QUIET 这一个开关；
+# 要展示的文字由 quiet_desc 在 check / status 里现算。
+compute_quiet() {
+    QUIET=0
+    QUIET_VALID=0
+    QUIET_QS=0
+    QUIET_QE=0
+    [ -n "$QUIET_WINDOW" ] || return 0
+    case "$QUIET_WINDOW" in
+        *-*) ;;
+        *) return 0 ;;
+    esac
+    _qs="${QUIET_WINDOW%%-*}"
+    _qe="${QUIET_WINDOW##*-}"
+    while :; do case "$_qs" in 0?*) _qs="${_qs#0}" ;; *) break ;; esac; done
+    while :; do case "$_qe" in 0?*) _qe="${_qe#0}" ;; *) break ;; esac; done
+    [ -n "$_qs" ] || _qs=0
+    [ -n "$_qe" ] || _qe=0
+    case "$_qs$_qe" in
+        *[!0-9]*) return 0 ;;
+    esac
+    QUIET_VALID=1
+    QUIET_QS="$_qs"
+    QUIET_QE="$_qe"
+    if [ "$_qs" -le "$_qe" ]; then
+        if [ "$NOW_HM" -ge "$_qs" ] && [ "$NOW_HM" -le "$_qe" ]; then QUIET=1; fi
+    else
+        # 跨零点的窗口（例如 2300-0200）也要能表达
+        if [ "$NOW_HM" -ge "$_qs" ] || [ "$NOW_HM" -le "$_qe" ]; then QUIET=1; fi
+    fi
+    return 0
+}
+
+# 静默窗的人话描述（只有 check / status 用，允许 fork）
+quiet_desc() {
+    if [ "$QUIET_VALID" != "1" ]; then
+        printf '%s' "未启用"
+        return 0
+    fi
+    if [ "$QUIET" = "1" ]; then
+        printf '%s' "$(fmt_hm "$QUIET_QS")–$(fmt_hm "$QUIET_QE")（当前在窗内，阈值已抬高）"
+    else
+        printf '%s' "$(fmt_hm "$QUIET_QS")–$(fmt_hm "$QUIET_QE")（当前不在窗内）"
+    fi
+}
+
+# ------------------------------------------------------------------
+# 检测核心（单次 awk 扫描，不落任何临时文件）
+# ------------------------------------------------------------------
+# 输入：事件行（stdin）。输出三类行：
+#   R <规则> <计数> <起ts> <止ts> <起日期> <起时刻> <止日期> <止时刻> <尾部窗口计数> <滑动窗口最大值>
+#   E <规则> <ts> <日期> <时刻> <图标> <原文...>
+#   S <最新事件ts> <有效事件总数> <本次扫描范围内条数> <日期> <时刻>
+#
+# 为什么用一次 awk 而不是每条规则各 grep 一遍：事件文件最大 1MB / 8000 行，
+# 每分钟跑一次，多趟扫描纯属浪费；而且"断网无前因"这条规则本来就要看事件之间的
+# 相对位置，只有把窗口内的事件都拿在手里才好判断。
+#
+# 兼容性注意（BusyBox awk）：不用 gensub/asort/数组的数组/delete 整个数组；
+# 排序用插入排序 —— 事件文件通常已经有序，对近乎有序的数据它是 O(n)。
+analyze() {
+    awk -v now="$NOW" -v mode="$1" -v range="$2" \
+        -v w_rat="$W_RAT" -v w_modem="$W_MODEM" -v w_uplink="$W_UPLINK" \
+        -v w_down="$W_DOWN" -v clook="$LOOKBACK" -v botguard="$BOT_GUARD" \
+        -v maxev="$MAX_EV" '
+    BEGIN {
+        n = 0; total = 0; file_max = 0
+        if (range <= 0) range = 2400
+        if (maxev <= 0) maxev = 6000
+        lo_limit = now - range
+        rl = "rat_flap modem_storm uplink_flap"
+    }
+    {
+        if (NF < 5) next
+        ts = $1 + 0
+        if (ts <= 0) next
+        total++
+        if (ts > file_max) file_max = ts
+        if (ts < lo_limit) next
+        if (n >= maxev) next
+        # 取消息原文：从行首连剥 4 个字段。用 $0 而不是拼 $5..$NF，
+        # 是为了保留原文里的连续空格（告警里要展示"事件原文"）。
+        # 只按【空格】剥字段：事件写入器 tohsakawrt-event 写出前 4 个字段时
+        # 用的格式串是四个 %s 之间各一个空格，分隔符必然是单个空格。
+        # 刻意不用 [ \t]：POSIX awk 里正则中的 \t 含义是实现相关的
+        # （有些实现当成字面量 t），赌它会算出"up"/"watch" 这类被截断的字段。
+        msg = $0
+        for (fi = 1; fi <= 4; fi++) sub(/^ *[^ ]+ +/, "", msg)
+        if (msg == "") next
+        n++
+        ets[n] = ts; elv[n] = $2; ekd[n] = $3; emsg[n] = msg
+    }
+    function hm(t) { return strftime("%m-%d %H:%M", t) }
+    function icon(l) {
+        if (l == "warn")  return "🟡"
+        if (l == "error") return "🔴"
+        if (l == "crit")  return "🚨"
+        return "⚪"
+    }
+    # 制式抖动：只算"真的切换了"的事件。回溯导入会产出 "首次记录制式 xx"，
+    # 那只是采集器第一次看到制式，不是切换 —— 若算进去，导入当天必然误报。
+    # 注意：函数参数一律用 ix 这类名字，不叫 i —— 免得和全局循环变量重名
+    # （awk 里参数是局部的，重名不会出错，但读的人容易误会）。
+    function is_rat(ix)    { return (skd[ix] == "rat" && smsg[ix] !~ /首次/) }
+    # 模组自愈风暴：统计所有 modem 事件，但剔除一类"每分钟一条"的例行噪声 ——
+    # "ICCID 实时读取失败" 是 heal_cellular_data 每次运行都会打的一条
+    # （AT 口一时读不到卡就写一条），AT 口持续异常时它每分钟都出现，
+    # 会把这 15 分钟窗口长期顶在阈值之上，变成每天 4 条的永久唠叨。
+    # 剔掉它不损失检测能力：同一个故障必然还会产生 warn 级的
+    # "AT 口 X 连续 N 次读取失败"（那个计入统计）。
+    function is_modem(ix)  { return (skd[ix] == "modem" && smsg[ix] !~ /ICCID 实时读取失败/) }
+    # 出口抖动：剔除"临时回退生效中，暂不校正出口"（回退期间每分钟一条），
+    # 以及紧跟用户操作（bot）之后 120 秒内的连带事件。
+    function is_uplink(ix) { return (skd[ix] == "uplink" && smsg[ix] !~ /暂不校正/ && !nearbot[ix]) }
+    # 断网：up -> down（实时采集）或"网络中断"（台账导入）
+    function is_down(ix)   { return (skd[ix] == "avail" && (smsg[ix] ~ /-> down/ || smsg[ix] ~ /网络中断/)) }
+    function is_cause(ix)  { return (skd[ix] == "rat" || skd[ix] == "uplink" || skd[ix] == "modem" || skd[ix] == "bot") }
+    function m_rule(rname, ix) {
+        if (rname == "rat_flap")    return is_rat(ix)
+        if (rname == "modem_storm") return is_modem(ix)
+        if (rname == "uplink_flap") return is_uplink(ix)
+        return 0
+    }
+    function win_of(rname) {
+        if (rname == "rat_flap")    return w_rat
+        if (rname == "modem_storm") return w_modem
+        return w_uplink
+    }
+    END {
+        # ---- 1. 按时间排序 ----
+        for (i = 1; i <= n; i++) ord[i] = i
+        for (i = 2; i <= n; i++) {
+            v = ord[i]; k = ets[v]; j = i - 1
+            while (j >= 1 && ets[ord[j]] > k) { ord[j + 1] = ord[j]; j-- }
+            ord[j + 1] = v
+        }
+        for (i = 1; i <= n; i++) {
+            p = ord[i]
+            sts[i] = ets[p]; slv[i] = elv[p]; skd[i] = ekd[p]; smsg[i] = emsg[p]
+        }
+
+        # ---- 2. 用户操作守卫：标记"紧跟 bot 事件之后"的事件 ----
+        lastbot = -1
+        for (i = 1; i <= n; i++) {
+            if (skd[i] == "bot") lastbot = sts[i]
+            nearbot[i] = (lastbot > 0 && (sts[i] - lastbot) <= botguard) ? 1 : 0
+        }
+
+        # ---- 3. 逐规则收集命中事件 ----
+        nr = split(rl, RL, " ")
+        for (r = 1; r <= nr; r++) {
+            c = 0
+            for (i = 1; i <= n; i++) if (m_rule(RL[r], i)) { c++; idx[RL[r], c] = i }
+            cnt[RL[r]] = c
+        }
+
+        for (r = 1; r <= nr; r++) {
+            rule = RL[r]; W = win_of(rule); c = cnt[rule]
+
+            # 尾部窗口（run 用）：只看 [now-W, now]，避免"旧的一阵抖动"在几十分钟后又被报一次
+            tc = 0; tf = 0; tl = 0; kstart = 0
+            for (k = c; k >= 1; k--) {
+                i = idx[rule, k]
+                if (sts[i] < now - W) break
+                if (tc == 0) tl = sts[i]
+                tf = sts[i]; tc++; kstart = k
+            }
+
+            # 滑动窗口最大值（check 用）：最近 N 小时里"任意一个 W 长的窗口"最多几条
+            best = 0; bs = 0; be = 0
+            j = 1
+            for (k = 1; k <= c; k++) {
+                kk = idx[rule, k]
+                while (j <= k && sts[idx[rule, j]] < sts[kk] - W) j++
+                cur = k - j + 1
+                if (cur > best) { best = cur; bs = j; be = k }
+            }
+
+            if (mode == "run") {
+                sc = tc; sb = kstart; se = c; sf = tf; sl = tl
+            } else {
+                sc = best; sb = bs; se = be
+                if (best > 0) { sf = sts[idx[rule, bs]]; sl = sts[idx[rule, be]] } else { sf = 0; sl = 0 }
+            }
+
+            if (sf > 0)
+                printf "R %s %d %d %d %s %s %d %d\n", rule, sc, sf, sl, hm(sf), hm(sl), tc, best
+            else
+                printf "R %s 0 0 0 - - - - 0 0\n", rule
+
+            # 证据：窗口内【最近 5 条】，按时间正序输出（人读起来顺）
+            e = 0
+            if (sb > 0 && se >= sb) {
+                for (k = se; k >= sb && e < 5; k--) { e++; ev[e] = idx[rule, k] }
+                for (q = e; q >= 1; q--) {
+                    i = ev[q]
+                    printf "E %s %d %s %s %s\n", rule, sts[i], hm(sts[i]), icon(slv[i]), smsg[i]
+                }
+            }
+        }
+
+        # ---- 4. 断网且无已知前因 ----
+        uc = 0; uf = 0; ul = 0; ulast = 0
+        for (i = 1; i <= n; i++) {
+            if (!is_down(i)) continue
+            if (mode == "run" && sts[i] < now - w_down) continue
+            causes = 0
+            for (j = i - 1; j >= 1; j--) {
+                if (sts[j] < sts[i] - clook) break
+                if (is_cause(j)) { causes = 1; break }
+            }
+            if (causes == 0) {
+                uc++
+                if (uf == 0) uf = sts[i]
+                ul = sts[i]; ulast = i
+            }
+        }
+        if (uf > 0)
+            printf "R unknown_down %d %d %d %s %s %d %d\n", uc, uf, ul, hm(uf), hm(ul), uc, uc
+        else
+            printf "R unknown_down 0 0 0 - - - - 0 0\n"
+
+        if (ulast > 0) {
+            # 证据：断网前最多 3 条 + 断网本身 —— 让用户能自己核对"确实没有前因"
+            s = ulast - 3
+            if (s < 1) s = 1
+            for (i = s; i <= ulast; i++)
+                printf "E unknown_down %d %s %s %s\n", sts[i], hm(sts[i]), icon(slv[i]), smsg[i]
+        }
+
+        # ---- 5. 文件总体信息（供 check / status 用）----
+        if (file_max > 0)
+            printf "S %d %d %d %s\n", file_max, total, n, hm(file_max)
+        else
+            printf "S 0 %d %d - -\n", total, n
+    }
+    ' 2>/dev/null
+}
+
+# 计算 run 的扫描范围：覆盖所有窗口，再留 5 分钟余量
+calc_range() {
+    _r="$W_RAT"
+    [ "$W_MODEM" -gt "$_r" ] && _r="$W_MODEM"
+    [ "$W_UPLINK" -gt "$_r" ] && _r="$W_UPLINK"
+    [ "$((W_DOWN + LOOKBACK))" -gt "$_r" ] && _r=$((W_DOWN + LOOKBACK))
+    printf '%s' "$((_r + 300))"
+}
+
+# 读取某条规则的 R 行
+rline_of() {
+    printf '%s\n' "$FINDINGS" | grep "^R $1 " 2>/dev/null | head -n 1
+}
+
+# 渲染证据（HTML）。limit=0 表示不要证据。
+render_evidence() {
+    _rule="$1"; _lim="$2"
+    [ "$_lim" -gt 0 ] 2>/dev/null || return 0
+    printf '%s\n' "$FINDINGS" | grep "^E $_rule " 2>/dev/null | head -n "$_lim" |
+        sed 's/^E [^ ]* [^ ]* //' 2>/dev/null |
+        while IFS= read -r _l; do
+            printf '<code>%s</code>\n' "$(html_escape "$_l")"
+        done
+}
+
+# ------------------------------------------------------------------
+# 规则元数据
+# ------------------------------------------------------------------
+rule_meta() {
+    case "$1" in
+        rat_flap)
+            RM_IDX=1; RM_WIN="$W_RAT"; RM_MIN="$MIN_RAT"; RM_MINQ="$MIN_RAT_Q"
+            RM_CD="$CD_RAT"; RM_CAP="$CAP_RAT"; RM_LVL=warn; RM_TITLE="制式抖动"
+            RM_UNIT="次"; RM_DESC="5G↔4G 切换"
+            RM_BARK_LVL="active"; RM_BARK_SND="bell"
+            RM_WHY="短时间内反复切换制式，通常意味着信号不稳或基站在反复掉。若持续出现，可考虑锁定频段。"
+            ;;
+        modem_storm)
+            RM_IDX=2; RM_WIN="$W_MODEM"; RM_MIN="$MIN_MODEM"; RM_MINQ="$MIN_MODEM_Q"
+            RM_CD="$CD_MODEM"; RM_CAP="$CAP_MODEM"; RM_LVL=warn; RM_TITLE="模组自愈风暴"
+            RM_UNIT="条"; RM_DESC="模组事件"
+            RM_BARK_LVL="timeSensitive"; RM_BARK_SND="alarm"
+            RM_WHY="模组自愈动作在短时间内密集触发，正是当初「无限复位」那类事故的前兆。若已出现 reset-exhausted，说明复位额度已用尽、已停止自愈。（已排除每分钟一条的 ICCID 读取失败噪声）"
+            ;;
+        uplink_flap)
+            RM_IDX=3; RM_WIN="$W_UPLINK"; RM_MIN="$MIN_UPLINK"; RM_MINQ="$MIN_UPLINK_Q"
+            RM_CD="$CD_UPLINK"; RM_CAP="$CAP_UPLINK"; RM_LVL=warn; RM_TITLE="出口反复切换"
+            RM_UNIT="条"; RM_DESC="出口事件"
+            RM_BARK_LVL="active"; RM_BARK_SND="bell"
+            RM_WHY="出口在两条线路之间反复切，说明其中一条不稳定。已排除临时回退期间的每分钟噪声与用户手动切换的连带事件。"
+            ;;
+        unknown_down)
+            RM_IDX=4; RM_WIN="$W_DOWN"; RM_MIN=1; RM_MINQ=1
+            RM_CD="$CD_DOWN"; RM_CAP="$CAP_DOWN"; RM_LVL=error; RM_TITLE="断网（原因未知）"
+            RM_UNIT="次"; RM_DESC="无前因的中断"
+            RM_BARK_LVL="timeSensitive"; RM_BARK_SND="alarm"
+            RM_WHY="中断前 5 分钟没有任何制式/出口/模组/用户操作事件，说明不是已知原因引起的。可能是上游线路或运营商侧问题，也可能是新问题。"
+            ;;
+        silence)
+            RM_IDX=5; RM_WIN=0; RM_MIN=1; RM_MINQ=1
+            RM_CD="$CD_SILENCE"; RM_CAP="$CAP_SILENCE"; RM_LVL=warn; RM_TITLE="长时间无事件"
+            RM_UNIT="条"; RM_DESC="事件"
+            RM_BARK_LVL="active"; RM_BARK_SND="glass"
+            RM_WHY="事件文件长时间不增长。注意：事件是事件驱动写入的，稳定期本来就长时间没有事件，所以这条规则默认关闭。"
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+cd_text() {
+    case "$1" in
+        ''|*[!0-9]*) printf '%s' "?" ;;
+        *)
+            if [ "$1" -ge 3600 ]; then
+                printf '%s 小时' "$(($1 / 3600))"
+            elif [ "$1" -ge 60 ]; then
+                printf '%s 分钟' "$(($1 / 60))"
+            else
+                printf '%s 秒' "$1"
+            fi
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------
+# 告警通道
+# ------------------------------------------------------------------
+# 每日上限 + 冷却的判定。返回 0 = 允许告警（并且已经把状态写好了）。
+# 返回非 0 = 压制（调用方只记日志）。
+#
+# 为什么先写状态再发送：宁可"发了但没送到"也不要"没发却以为发了"。
+# 反过来（先发后写）在发送失败时会每分钟重试一次，正是刷屏的成因。
+alert_slot() {
+    _rule="$1"; _cd="$2"; _cap="$3"
+    _cdfile="$STATE/cooldown.$_rule"
+    _last="$(cat "$_cdfile" 2>/dev/null)"
+    case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+    if [ "$_last" -gt 0 ] && [ "$((NOW - _last))" -lt "$_cd" ]; then
+        return 1
+    fi
+    _dayfile="$STATE/day.$TODAY.$_rule"
+    _dc="$(cat "$_dayfile" 2>/dev/null)"
+    case "$_dc" in ''|*[!0-9]*) _dc=0 ;; esac
+    [ "$_dc" -ge "$_cap" ] && return 2
+    # 只有走到这里才写盘：常态（无异常 / 冷却中 / 超上限）一个字节都不写
+    mkdir -p "$STATE" 2>/dev/null
+    printf '%s\n' "$NOW" > "$_cdfile" 2>/dev/null
+    printf '%s\n' "$((_dc + 1))" > "$_dayfile" 2>/dev/null
+    SLOT_COUNT=$((_dc + 1))
+    # 顺手清掉旧日期的计数文件 —— 只在真正告警时动手，避免常态写入
+    for _f in "$STATE"/day.*; do
+        [ -e "$_f" ] || continue
+        case "$_f" in
+            *".$TODAY."*) ;;
+            *) rm -f "$_f" 2>/dev/null ;;
+        esac
+    done
+    return 0
+}
+
+# ------------------------------------------------------------------
+# run：巡检每分钟调用
+# ------------------------------------------------------------------
+do_run() {
+    now_vars
+    compute_quiet
+
+    # 开机宽限：刚开机时模组重枚举、出口重切、可用性变化，事件天然密集。
+    # 这段时间的密集事件不是异常，交给"已上线"通知就够了。
+    _up="$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)"
+    case "$_up" in ''|*[!0-9]*) _up=0 ;; esac
+    if [ "$_up" -gt 0 ] && [ "$_up" -lt "$BOOT_GRACE" ]; then
+        return 0
+    fi
+
+    [ -r "$LOG" ] || return 0
+
+    FINDINGS="$(tail -n "$TAIL_LINES" "$LOG" 2>/dev/null | analyze run "$(calc_range)")"
+    [ -n "$FINDINGS" ] || return 0
+
+    process_rule rat_flap
+    process_rule modem_storm
+    process_rule uplink_flap
+    process_rule unknown_down
+    process_silence
+    return 0
+}
+
+process_rule() {
+    rule="$1"
+    rule_meta "$rule" || return 0
+
+    th="$RM_MIN"
+    [ "$QUIET" = "1" ] && th="$RM_MINQ"
+
+    line="$(rline_of "$rule")"
+    [ -n "$line" ] || return 0
+    # R 行字段：1=R 2=规则 3=计数 4=起ts 5=止ts 6=起日期 7=起时刻 8=止日期 9=止时刻 10=尾部 11=滑动最大
+    set -- $line
+    cnt="$3"; fdate="$6"; ftime="$7"; ldate="$8"; ltime="$9"
+    trailing="${10}"; best="${11}"
+    case "$cnt" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$cnt" -ge "$th" ] 2>/dev/null || return 0
+
+    win_min=$((RM_WIN / 60))
+    clook_min=$((LOOKBACK / 60))
+
+    # 冷却 / 每日上限判定。$? 显式取出，不用 if 的隐式状态：
+    # alert_slot 返回 0=允许（状态已写好）1=冷却中 2=超日限
+    alert_slot "$rule" "$RM_CD" "$RM_CAP"
+    _slot_rc=$?
+    if [ "$_slot_rc" != "0" ]; then
+        if [ "$_slot_rc" = "2" ]; then
+            logger -t TohsakaWrt-EventWatch "$RM_TITLE：${cnt}${RM_UNIT}（阈值 ≥${th}）但今日已达上限 ${RM_CAP} 条，只记日志不发通知" 2>/dev/null || true
+        else
+            logger -t TohsakaWrt-EventWatch "$RM_TITLE：${cnt}${RM_UNIT}（阈值 ≥${th}）但仍在冷却期（$(cd_text "$RM_CD")），只记日志不发通知" 2>/dev/null || true
+        fi
+        return 0
+    fi
+
+    # ---- 正文 ----
+    case "$rule" in
+        rat_flap)
+            MID="📶 <b>${win_min} 分钟内 ${cnt} 次</b> 5G↔4G 切换（阈值 ≥${th}）\n🕐 <b>区间</b>：<code>${fdate} ${ftime}</code> → <code>${ldate} ${ltime}</code>"
+            EVMSG="制式抖动：${win_min} 分钟内 ${cnt} 次 5G↔4G 切换（${fdate} ${ftime}→${ldate} ${ltime}）"
+            ;;
+        modem_storm)
+            MID="📦 <b>${win_min} 分钟内 ${cnt} 条</b> 模组事件（阈值 ≥${th}）\n🕐 <b>区间</b>：<code>${fdate} ${ftime}</code> → <code>${ldate} ${ltime}</code>"
+            EVMSG="模组自愈风暴：${win_min} 分钟内 ${cnt} 条模组事件（${fdate} ${ftime}→${ldate} ${ltime}）"
+            ;;
+        uplink_flap)
+            MID="🔀 <b>${win_min} 分钟内 ${cnt} 条</b> 出口事件（阈值 ≥${th}）\n🕐 <b>区间</b>：<code>${fdate} ${ftime}</code> → <code>${ldate} ${ltime}</code>"
+            EVMSG="出口反复切换：${win_min} 分钟内 ${cnt} 条出口事件（${fdate} ${ftime}→${ldate} ${ltime}）"
+            ;;
+        unknown_down)
+            MID="🔌 <b>断网事件</b>：<code>${fdate} ${ftime}</code>\n🔍 <b>回溯 ${clook_min} 分钟</b>：没有任何 制式 / 出口 / 模组 / 用户操作 事件"
+            EVMSG="断网且无已知前因：${fdate} ${ftime}（回溯 ${clook_min} 分钟无 制式/出口/模组/操作 事件）"
+            ;;
+    esac
+
+    if [ "$rule" = "unknown_down" ]; then
+        HEAD="🔴 <b>网络黑匣子 · ${RM_TITLE}</b>"
+    else
+        HEAD="⚠️ <b>网络黑匣子 · ${RM_TITLE}</b>"
+    fi
+
+    # 正文长度兜底：Telegram 单条上限 4096 字符。超长时按【整行】减少证据，
+    # 绝不截断单行 —— 中文是 3 字节，按字节截断会把字符切成两半，
+    # 那样的正文 Telegram 会直接拒收（告警就丢了）。
+    BODY=""
+    for lim in 5 2 0; do
+        EV="$(render_evidence "$rule" "$lim")"
+        BODY="$HEAD\n━━━━━━━━━━━━━━━━━━\n$MID"
+        if [ -n "$EV" ]; then
+            BODY="$BODY\n📄 <b>事件原文</b>\n$EV"
+        fi
+        BODY="$BODY\n━━━━━━━━━━━━━━━━━━\n💡 <i>${RM_WHY}</i>\n🛡️ <i>本类告警：冷却 $(cd_text "$RM_CD") · 今日第 ${SLOT_COUNT}/${RM_CAP} 条</i>\n🕰️ <i>${NOW_STR}</i>"
+        _bytes="$(printf '%s' "$BODY" | wc -c 2>/dev/null)"
+        case "$_bytes" in ''|*[!0-9]*) _bytes=0 ;; esac
+        [ "$_bytes" -le 3500 ] && break
+    done
+
+    if [ "$DRY" = "1" ]; then
+        # 注意：格式串不能以 "-" 开头 —— printf 会把它当选项解析（实测报
+        # "printf: --: invalid option"）。所以这里用 '%s\n' 拼整行。
+        printf '%s\n' "----- DRY $rule -----"
+        printf '%b\n' "$BODY"
+        printf '%s\n' '------------------'
+    else
+        # 先把"告警"这件事记进黑匣子本身：时间线上看得见"哪一刻报过警"。
+        # kind=alert 不参与任何规则判定，所以不存在自激回环。
+        if [ -x "$EVENT_BIN" ]; then
+            "$EVENT_BIN" "$RM_LVL" alert eventwatch "$EVMSG" >/dev/null 2>&1
+        fi
+        send_tg_bg "$BODY" HTML
+        # BARK_KEY 按需取：常态不告警时连一次 uci 都不执行
+        if [ -z "${BARK_KEY:-}" ]; then
+            BARK_KEY="$(uci -q get tohsakawrt-tgbot.main.bark_key 2>/dev/null)"
+        fi
+        BARK_API="${BARK_API:-https://api.day.app/push}"
+        if [ -n "${BARK_KEY:-}" ]; then
+            push_bark_bg "网络黑匣子 · ${RM_TITLE}" "$BODY" "$RM_BARK_LVL" "$RM_BARK_SND"
+        fi
+        logger -t TohsakaWrt-EventWatch "$RM_TITLE 告警：${cnt}${RM_UNIT}（阈值 ≥${th}），已投递（今日第 ${SLOT_COUNT}/${RM_CAP} 条）" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# 长时间无事件（默认关闭；打开时要求"系统还活着"作为旁证）
+process_silence() {
+    [ "$SILENCE_HOURS" -gt 0 ] || return 0
+    rule_meta silence || return 0
+
+    sline="$(printf '%s\n' "$FINDINGS" | grep '^S ' 2>/dev/null | head -n 1)"
+    [ -n "$sline" ] || return 0
+    set -- $sline
+    last_ts="$2"
+    case "$last_ts" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$last_ts" -gt 0 ] || return 0
+    gap=$((NOW - last_ts))
+    [ "$gap" -ge "$((SILENCE_HOURS * 3600))" ] || return 0
+
+    # 旁证：只有"别的采集还在写"时，长时间没有事件才值得怀疑。
+    # 如果整个巡检链都停了，那是另一套（锁/看门狗）的职责，这里报也报不出去。
+    _witness="${TWR_EVENT_SILENCE_WITNESS:-/tmp/tohsakawrt/state/signal-trend.log}"
+    [ -e "$_witness" ] || return 0
+    _wm="$(stat -c %Y "$_witness" 2>/dev/null)"
+    case "$_wm" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$((NOW - _wm))" -le 900 ] || return 0
+
+    if alert_slot silence "$RM_CD" "$RM_CAP"; then
+        :
+    else
+        logger -t TohsakaWrt-EventWatch "长时间无事件（${gap} 秒）但已被冷却/上限压制" 2>/dev/null || true
+        return 0
+    fi
+
+    MID="💤 <b>已有 $((gap / 3600)) 小时 $(((gap % 3600) / 60)) 分钟</b>没有新事件\n📄 最后一条：<code>$(printf '%s' "$sline" | sed 's/^S [^ ]* [^ ]* [^ ]* //')</code>\n🔍 旁证：$(basename "$_witness") 仍在更新 → 采集链还活着，只有事件文件不增长"
+    BODY="⚠️ <b>网络黑匣子 · ${RM_TITLE}</b>\n━━━━━━━━━━━━━━━━━━\n$MID\n━━━━━━━━━━━━━━━━━━\n💡 <i>${RM_WHY}</i>\n🕰️ <i>${NOW_STR}</i>"
+    if [ "$DRY" = "1" ]; then
+        printf '%b\n' "$BODY"
+    else
+        send_tg_bg "$BODY" HTML
+        logger -t TohsakaWrt-EventWatch "长时间无事件告警：${gap} 秒" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------
+# check：只检测不告警
+# ------------------------------------------------------------------
+do_check() {
+    hours="$1"
+    case "$hours" in
+        ''|*[!0-9]*) hours=2 ;;
+    esac
+    [ "$hours" -lt 1 ] && hours=1
+    [ "$hours" -gt 168 ] && hours=168
+
+    now_vars
+    compute_quiet
+
+    if [ -r "$LOG" ]; then
+        FINDINGS="$(tail -n "$TAIL_LINES" "$LOG" 2>/dev/null | analyze check "$((hours * 3600))")"
+    else
+        FINDINGS=""
+    fi
+
+    printf '网络黑匣子 · 异常检测（最近 %s 小时 · 只检测不告警）\n' "$hours"
+    printf '生成时间 %s\n' "$NOW_STR"
+    printf '规则参数 制式 ≥%s/%s分钟 · 模组 ≥%s/%s分钟 · 出口 ≥%s/%s分钟 · 静默窗 %s\n' \
+        "$MIN_RAT" "$((W_RAT / 60))" "$MIN_MODEM" "$((W_MODEM / 60))" "$MIN_UPLINK" "$((W_UPLINK / 60))" "$(quiet_desc)"
+
+    sline="$(printf '%s\n' "$FINDINGS" | grep '^S ' 2>/dev/null | head -n 1)"
+    if [ -n "$sline" ]; then
+        set -- $sline
+        last_ts="$2"; total="$3"; inrange="$4"; ldate="$5"; ltime="$6"
+        case "$last_ts" in ''|*[!0-9]*) last_ts=0 ;; esac
+        # 先判可读再取大小：`wc -c < "$LOG"` 在文件不存在时是【重定向】失败，
+        # 报错由 shell 自己打印，命令上的 2>/dev/null 压不住它（顺序在重定向之后）。
+        _sz=0
+        [ -r "$LOG" ] && _sz="$(wc -c < "$LOG" 2>/dev/null)"
+        case "$_sz" in ''|*[!0-9]*) _sz=0 ;; esac
+        if [ "$last_ts" -gt 0 ]; then
+            printf '事件文件 %s（%s 字节 · 共 %s 条 · 最近事件 %s %s，%s 分钟前 · 本次范围内 %s 条）\n' \
+                "$LOG" "$_sz" "$total" "$ldate" "$ltime" "$(((NOW - last_ts) / 60))" "$inrange"
+        else
+            printf '事件文件 %s（%s 字节 · 共 %s 条 · 还没有任何事件）\n' "$LOG" "$_sz" "$total"
+        fi
+    else
+        printf '事件文件 %s（读不到或为空）\n' "$LOG"
+    fi
+    printf '\n'
+
+    for r in rat_flap modem_storm uplink_flap unknown_down; do
+        check_rule "$r"
+    done
+
+    if [ "$SILENCE_HOURS" -gt 0 ]; then
+        printf '[5] 长时间无事件   已启用（阈值 %s 小时，且要求旁证文件仍在更新）\n' "$SILENCE_HOURS"
+    else
+        printf '[5] 长时间无事件   已关闭（事件文件是事件驱动的，稳定期本来就长时间没有事件）\n'
+    fi
+    return 0
+}
+
+check_rule() {
+    rule="$1"
+    rule_meta "$rule" || return 0
+    th="$RM_MIN"
+    [ "$QUIET" = "1" ] && th="$RM_MINQ"
+
+    line="$(rline_of "$rule")"
+    if [ -z "$line" ]; then
+        printf '[%s] %s   无法判定（事件文件不可读）\n' "$RM_IDX" "$RM_TITLE"
+        return 0
+    fi
+    set -- $line
+    cnt="$3"; fdate="$6"; ftime="$7"; ldate="$8"; ltime="$9"; trailing="${10}"; best="${11}"
+    case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
+
+    if [ "$cnt" -ge "$th" ] 2>/dev/null; then
+        printf '[%s] %s   ⚠️ 触发\n' "$RM_IDX" "$RM_TITLE"
+        printf '    范围内最多 %s %s %s（%s %s → %s %s）· 阈值 ≥%s · 当前窗口 %s %s\n' \
+            "$cnt" "$RM_UNIT" "$RM_DESC" "$fdate" "$ftime" "$ldate" "$ltime" "$th" "$trailing" "$RM_UNIT"
+        printf '%s\n' "$FINDINGS" | grep "^E $rule " 2>/dev/null | head -n 5 |
+            sed 's/^E [^ ]* [^ ]* //' 2>/dev/null | sed 's/^/    · /' 2>/dev/null
+    else
+        printf '[%s] %s   未触发\n' "$RM_IDX" "$RM_TITLE"
+        printf '    范围内最多 %s %s（阈值 ≥%s）· 当前窗口 %s %s\n' \
+            "$cnt" "$RM_UNIT" "$th" "$trailing" "$RM_UNIT"
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------
+# status：冷却状态与今日计数
+# ------------------------------------------------------------------
+do_status() {
+    now_vars
+    compute_quiet
+
+    # 同 do_check：先判可读，避免重定向失败的报错漏到 stderr
+    _sz=0
+    [ -r "$LOG" ] && _sz="$(wc -c < "$LOG" 2>/dev/null)"
+    case "$_sz" in ''|*[!0-9]*) _sz=0 ;; esac
+    _last_ts="$(awk 'BEGIN { m = 0 } { if ($1 + 0 > m) m = $1 + 0 } END { print m + 0 }' "$LOG" 2>/dev/null)"
+    case "$_last_ts" in ''|*[!0-9]*) _last_ts=0 ;; esac
+
+    _up="$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)"
+    case "$_up" in ''|*[!0-9]*) _up=0 ;; esac
+
+    printf '网络黑匣子 · 异常检测状态\n'
+    printf '当前时间   %s\n' "$NOW_STR"
+    printf '事件文件   %s（%s 字节）\n' "$LOG" "$_sz"
+    if [ "$_last_ts" -gt 0 ]; then
+        _lm="$(awk -v t="$_last_ts" 'BEGIN { print strftime("%m-%d %H:%M", t) }' 2>/dev/null)"
+        printf '最近事件   %s（%s 分钟前）\n' "$_lm" "$(((NOW - _last_ts) / 60))"
+    else
+        printf '最近事件   无\n'
+    fi
+    printf '本次开机   %s（开机宽限 %s 分钟，%s）\n' \
+        "$(format_duration "$_up")" "$((BOOT_GRACE / 60))" \
+        "$(if [ "$_up" -le 0 ]; then echo '读不到 /proc/uptime，run 不启用宽限'; elif [ "$_up" -lt "$BOOT_GRACE" ]; then echo 仍在宽限期内; else echo 已过; fi)"
+    printf '每日静默窗 %s\n' "$(quiet_desc)"
+    printf '状态目录   %s\n' "$STATE"
+    printf '━━━━━━━━━━━━━━━━━━\n'
+
+    for r in rat_flap modem_storm uplink_flap unknown_down; do
+        status_rule "$r"
+    done
+    if [ "$SILENCE_HOURS" -gt 0 ]; then
+        printf '长时间无事件   已启用（%s 小时阈值）\n' "$SILENCE_HOURS"
+    else
+        printf '长时间无事件   已关闭（事件驱动写入，静默不等于故障）\n'
+    fi
+    return 0
+}
+
+status_rule() {
+    rule="$1"
+    rule_meta "$rule" || return 0
+
+    _dc="$(cat "$STATE/day.$TODAY.$rule" 2>/dev/null)"
+    case "$_dc" in ''|*[!0-9]*) _dc=0 ;; esac
+    _last="$(cat "$STATE/cooldown.$rule" 2>/dev/null)"
+    case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+    if [ "$_last" -gt 0 ] && [ "$((NOW - _last))" -lt "$RM_CD" ]; then
+        _cd="剩 $(cd_text "$((RM_CD - (NOW - _last)))")"
+    else
+        _cd="无"
+    fi
+    printf '%-12s 今日 %s/%s · 冷却 %s · 阈值 %s 分钟内 ≥%s（静默窗 ≥%s）\n' \
+        "$RM_TITLE" "$_dc" "$RM_CAP" "$_cd" "$((RM_WIN / 60))" "$RM_MIN" "$RM_MINQ"
+    return 0
+}
+
+# ------------------------------------------------------------------
+# 入口
+# ------------------------------------------------------------------
+CMD="${1:-run}"
+case "$CMD" in
+    # run 在巡检链里跑：整条命令的 stderr 一并丢掉。
+    # 逐条命令重定向是主力，这里是最后一道保险 —— 任何一处漏网的报错
+    # 都不该污染巡检的输出（check / status 是人手敲的，保留 stderr 便于排查）。
+    run)    do_run 2>/dev/null ;;
+    check)  do_check "${2:-2}" ;;
+    status) do_status ;;
+    *)
+        printf '用法: %s {run|check [小时]|status}\n' "$0" >&2
+        exit 1
+        ;;
+esac
+
+# 永远成功退出：本脚本绝不能影响调用它的巡检
+exit 0

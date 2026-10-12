@@ -26,7 +26,9 @@ end
 local function api_patch(endpoint, data, timeout)
     timeout = timeout or 3
     local body = json.stringify(data)
-    local cmd = string.format("curl -s -m %d -X PATCH -H 'Content-Type: application/json' -d '%s' '%s%s'", timeout, body, API_BASE, endpoint)
+    -- 必须走 shell_quote：原先用裸 '-d '%s'' 包裹，body 里的单引号会直接逃出引号，
+    -- 形成命令注入（例如 mode = "rule'; sleep 999; #" 可让机器人卡 999 秒）。
+    local cmd = string.format("curl -s -m %d -X PATCH -H 'Content-Type: application/json' -d %s '%s%s'", timeout, shell_quote(body), API_BASE, endpoint)
     return core.exec(cmd)
 end
 
@@ -72,7 +74,15 @@ function M.mode()
     return "unknown"
 end
 
+-- 白名单：mode 来自客户端上报的 callback_data，必须校验后才允许落到 shell。
+-- 同文件的 direct_add 早就有 valid_target 校验，这里原先缺失。
+local VALID_MODES = { rule = true, global = true, direct = true }
+
 function M.set_mode(mode)
+    mode = tostring(mode or ""):match("^%s*(.-)%s*$") or ""
+    if not VALID_MODES[mode] then
+        return nil, "invalid_mode"
+    end
     api_patch("/configs", { mode = mode }, 3)
     return mode
 end
@@ -161,30 +171,45 @@ function M.proxy_delay(group_name)
     return nil
 end
 
+-- 直连白名单统一到新实现 /usr/bin/tohsakawrt-clash-direct。
+-- 它把规则写进 /etc/openclash/config/config.yaml 的 TG_DIRECT_RULES 段 —— 那才是 OpenClash
+-- 实际加载的模块配置。旧实现 /usr/bin/tohsaka-direct 写的是 /etc/openclash/tg_direct_rules.list，
+-- 该文件不被任何配置 include（已在设备上 grep 确认），只有它顺带同步的运行态 yaml 会生效，
+-- 于是出现"清单里看不到刚加的规则、撤销了也不生效"的分叉：实测两套清单内容已不一致
+-- （旧：fxxk.dedyn.io；新：www.workbuddy.ai + fxxk.dedyn.io）。
+local DIRECT_BIN = "/usr/bin/tohsakawrt-clash-direct"
+
 function M.direct_list()
-    local f = io.open("/etc/openclash/tg_direct_rules.list", "r")
-    if not f then return {} end
+    local raw = core.exec(DIRECT_BIN .. " list 2>/dev/null") or ""
     local list = {}
-    for line in f:lines() do
-        line = line:match("^%s*(.-)%s*$")
-        if line ~= "" and not line:match("^#") then
-            table.insert(list, line)
+    for line in raw:gmatch("[^\r\n]+") do
+        local d = line:match("^%s*(.-)%s*$")
+        if d ~= "" and not d:match("^#") then
+            table.insert(list, d)
         end
     end
-    f:close()
     return list
 end
 
-function M.direct_add(target)
+-- 只取首行判定：脚本在热重载失败时会额外输出一行 RELOAD_FAILED:<code>，
+-- 用整体精确比较会把"已写入成功"误判成失败（进而"重试→ALREADY→又判失败"，
+-- 主路径变成既无法成功也无法撤销）。
+local function direct_run(verb, target)
     if not valid_target(target) then return "ERROR:invalid_target" end
-    local res = core.exec_line("/usr/bin/tohsaka-direct add " .. shell_quote(target) .. " 2>/dev/null")
-    return res
+    local raw = core.exec(DIRECT_BIN .. " " .. verb .. " " .. shell_quote(target) .. " 2>/dev/null") or ""
+    local first = raw:match("^([^\r\n]+)") or ""
+    if raw:find("RELOAD_FAILED:", 1, true) then
+        return first .. "|RELOAD_FAILED"
+    end
+    return first
+end
+
+function M.direct_add(target)
+    return direct_run("add", target)
 end
 
 function M.direct_del(target)
-    if not valid_target(target) then return "ERROR:invalid_target" end
-    local res = core.exec_line("/usr/bin/tohsaka-direct del " .. shell_quote(target) .. " 2>/dev/null")
-    return res
+    return direct_run("del", target)
 end
 
 return M

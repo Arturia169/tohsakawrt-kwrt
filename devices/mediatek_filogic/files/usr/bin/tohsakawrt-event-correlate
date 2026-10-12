@@ -1,0 +1,933 @@
+#!/usr/bin/lua
+-- TohsakaWrt 网络黑匣子 —— 因果关联（第三步：把"事件列表"变成"因果链"）
+--
+--   show [小时数] [--text]          窗口内的事故簇 + 断网前因（默认 24 小时，默认 HTML）
+--   around <epoch> [分钟] [--text]  分析某个时刻前后（默认 ±10 分钟）
+--   raw                             调试用：输出解析后的事件（含无法解析的行）
+--
+-- 事件格式（由 tohsakawrt-event 写入，格式已冻结）：
+--   <epoch> <level> <kind> <actor> <message>
+--
+-- 为什么单独一个脚本，而不是把逻辑并进 tohsakawrt-event-log：
+--   event-log 回答"那段时间发生了哪些事"，要求【一条不漏】；
+--   本脚本回答"为什么卡了 / 断了"，要求【只留下有意义的少数几条】。
+--   两者的取舍正好相反（展示上限、排序方式、要不要给结论），
+--   混在一起会互相牵制，所以拆开：event-log 一行不改，本脚本独立演进。
+--
+-- 两个核心概念：
+--   ① 事件簇：时间上挨得近的一串事件 —— 通常是一次事故，而不是若干独立小事。
+--   ② 断网前因：断网事件【之前】一小段时间里的事件，按"最可能是原因"的顺序列出。
+--      ⚠️ 本脚本只陈述【先后关系】，不声称因果。真正的因果要人看序列判断：
+--         例如"制式降级"既可能是断网的原因，也可能是断网的结果（掉信号才降级）。
+--
+-- 输出长度：HTML 模式必须 ≤ 4000 字节（Telegram 单条上限 4096）。
+--   做法是逐行累加字节数，超了就把整行不输出并计数，最后统一说明省略了多少行。
+--   为什么不做"截断半行"：HTML 标签被切成两半会让 Telegram 直接拒收整条消息，
+--   宁可少显示一行，也不能产出非法 HTML。
+
+local LOG = os.getenv("TWR_EVENT_LOG") or "/etc/tohsakawrt/events.log"
+
+-- ==================================================================
+-- 一、可调参数
+--   这些数字就是本脚本的"判断力"所在，所以每个取值都写清理由。
+--   全部可用环境变量覆盖，方便在真机上按实际数据再调（不用改代码）。
+-- ==================================================================
+
+-- 环境变量取整数参数：拿不到 / 写错 / 负数 一律退回默认值。
+-- 为什么要包一层：这些变量是给真机调参用的，写错一个不该让整个脚本崩掉。
+local function env_num(name, default)
+    local n = tonumber(os.getenv(name) or "")
+    if not n then return default end
+    n = math.floor(n)
+    if n < 0 then return default end
+    return n
+end
+
+-- 事件簇：相邻两条事件间隔 ≤ CLUSTER_GAP 秒就归为一簇。
+-- 为什么是 120 秒：
+--   * 一次事故里每一步的耗时是"几十秒"量级 —— 机器人回调几秒、
+--     ifup 约 45 秒、模组自愈轮询最多 30 秒 + 复归等待 10 秒，
+--     最慢的一步约 90 秒。阈值取 120 秒刚好覆盖"最慢的一步"，
+--     不会把同一次事故劈成两簇（漏报）。
+--   * 正常运行时事件是稀疏的（真机样例里相邻间隔 100 秒 ~ 3.2 小时），
+--     阈值放宽到 300 秒以上就会把"降级"和几分钟后的"恢复"粘成一簇（误报）。
+--   即：120 秒 ≈ 一个最慢步骤的时长。
+local CLUSTER_GAP = env_num("TWR_EVENT_CLUSTER_GAP", 120)
+
+-- 簇的跨度上限（误报防护）：
+--   只看"相邻间隔"有个漏洞 —— 每 100 秒来一条无关事件（例如每分钟一次的
+--   机器人回调）会首尾相连，把几小时的事件串成一个巨大的"簇"。
+--   所以再加一条硬约束：跨度超过 15 分钟就强制断开，宁可多切一刀。
+local CLUSTER_MAX_SPAN = env_num("TWR_EVENT_CLUSTER_SPAN", 900)
+
+-- 断网前因的回溯窗口：5 分钟。
+-- 为什么是 5 分钟：真机上"用户点了按钮 → 模组掉线"的间隔是几秒到几十秒；
+-- 5 分钟足够覆盖"点按钮 → 模组自愈 → 掉线"这种慢链，
+-- 又不至于把半小时前的无关操作也算进来（那只会制造噪音）。
+-- 输出里每条前因都标了"前多少秒"，所以离得近的自然一眼可见。
+local CAUSE_WINDOW = env_num("TWR_EVENT_CAUSE_WINDOW", 300)
+
+-- 恢复判定窗口：断网后 30 分钟内找不到"恢复"事件，就如实说"没看到恢复"，
+-- 而不是猜一个恢复时间 —— 黑匣子给出的每个结论都必须能追溯到某条事件。
+local RECOVER_WINDOW = env_num("TWR_EVENT_RECOVER_WINDOW", 1800)
+
+-- 展示上限：先靠这些上限把输出压住，再用字节上限兜底。
+-- 断网前因放在最前面（最有价值），簇放后面，所以被截掉时损失最小。
+local MAX_OUTAGES = 3          -- 最多分析几次断网（最近的优先）
+local MAX_CAUSES = 5           -- 每次断网最多列几条前因（离断网最近的优先）
+local MAX_CLUSTERS = 4         -- 最多列几个事故簇
+local MAX_CLUSTER_LINES = 7    -- 每个簇最多列几条事件
+local MAX_ISOLATED = 3         -- 最多列几条"没成簇的孤立告警"
+local MAX_AROUND_LINES = 12    -- around 模式最多列几条窗口内事件（留出预算给断网前因）
+local BYTE_LIMIT = 3900        -- 硬上限 4000 字节，留 100 字节给结尾的省略提示
+
+local LEVEL_ICON = {
+    info  = "⚪",
+    warn  = "🟡",
+    error = "🔴",
+    crit  = "🚨",
+}
+
+-- 类别标签与 event-log 保持一致：同一份数据在两个命令里必须长得一样，
+-- 否则用户在两个卡片之间切换时会产生"这是不是同一件事"的困惑。
+local KIND_LABEL = {
+    avail  = "可用",
+    rat    = "制式",
+    uplink = "出口",
+    modem  = "模组",
+    proxy  = "代理",
+    bot    = "操作",
+    alert  = "告警",
+    sys    = "系统",
+}
+
+-- 严重度权重：级别是"这条事件有多严重"，类别是"这条事件离网络可用性有多近"。
+-- 两者相加得到单条事件的权重，簇的分数取簇内最大值 —— 这样"一条 crit"永远
+-- 压过"一堆 info"，符合"事故看最坏那条"的直觉。
+local LEVEL_W = { info = 0, warn = 12, error = 25, crit = 40 }
+local KIND_W  = {
+    avail  = 20,   -- 可用性事件：直接就是断网/恢复，权重最高
+    alert  = 15,
+    modem  = 6,    -- 模组自愈动作：可能主动打断连接（例如切 AT 口、复位）
+    proxy  = 5,    -- 代理核心重启
+    uplink = 4,    -- 出口切换
+    rat    = 3,    -- 制式变化：常常是症状而不是原因，所以权重低
+    bot    = 1,    -- 用户操作本身不严重，但它是"最可能的诱因"，另有排序权重
+    sys    = 0,
+}
+local OUTAGE_BONUS = 10        -- 明确是"断网"的 avail 事件再加一点
+
+-- "最可疑"的排序权重（与上面的严重度是两回事）：
+--   严重度回答"这条事件多坏"，可疑度回答"这条事件多大程度上可能是原因"。
+--   能成为【外部输入】或【主动干预】的排前面：
+--     操作(用户点了按钮) > 模组(自愈动作可能打断连接) > 代理(核心重启)
+--     > 出口(改路由) > 制式(通常是症状) > 告警
+local SUSPECT_RANK = { bot = 6, modem = 5, proxy = 4, uplink = 3, rat = 2, alert = 1 }
+
+local CIRCLED = { "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩" }
+
+-- ==================================================================
+-- 二、基础工具
+-- ==================================================================
+
+local function readfile(p)
+    local f = io.open(p, "r")
+    if not f then return nil end
+    local s = f:read("*a")
+    f:close()
+    return s
+end
+
+-- HTML 转义：message 是自由文本，可能含 < > &（例如 "RSSI < -100"），
+-- 不转义会让 Telegram 的 HTML 解析器把消息吃掉半截、甚至整条拒收。
+-- 顺序必须是 & 先转，否则会把后面生成的 &lt; 再转一次变成 &amp;lt;。
+local function esc(s)
+    s = tostring(s or "")
+    s = s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+    return s
+end
+
+-- 按【UTF-8 字符边界】截断。
+-- 为什么不能直接 string.sub(s, 1, n)：中文一个字 3 字节，从中间切开会产生
+-- 非法 UTF-8 序列，Telegram 会拒收。这里按首字节判断字符长度，整字保留。
+-- 首字节落在 0x80~0xBF（续字节）说明输入本身就不是合法 UTF-8，
+-- 此时按 1 字节前进，保证循环一定能结束（不会死循环）。
+local function u_trunc(s, limit)
+    s = tostring(s or "")
+    if #s <= limit then return s end
+    local i = 1
+    while i <= #s do
+        local b = s:byte(i) or 0
+        local len = 1
+        if b >= 0xF0 then len = 4
+        elseif b >= 0xE0 then len = 3
+        elseif b >= 0xC0 then len = 2 end
+        if i + len - 1 > limit then break end
+        i = i + len
+    end
+    if i <= 1 then return "…" end
+    return s:sub(1, i - 1) .. "…"
+end
+
+local function fmt_dur(sec)
+    sec = math.floor(tonumber(sec) or 0)
+    if sec < 0 then sec = 0 end
+    if sec < 60 then return string.format("%d 秒", sec) end
+    if sec < 3600 then
+        local m = math.floor(sec / 60)
+        local s = sec % 60
+        if s == 0 then return string.format("%d 分", m) end
+        return string.format("%d 分 %d 秒", m, s)
+    end
+    local h = math.floor(sec / 3600)
+    local m = math.floor((sec % 3600) / 60)
+    return string.format("%d 小时 %d 分", h, m)
+end
+
+local function fmt_clock(ts) return os.date("%m-%d %H:%M:%S", ts) end
+local function fmt_hms(ts)   return os.date("%H:%M:%S", ts) end
+local function fmt_day(ts)   return os.date("%m-%d", ts) end
+
+-- 起止时间：同一天就不重复写日期（省字节，也更像人话）
+local function fmt_range(t1, t2)
+    local d1, d2 = fmt_day(t1), fmt_day(t2)
+    if d1 == d2 then
+        return string.format("%s %s → %s", d1, fmt_hms(t1), fmt_hms(t2))
+    end
+    return string.format("%s %s → %s %s", d1, fmt_hms(t1), d2, fmt_hms(t2))
+end
+
+-- 展示用短消息。100 字节 ≈ 33 个汉字 —— 真机上最长的那条
+-- （"AT 口 /dev/ttyUSB2 连续 5 次读取失败，实测改用 /dev/ttyUSB3"）是 72 字节，
+-- 所以 100 字节既不会截断正常消息，又能挡住"某条消息特别长"把预算吃光。
+-- 注意：这是"可读性"截断，真正防超长的是下面按【转义后】字节数累加的 emit。
+local function short_msg(e, limit)
+    return u_trunc(e.msg, limit or 100)
+end
+
+-- ==================================================================
+-- 三、判定：什么算断网、单条事件多重、哪些事件能当"嫌疑"
+-- ==================================================================
+
+-- 判断一个【纯 ASCII 单词】是否作为独立单词出现。
+-- 为什么要这么麻烦：如果用朴素子串匹配，download / shutdown / backup
+-- 都会被当成 down / up，凭空造出一次断网或一次恢复。
+-- 为什么不用 Lua 的 frontier 模式 %f[%a]down%f[%A]：%f 在 Lua 5.1 里是支持的，
+-- 但本项目其它脚本一个都没用过它，而本机没有 lua 无法实测；
+-- 换成只用 %W（非字母数字）把"词首/词中/词尾"三种位置显式列出来，
+-- 效果等价，依赖的字符类又是最常见的那几个，风险更低。
+-- 注意：w 必须是纯 ASCII 单词（不含 Lua 模式里的特殊字符），否则模式会被解释错。
+local function has_word(lower, w)
+    if lower == w then return true end
+    if lower:find("^" .. w .. "%W") then return true end
+    if lower:find("%W" .. w .. "%W") then return true end
+    if lower:find("%W" .. w .. "$") then return true end
+    return false
+end
+
+-- 断网判定：kind=avail 且消息里有"中断/掉线/断网/离线"，或有独立的 down / offline。
+-- 中文没有词边界，只能按子串匹配 —— 这是已知的粗糙之处，见交付报告"误报评估"。
+-- 这几个词是照着采集器 tohsakawrt-event-collect 里【所有 avail 事件的原文】定的，
+-- 少一个就会漏掉一类断网，所以逐一核对过：
+--   台账导入：网络中断                      → 中断
+--   网络状态变化: up -> down                → 箭头右边是 down
+--   WAN offline after 3 consecutive checks  → 独立的 offline
+--   <iface> is now down                     → 独立的 down
+-- 对照：同项目的 tohsakawrt-event-watch 只认 "-> down" 和 "网络中断" 两种，
+-- 这里刻意更全一点（多认 offline / is now down），因为漏报一次断网的代价更高。
+local function is_outage(e)
+    if e.kind ~= "avail" then return false end
+    local m = e.msg
+    local lower = m:lower()
+
+    -- ⚠️ 带箭头的"状态转移"必须先单独处理，而且只看【箭头右边】。
+    -- 否则 "网络状态变化: down -> up"（这是恢复！）会因为句子里有个 down
+    -- 被当成断网 —— 结果是每一次恢复都平白多出一次断网，前因分析全是错的。
+    local arrow = lower:find("->", 1, true)
+    if arrow then
+        local to = lower:sub(arrow + 2)
+        if has_word(to, "down") or has_word(to, "offline") then return true end
+        return false          -- 转移到 up / online 之类：那是恢复，不是断网
+    end
+
+    if m:find("中断", 1, true) or m:find("掉线", 1, true)
+        or m:find("断网", 1, true) or m:find("离线", 1, true) then
+        return true
+    end
+    if has_word(lower, "down") or has_word(lower, "offline") then return true end
+    return false
+end
+
+-- 恢复判定：kind=avail 且不是断网，且消息里有"恢复/上线"，或有独立的 up / recover。
+-- 为什么把"上线"也算恢复：路由器重启后采集器会写"设备上线（开机自检完成）"，
+-- 对"这次断网多久恢复"来说它就是一个合法的恢复信号（哪怕中间重启过）。
+-- 与 is_outage 对称：带箭头的状态转移同样只看箭头右边。
+local function is_recovery(e)
+    if e.kind ~= "avail" or is_outage(e) then return false end
+    local m = e.msg
+    local lower = m:lower()
+    local arrow = lower:find("->", 1, true)
+    if arrow then
+        local to = lower:sub(arrow + 2)
+        if has_word(to, "up") or has_word(to, "online") then return true end
+        return false
+    end
+    if m:find("恢复", 1, true) or m:find("上线", 1, true) then return true end
+    if has_word(lower, "up") or lower:find("recover", 1, true) then return true end
+    return false
+end
+
+local function event_weight(e)
+    local w = (LEVEL_W[e.level] or 0) + (KIND_W[e.kind] or 0)
+    if is_outage(e) then w = w + OUTAGE_BONUS end
+    return w
+end
+
+-- ==================================================================
+-- 四、读事件
+-- ==================================================================
+
+-- 解析结果：
+--   events  —— 已按时间排序的事件数组（元素含 ts/level/kind/actor/msg/seq）
+--   lines   —— 非空行总数
+--   skipped —— 非空但无法解析的行数（格式坏了才会 >0，正常恒为 0）
+--   samples —— 最多 3 条坏行样本，供 raw 模式排查
+--   exists  —— 文件是否存在（区分"没有文件"和"文件是空的"，提示语不同）
+local function load_events(path)
+    local data = { events = {}, lines = 0, skipped = 0, samples = {}, exists = false }
+    local raw = readfile(path)
+    if not raw then return data end
+    data.exists = true
+
+    for line in raw:gmatch("[^\r\n]+") do
+        -- 纯空白行不算"坏行"：轮转/手工编辑可能留下空行，报出来只会干扰排查
+        if line:match("%S") then
+            data.lines = data.lines + 1
+            local ts, level, kind, actor, msg =
+                line:match("^(%d+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(.+)$")
+            if ts then
+                data.events[#data.events + 1] = {
+                    ts = tonumber(ts) or 0,
+                    level = level, kind = kind, actor = actor, msg = msg,
+                    seq = data.lines,
+                }
+            else
+                data.skipped = data.skipped + 1
+                if #data.samples < 3 then data.samples[#data.samples + 1] = line end
+            end
+        end
+    end
+
+    -- 同一秒内的事件用【行号】兜底排序：文件是追加写的，行号就是真实先后。
+    -- 不能用消息字典序代替 —— 那会把"用户点了按钮"和"模组掉了"这两条
+    -- 同一秒的事件排成相反的顺序，因果链就反了。
+    -- 另外 Lua 5.1 的 table.sort 不是稳定排序，所以必须给出这个确定的全序。
+    table.sort(data.events, function(a, b)
+        if a.ts ~= b.ts then return a.ts < b.ts end
+        return a.seq < b.seq
+    end)
+
+    return data
+end
+
+-- 取 [t1, t2] 内的事件（events 已排序，结果天然有序）
+local function events_between(events, t1, t2)
+    local out = {}
+    for _, e in ipairs(events) do
+        if e.ts >= t1 and e.ts <= t2 then out[#out + 1] = e end
+    end
+    return out
+end
+
+-- ==================================================================
+-- 五、分析
+-- ==================================================================
+
+-- 事件簇识别：相邻间隔 ≤ gap 且跨度 ≤ maxspan 就归为一簇。
+-- 注意是"相邻间隔"而不是"与簇首的间隔"：一次事故里各步骤可能拖到几分钟，
+-- 但只要每一步之间都挨得近，就仍然是同一次事故。
+local function clusterize(events, gap, maxspan)
+    local clusters = {}
+    local cur = nil
+
+    for _, e in ipairs(events) do
+        if cur and (e.ts - cur.last_ts) <= gap and (e.ts - cur.start_ts) <= maxspan then
+            cur.items[#cur.items + 1] = e
+            cur.last_ts = e.ts
+        else
+            cur = { start_ts = e.ts, last_ts = e.ts, items = { e } }
+            clusters[#clusters + 1] = cur
+        end
+    end
+
+    for ci, c in ipairs(clusters) do
+        c.seq = ci
+        c.n = #c.items
+        c.span = c.last_ts - c.start_ts
+        local best, best_ev = -1, c.items[1]
+        local kinds = {}
+        local has_outage = false
+        for _, e in ipairs(c.items) do
+            local w = event_weight(e)
+            if w > best then best, best_ev = w, e end
+            kinds[e.kind] = (kinds[e.kind] or 0) + 1
+            if is_outage(e) then has_outage = true end
+        end
+        c.worst = best_ev
+        c.kinds = kinds
+        c.has_outage = has_outage
+        -- 分数 = 最坏那条的权重 * 100 + 条数（封顶 99）。
+        -- 乘 100 是为了让"最坏那条"绝对优先：一条 crit 永远排在十条 info 前面。
+        c.score = best * 100 + math.min(c.n, 99)
+    end
+
+    -- 排序：严重度降序；同分时【近的排前面】（事故复盘通常先看最近那次）；
+    -- 再同就按簇的原始序号，保证结果稳定（table.sort 需要确定的全序）。
+    table.sort(clusters, function(a, b)
+        if a.score ~= b.score then return a.score > b.score end
+        if a.start_ts ~= b.start_ts then return a.start_ts > b.start_ts end
+        return a.seq < b.seq
+    end)
+
+    for i, c in ipairs(clusters) do c.rank = i end
+    return clusters
+end
+
+-- 断网前因：断网【之前】window 秒内的事件，按时间顺序返回（旧 → 新）。
+-- 用下标而不是时间戳做边界：同一秒内的多条事件，只有下标能确定谁在前。
+local function causes_before(events, idx, window)
+    local t = events[idx].ts
+    local rev = {}
+    for j = idx - 1, 1, -1 do
+        local e = events[j]
+        if t - e.ts > window then break end
+        rev[#rev + 1] = e
+    end
+    local out = {}
+    for k = #rev, 1, -1 do out[#out + 1] = rev[k] end
+    return out
+end
+
+-- 断网后多久恢复：找下一条"恢复"事件。找不到就返回 nil（如实说没看到）。
+local function recovery_after(events, idx, window)
+    local t = events[idx].ts
+    for j = idx + 1, #events do
+        local e = events[j]
+        if e.ts - t > window then break end
+        if is_recovery(e) then return e, e.ts - t end
+    end
+    return nil, nil
+end
+
+-- 在候选前因里挑"最可疑"的一条：先看可疑度权重，同权重取离断网最近的。
+-- 只是【排序建议】，不是结论 —— 输出里用"最可疑"而不是"原因"就是这个意思。
+local function pick_suspect(causes, ts)
+    local best, best_rank, best_delta = nil, -1, 0
+    for _, e in ipairs(causes) do
+        local r = SUSPECT_RANK[e.kind]
+        if r then
+            local d = ts - e.ts
+            if r > best_rank or (r == best_rank and d < best_delta) then
+                best, best_rank, best_delta = e, r, d
+            end
+        end
+    end
+    return best, best_delta
+end
+
+-- 取离中心时刻最近的 maxn 条（around 模式用）。
+-- 为什么不是"取前 20 条"：用户问的是"那个时刻"，所以越靠近中心的越该留下；
+-- 选完再按时间排回来，读起来仍然是一条时间线。
+local function nearest_subset(list, center, maxn)
+    if #list <= maxn then return list, 0 end
+    local copy = {}
+    for i = 1, #list do copy[i] = list[i] end
+    table.sort(copy, function(a, b)
+        local da, db = math.abs(a.ts - center), math.abs(b.ts - center)
+        if da ~= db then return da < db end
+        return a.seq < b.seq
+    end)
+    local keep = {}
+    for i = 1, maxn do keep[i] = copy[i] end
+    table.sort(keep, function(a, b)
+        if a.ts ~= b.ts then return a.ts < b.ts end
+        return a.seq < b.seq
+    end)
+    return keep, #list - maxn
+end
+
+-- ==================================================================
+-- 六、输出缓冲
+--   逐行累加【转义后】的字节数，保证最终 ≤ 4000 字节。
+--   用转义后的长度而不是原始长度：& 转成 &amp; 会膨胀 5 倍，
+--   只算原始长度会在含特殊字符时超限。
+-- ==================================================================
+
+local PLAIN = false
+local OUT = {}
+local out_bytes = 0
+local dropped = 0
+
+local function emit(line)
+    line = tostring(line or "")
+    -- +1 是行尾换行符（拼接时才产生，但预算里先算上，免得正好差一点点超限）
+    if out_bytes + #line + 1 > BYTE_LIMIT then
+        dropped = dropped + 1
+        return false
+    end
+    OUT[#OUT + 1] = line
+    out_bytes = out_bytes + #line + 1
+    return true
+end
+
+local function finish()
+    if dropped > 0 then
+        local note
+        if PLAIN then
+            note = string.format("（因长度限制省略 %d 行）", dropped)
+        else
+            note = string.format("<i>（因长度限制省略 %d 行）</i>", dropped)
+        end
+        -- 直接追加：BYTE_LIMIT 已经为它留了 100 字节余量。
+        -- 这里再判一次 4000 是最后一道保险 —— 无论前面发生什么，
+        -- 都不能越过 Telegram 的上限（超了就是整条消息被拒，什么都看不到）。
+        if out_bytes + #note + 1 <= 4000 then
+            OUT[#OUT + 1] = note
+        end
+    end
+    print(table.concat(OUT, "\n"))
+end
+
+-- ==================================================================
+-- 七、渲染零件
+-- ==================================================================
+
+-- 一条事件（列表用）。with_date 决定要不要带日期。
+local function ev_line(e, with_date)
+    local t = with_date and fmt_clock(e.ts) or fmt_hms(e.ts)
+    local icon = LEVEL_ICON[e.level] or "⚪"
+    local label = KIND_LABEL[e.kind] or e.kind
+    local msg = short_msg(e, 100)
+    if PLAIN then
+        return string.format("%s %s %s  %s", t, icon, label, msg)
+    end
+    return string.format("<code>%s</code> %s <b>%s</b>  %s",
+        t, icon, esc(label), esc(msg))
+end
+
+-- 一条前因（带"前多少秒"）。相对时间放在最前面，因为它才是判断因果的关键信息。
+local function cause_line(e, ts)
+    local d = ts - e.ts
+    local rel
+    if d <= 0 then rel = "同一秒" else rel = "前 " .. fmt_dur(d) end
+    local icon = LEVEL_ICON[e.level] or "⚪"
+    local label = KIND_LABEL[e.kind] or e.kind
+    local msg = short_msg(e, 100)
+    if PLAIN then
+        return string.format("%s [%s] %s %s  %s", fmt_hms(e.ts), rel, icon, label, msg)
+    end
+    return string.format("<code>%s</code> <i>%s</i> %s <b>%s</b>  %s",
+        fmt_hms(e.ts), esc(rel), icon, esc(label), esc(msg))
+end
+
+-- 簇的类别构成。按条数降序、再按类别名升序 —— 保证输出稳定
+-- （pairs 的遍历顺序在 Lua 里是不确定的，直接用会让同一份数据每次显示不一样）。
+local function kinds_str(kinds)
+    local ks = {}
+    for k in pairs(kinds) do ks[#ks + 1] = k end
+    table.sort(ks, function(a, b)
+        if kinds[a] ~= kinds[b] then return kinds[a] > kinds[b] end
+        return a < b
+    end)
+    local parts = {}
+    for _, k in ipairs(ks) do
+        local label = KIND_LABEL[k] or k
+        if PLAIN then
+            parts[#parts + 1] = string.format("%s%d", label, kinds[k])
+        else
+            parts[#parts + 1] = string.format("%s<b>%d</b>", esc(label), kinds[k])
+        end
+    end
+    return table.concat(parts, " ")
+end
+
+-- 下面两个包装器都先把参数收敛成字符串再返回：
+-- 调用点会写 strong(#win) 这种"传数字"的用法，而 string.format("%s", 数字)
+-- 在 5.1 里虽然能工作（会就地转成字符串），但没必要依赖这个细节 ——
+-- 显式 tostring 一下，语义明确、也不怕以后换实现。
+local function strong(s)
+    s = tostring(s or "")
+    if PLAIN then return s end
+    return "<b>" .. esc(s) .. "</b>"
+end
+
+local function dim(s)
+    s = tostring(s or "")
+    if PLAIN then return s end
+    return "<i>" .. esc(s) .. "</i>"
+end
+
+-- 纯文本模式绝不能转义（否则用户会看到 &lt; 这种字面量），
+-- 所以凡是"可能含 < > &"的自由文本都要走这里。
+-- 注意：必须定义在 PLAIN 之后 —— 定义在前面的话，PLAIN 还没进入词法作用域，
+-- 这里读到的会是一个永远为 nil 的【全局】PLAIN，等于转义永远生效。
+local function maybe_esc(s)
+    if PLAIN then return tostring(s or "") end
+    return esc(s)
+end
+
+-- 一次断网的完整前因分析。
+local function emit_outage(events, idx, mark)
+    local e = events[idx]
+    emit(string.format("%s %s 断网", mark, strong(fmt_clock(e.ts))))
+
+    local causes = causes_before(events, idx, CAUSE_WINDOW)
+    if #causes == 0 then
+        emit("   " .. dim(string.format("断网前 %s内没有其他事件 —— 孤立断网", fmt_dur(CAUSE_WINDOW))))
+    else
+        local show, omitted = causes, 0
+        if #causes > MAX_CAUSES then
+            omitted = #causes - MAX_CAUSES
+            show = {}
+            -- 只保留【离断网最近】的几条：越靠近断网越可能是原因
+            for k = #causes - MAX_CAUSES + 1, #causes do show[#show + 1] = causes[k] end
+        end
+        if omitted > 0 then
+            emit("   " .. dim(string.format("更早的 %d 条前因略", omitted)))
+        end
+        for _, ce in ipairs(show) do
+            emit("   " .. cause_line(ce, e.ts))
+        end
+
+        local sus, delta = pick_suspect(causes, e.ts)
+        if sus then
+            local label = KIND_LABEL[sus.kind] or sus.kind
+            emit(string.format("   ⚠️ 最可疑：%s（%s）%s",
+                strong(label), maybe_esc("前 " .. fmt_dur(delta)), maybe_esc(u_trunc(sus.msg, 60))))
+        end
+    end
+
+    local rec, rd = recovery_after(events, idx, RECOVER_WINDOW)
+    if rec then
+        emit(string.format("   ⏱️ 恢复 +%s（%s）", esc(fmt_dur(rd)), esc(fmt_clock(rec.ts))))
+    else
+        emit("   ⏱️ " .. dim(string.format("%s内未见恢复事件", fmt_dur(RECOVER_WINDOW))))
+    end
+end
+
+-- 一个事故簇。
+local function emit_cluster(c, mark)
+    local icon = LEVEL_ICON[c.worst.level] or "⚪"
+    emit(string.format("%s %s %s（%s）· %d 条 · %s",
+        mark, icon, strong(fmt_range(c.start_ts, c.last_ts)),
+        esc(fmt_dur(c.span)), c.n, kinds_str(c.kinds)))
+
+    local show = c.items
+    if c.n > MAX_CLUSTER_LINES then
+        -- 保留首尾：开头能看出事故怎么起，结尾能看出怎么收
+        local half = math.floor(MAX_CLUSTER_LINES / 2)
+        show = {}
+        for i = 1, half do show[#show + 1] = c.items[i] end
+        for i = c.n - (MAX_CLUSTER_LINES - half) + 1, c.n do show[#show + 1] = c.items[i] end
+    end
+    local prev = nil
+    for _, e in ipairs(show) do
+        if prev and e.ts - prev.ts > 0 and c.n > MAX_CLUSTER_LINES then
+            -- 首尾拼接处：标明中间跳过了多少条，免得看起来像连续事件
+            local gapn = 0
+            for _, x in ipairs(c.items) do
+                if x.ts > prev.ts and x.ts < e.ts then gapn = gapn + 1 end
+            end
+            if gapn > 0 then emit("   " .. dim(string.format("… 中间省略 %d 条 …", gapn))) end
+        end
+        emit("   " .. ev_line(e, false))
+        prev = e
+    end
+end
+
+-- 窗口内没有事件时的友好提示（绝不报错，也不输出空消息）。
+local function empty_hint(data, scope)
+    if not data.exists then
+        return string.format("事件文件还不存在（%s）—— 采集器每分钟运行一次，稍后再看。", LOG)
+    end
+    if data.lines == 0 then
+        return "事件文件还是空的 —— 采集器每分钟运行一次，稍后再看。"
+    end
+    if data.skipped > 0 and data.skipped == data.lines then
+        return string.format("事件文件有 %d 行，但没有一行符合格式（用 raw 子命令排查）。", data.lines)
+    end
+    return string.format("%s内没有事件（文件里共 %d 行历史）。", scope, data.lines)
+end
+
+local function emit_empty(hint)
+    if PLAIN then
+        emit("网络黑匣子 · 因果关联")
+        emit(hint)
+    else
+        emit("🗃️ <b>网络黑匣子 · 因果关联</b>")
+        emit("")
+        emit("<i>" .. esc(hint) .. "</i>")
+    end
+end
+
+-- ==================================================================
+-- 八、参数解析
+-- ==================================================================
+
+local argv = arg or {}
+local sub = argv[1] or ""
+local rest = {}
+for i = 2, #argv do rest[#rest + 1] = argv[i] end
+
+local nums = {}
+for _, a in ipairs(rest) do
+    if a == "--text" or a == "-t" then
+        PLAIN = true
+    else
+        local n = tonumber(a)
+        if n then nums[#nums + 1] = n end
+    end
+end
+
+local function usage()
+    local L = {
+        "网络黑匣子 · 因果关联（把事件列表变成因果链）",
+        "",
+        "用法:",
+        "  tohsakawrt-event-correlate show [小时数] [--text]",
+        "      窗口内的事故簇 + 断网前因（默认 24 小时；默认输出 HTML）",
+        "  tohsakawrt-event-correlate around <epoch> [分钟] [--text]",
+        "      分析指定时刻前后（默认 ±10 分钟；分钟数是可选扩展）",
+        "  tohsakawrt-event-correlate raw",
+        "      调试用：输出解析后的事件（含无法解析的行）",
+        "",
+        string.format("事件文件: %s（可用 TWR_EVENT_LOG 覆盖）", LOG),
+    }
+    print(table.concat(L, "\n"))
+end
+
+if sub == "" then
+    usage()
+    os.exit(0)
+end
+
+-- ==================================================================
+-- 九、raw：只做解析，不做分析
+-- ==================================================================
+
+if sub == "raw" then
+    local data = load_events(LOG)
+    local L = {}
+    L[#L + 1] = string.format("# 事件文件 %s", LOG)
+    L[#L + 1] = string.format("# 非空行 %d · 解析成功 %d · 无法解析 %d",
+        data.lines, #data.events, data.skipped)
+    if not data.exists then
+        L[#L + 1] = "# 文件不存在或读不到（还没开始采集？）"
+    end
+    for _, e in ipairs(data.events) do
+        -- 行首给出 epoch 便于和 events.log 原文对照，后面是可读时间
+        L[#L + 1] = string.format("%d %s %-5s %-6s %-8s %s",
+            e.ts, fmt_clock(e.ts), e.level, e.kind, e.actor, short_msg(e, 200))
+    end
+    for _, b in ipairs(data.samples) do
+        L[#L + 1] = "# 无法解析: " .. u_trunc(b, 120)
+    end
+    print(table.concat(L, "\n"))
+    os.exit(0)
+end
+
+-- ==================================================================
+-- 十、show / around
+-- ==================================================================
+
+if sub ~= "show" and sub ~= "around" then
+    print(string.format("未知子命令: %s", sub))
+    print("")
+    usage()
+    os.exit(1)
+end
+
+local now = os.time()
+local data = load_events(LOG)
+local win, title, scope
+local w1, w2 = 0, 0        -- 窗口边界：断网事件按【全量下标】统计，需要这两个值
+
+if sub == "show" then
+    local hours = nums[1] or 24
+    if hours < 1 then hours = 1 end
+    if hours > 720 then hours = 720 end
+    hours = math.floor(hours)   -- 显式取整：%d 收到浮点虽然在 5.1 里能截断，但不该依赖这个细节
+    local cutoff = now - hours * 3600
+    -- 不设上界：真机上出现过时钟被 NTP 校正而事件时间略微超前的情况，
+    -- 那些"刚刚发生"的事件不该因为几秒的偏差被藏起来（与 event-log 行为一致）。
+    w1, w2 = cutoff, math.huge
+    win = events_between(data.events, w1, w2)
+    title = string.format("最近 %d 小时", hours)
+    scope = title
+else
+    local epoch = nums[1]
+    if not epoch or epoch < 100000000 then
+        print("around 需要给出一个 epoch 时间戳（秒），例如: tohsakawrt-event-correlate around 1791569700")
+        os.exit(1)
+    end
+    local minutes = nums[2] or 10
+    if minutes < 1 then minutes = 1 end
+    if minutes > 1440 then minutes = 1440 end
+    minutes = math.floor(minutes)
+    local half = minutes * 60
+    w1, w2 = epoch - half, epoch + half
+    win = events_between(data.events, w1, w2)
+    title = string.format("%s ± %d 分钟", fmt_clock(epoch), minutes)
+    scope = fmt_clock(epoch) .. " 前后 " .. minutes .. " 分钟"
+end
+
+-- 空态：文件没有 / 窗口内没有，都给一句人话
+if #win == 0 then
+    emit_empty(empty_hint(data, scope))
+    finish()
+    os.exit(0)
+end
+
+local clusters = clusterize(win, CLUSTER_GAP, CLUSTER_MAX_SPAN)
+
+-- 断网事件记的是【整个文件里的下标】，不是 win 里的下标。
+-- 为什么：前因要往回看 5 分钟、恢复要往后看 30 分钟，这两段都可能落在
+-- 展示窗口之外（around 的窗口只有 ±10 分钟，而恢复可能发生在 +25 分钟）。
+-- 用全量下标去查，才能看到窗口外的前因与恢复。
+local outages = {}
+for i, e in ipairs(data.events) do
+    if e.ts >= w1 and e.ts <= w2 and is_outage(e) then
+        outages[#outages + 1] = { idx = i, e = e }
+    end
+end
+
+-- 事故簇 = 含 ≥2 条事件的簇。单条事件不算"事故"，
+-- 否则时间线上每个孤立事件都会变成一个"簇"，把真正的事故淹掉。
+local dense = {}
+for _, c in ipairs(clusters) do
+    if c.n >= 2 then dense[#dense + 1] = c end
+end
+
+-- 孤立告警：没成簇、但级别 ≥ warn 或本身就是断网的事件。
+-- 单独列出来，是因为"孤立的 crit"同样重要，不该因为没成簇就消失。
+local isolated = {}
+for _, c in ipairs(clusters) do
+    if c.n == 1 then
+        local e = c.items[1]
+        if (LEVEL_W[e.level] or 0) >= LEVEL_W.warn or is_outage(e) then
+            isolated[#isolated + 1] = e
+        end
+    end
+end
+-- 近的排前面
+table.sort(isolated, function(a, b)
+    if a.ts ~= b.ts then return a.ts > b.ts end
+    return a.seq < b.seq
+end)
+
+-- ---- 标题与统计 ----
+if PLAIN then
+    emit("网络黑匣子 · 因果关联 · " .. title)
+    emit(string.rep("=", 46))
+else
+    emit("🗃️ <b>网络黑匣子 · 因果关联</b> · " .. esc(title))
+    emit("━━━━━━━━━━━━━━━━━━")
+end
+emit(string.format("📊 事件 %s 条 · 事故簇 %s 个 · 断网 %s 次 · 孤立告警 %s 条",
+    strong(#win), strong(#dense), strong(#outages), strong(#isolated)))
+
+-- ---- ⓪ around 专属：窗口内的时间线（▶ 标出用户问的那个时刻）----
+-- 放在断网前因之前：用户既然点名了一个时刻，第一件想知道的就是"那一刻前后
+-- 究竟按什么顺序发生了什么"，这就是这条时间线；前因分析是紧接着的第二问。
+-- 只取"离该时刻最近的若干条"，因为问的是"那个时刻"，越远的越不相关。
+if sub == "around" then
+    local epoch = nums[1]
+    local shown, omitted = nearest_subset(win, epoch, MAX_AROUND_LINES)
+    emit("")
+    emit(string.format("🕐 %s（▶ = 所问时刻）", strong("窗口内时间线")))
+    local exact = false
+    for _, e in ipairs(win) do
+        if e.ts == epoch then exact = true end
+    end
+    if not exact then
+        emit("   " .. dim(fmt_clock(epoch) .. " 本身没有事件，下面是最靠近它的事件"))
+    end
+    if omitted > 0 then
+        emit("   " .. dim(string.format("只显示最近的 %d 条，其余 %d 条略", MAX_AROUND_LINES, omitted)))
+    end
+    local marked = false
+    for _, e in ipairs(shown) do
+        local prefix = "   "
+        if not marked and e.ts >= epoch then
+            prefix = "▶ "
+            marked = true
+        end
+        emit(prefix .. ev_line(e, true))
+    end
+    if not marked then
+        emit("   " .. dim("该时刻之后，窗口内没有更多事件"))
+    end
+end
+
+-- ---- ① 断网前因（最有价值，放最前面）----
+if #outages > 0 then
+    local pick, omitted = outages, 0
+    if #outages > MAX_OUTAGES then
+        omitted = #outages - MAX_OUTAGES
+        pick = {}
+        -- 只分析【最近】的几次：老断网通常已经复盘过，而且日志可能已被轮转
+        for k = #outages - MAX_OUTAGES + 1, #outages do pick[#pick + 1] = outages[k] end
+    end
+    emit("")
+    emit(string.format("🚨 %s（%d 次，列最近 %d 次）",
+        strong("断网前因"), #outages, #pick))
+    if omitted > 0 then
+        emit(dim(string.format("更早的 %d 次断网略", omitted)))
+    end
+    -- 最近的排最前：事故复盘总是先看刚发生的那次
+    for k = #pick, 1, -1 do
+        emit_outage(data.events, pick[k].idx, CIRCLED[#pick - k + 1] or ("#" .. (#pick - k + 1)))
+    end
+else
+    emit("")
+    emit("✅ " .. dim(string.format("%s内没有断网事件", scope)))
+end
+
+-- ---- ② 事故簇（按严重度）----
+emit("")
+if #dense == 0 then
+    emit("🔗 " .. dim(string.format("未发现密集事件簇（事件间隔都大于 %d 秒）", CLUSTER_GAP)))
+else
+    local pick = dense
+    if #dense > MAX_CLUSTERS then
+        pick = {}
+        for i = 1, MAX_CLUSTERS do pick[i] = dense[i] end
+    end
+    emit(string.format("🔗 %s（按严重度，共 %d 个）", strong("事故簇"), #dense))
+    for i, c in ipairs(pick) do
+        emit_cluster(c, CIRCLED[i] or ("#" .. i))
+    end
+    if #dense > #pick then
+        emit(dim(string.format("另有 %d 个簇未列出", #dense - #pick)))
+    end
+end
+
+-- ---- ③ 孤立告警 ----
+if #isolated > 0 then
+    emit("")
+    emit(string.format("⚠️ %s（未成簇，共 %d 条）", strong("孤立告警"), #isolated))
+    for i = 1, math.min(MAX_ISOLATED, #isolated) do
+        emit("   " .. ev_line(isolated[i], true))
+    end
+    if #isolated > MAX_ISOLATED then
+        emit("   " .. dim(string.format("另有 %d 条未列出", #isolated - MAX_ISOLATED)))
+    end
+end
+
+-- ---- 判定规则（自解释：让用户知道结论是怎么来的，也便于调参）----
+emit("")
+emit(dim(string.format("判定：相邻间隔 ≤%d 秒归为一簇（跨度上限 %s）；断网前因回溯 %s；只陈述先后，不声称因果",
+    CLUSTER_GAP, fmt_dur(CLUSTER_MAX_SPAN), fmt_dur(CAUSE_WINDOW))))
+
+finish()
+os.exit(0)

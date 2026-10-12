@@ -1,0 +1,711 @@
+#!/usr/bin/lua
+-- TohsakaWrt 网络黑匣子 —— 时间线读取与展示
+--
+--   show [小时数] [选项] [关键词]   渲染时间线（默认最近 2 小时；默认 HTML 供 Telegram）
+--   raw                             原样输出事件文件（排查用）
+--
+-- 选项（都可叠加，顺序无关）：
+--   --kind <类别>      只看这些类别，多值用逗号：--kind rat,uplink
+--   --level <级别>     只看该级别及以上：warn = warn/error/crit，error = error/crit
+--   --before <epoch>   只看该时刻之前的事件（沿着时间线往回翻页）
+--   --text             纯文本输出（不带 HTML 标签）
+--   --compact          紧凑模式：每条一行、消息截短，用于一次扫大量事件
+--   --help             打印用法
+--   关键词             自由文本，命中 message 即保留（Lua 的 find(..., 1, true)，纯字面匹配）
+--
+-- 事件格式（由 tohsakawrt-event 写入）：
+--   <epoch> <level> <kind> <actor> <message>
+--
+-- 展示约定：
+--   * 级别决定图标（⚪🟡🔴🚨）—— 扫一眼就能找到异常
+--   * 类别决定文字标签（可用/制式/出口/模组/代理/操作/告警/系统）
+--   * 底部给出条数、时间跨度、**最长静默**（静默长说明这段时间没事件 = 平稳）
+--   * 短时间内重复的同一条消息折叠成 "×N" —— 见下面 FOLD_WINDOW 的说明
+--
+-- 为什么输出要卡字节数而不是只卡条数：
+--   Telegram 单条消息上限 4096 字符，超了整条被拒（用户什么都看不到）。
+--   一条事件的长度是不确定的：message 是自由文本，中文一个字 3 字节，
+--   一条长消息就能吃掉几百字节。所以"最多 40 条"根本不足以保证不超限
+--   （40 × 100 字节 = 4000 字节，刚好踩线）。这里改成按【字节预算】动态决定
+--   显示多少条：先按 3800 字节预算预留标题和页脚的额度，从最新往回装，
+--   装不下就少显示几条并在正文里注明省略了多少。宁可少显示，不可整条被拒。
+
+local LOG = os.getenv("TWR_EVENT_LOG") or "/etc/tohsakawrt/events.log"
+
+-- 4000 = 与 usr/lib/lua/tohsakawrt/tg.lua 里的 MSG_LIMIT 对齐；
+-- 留出 200 字节余量给调用方（bot 会 gsub 行尾空白、可能再加前缀）。
+-- 刻意不复用 TWR_EVENT_MAX_BYTES：那个名字在 tohsakawrt-event（写入端）里
+-- 指的是"日志文件多大触发轮转"，两个含义混在一起迟早出事。
+local LIMIT_BYTES = tonumber(os.getenv("TWR_EVENT_OUT_BYTES") or "") or 4000
+local BUDGET = LIMIT_BYTES - 200
+if BUDGET < 300 then BUDGET = 300 end
+
+-- 40 条仍然是"条数"上的软上限：字节预算够也不无限列，避免刷屏
+local MAX_SHOW = tonumber(os.getenv("TWR_EVENT_MAX_SHOW") or "") or 40
+
+-- 单条事件最多占多少字节（超了就把 message 截短）。
+-- 算一下最坏情况：前缀约 45 字节 + 后缀约 8 字节 + 1200 = 1253 字节，
+-- 远小于给正文留的预算（BUDGET - 300），所以"从最新往回装"至少能装下 1 条，
+-- 不会出现"一条都显示不出来"的死角。
+local MAX_LINE_MSG_BYTES = 1200
+
+-- 折叠窗口：同一条消息（level/kind/actor/message 全同）在这个秒数内连续出现就折叠成 ×N。
+-- 为什么是 300 秒：采集器每分钟跑一次，同一故障在几个采集周期里反复刷屏是最常见的噪声；
+-- 5 分钟能把这一串收成一行，又不会把"上午和下午各发生一次"误并成一次。
+local FOLD_WINDOW = 300
+
+-- 内存护栏：事件文件轮转上限约 8000 行（见 tohsakawrt-event 的 KEEP_LINES），
+-- 这里给一个更大的硬上限，纯粹防止异常文件把路由器内存吃满（480MB 机器要保守）。
+local MAX_PARSE = 20000
+
+-- 时间窗口最大小时数，与 bot 侧 event_log:720 的上限保持一致
+local MAX_HOURS = 720
+
+local LEVEL_ICON = {
+    info  = "⚪",
+    warn  = "🟡",
+    error = "🔴",
+    crit  = "🚨",
+}
+
+-- 紧凑模式 / 纯文本模式的级别标记：ASCII 单字符。
+-- 为什么不用 emoji：⚪ 一个就是 3 字节，40 条光图标就 120 字节，而且等宽终端里
+-- emoji 宽度不一，列会对不齐。ASCII 标记在两种输出里都对齐且便宜。
+local LEVEL_MARK = {
+    info  = "·",
+    warn  = "!",
+    error = "!!",
+    crit  = "!!!",
+}
+
+local KIND_LABEL = {
+    avail  = "可用",
+    rat    = "制式",
+    uplink = "出口",
+    modem  = "模组",
+    proxy  = "代理",
+    bot    = "操作",
+    alert  = "告警",
+    sys    = "系统",
+}
+
+-- 合法值集合。既用于过滤，也用于"非法值要明确报错"的校验
+-- （静默忽略非法值会让人以为筛过了，实际看到的是全量，比报错更危险）。
+local VALID_LEVEL = { info = true, warn = true, error = true, crit = true }
+local VALID_KIND = {
+    avail = true, rat = true, uplink = true, modem = true,
+    proxy = true, bot = true, alert = true, sys = true,
+}
+local KIND_ORDER = { "avail", "rat", "uplink", "modem", "proxy", "bot", "alert", "sys" }
+
+local function readfile(p)
+    local f = io.open(p, "r")
+    if not f then return nil end
+    local s = f:read("*a")
+    f:close()
+    return s
+end
+
+local function fmt_dur(sec)
+    sec = math.floor(tonumber(sec) or 0)
+    if sec < 0 then sec = 0 end
+    local h = math.floor(sec / 3600)
+    local m = math.floor((sec % 3600) / 60)
+    if h > 0 then return string.format("%d 小时 %d 分", h, m) end
+    if m > 0 then return string.format("%d 分", m) end
+    return string.format("%d 秒", sec)
+end
+
+local function esc(s)
+    s = tostring(s or "")
+    s = s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+    return s
+end
+
+local function fmt_ts(ts)
+    return os.date("%m-%d %H:%M", ts)
+end
+
+-- 级别权重。写入端（tohsakawrt-event）会把非法 level 归一到 info，所以正常不会有
+-- 未知值；但万一有（旧格式、手工编辑），按最严重处理而不是按 info：
+-- 未知级别的行宁可多显示，也不能被 --level warn 静默藏掉 —— 那正是最该看见的行。
+local LEVEL_W = { info = 1, warn = 2, error = 3, crit = 4 }
+local function level_weight(lv)
+    return LEVEL_W[lv] or 9
+end
+
+-- 按字节截断，且不切断 UTF-8 字符。
+-- 为什么需要：message 是自由文本，一条超长消息会独占整个字节预算。
+-- 切断 UTF-8 字符会产出无效字节，Telegram 可能直接拒收整条消息；
+-- 所以切完再看末尾是不是"续字节"（0x80–0xBF，即 [\128-\191]），是就继续往前退。
+local function trunc_bytes(s, n)
+    s = tostring(s or "")
+    if #s <= n then return s, false end
+    local cut = s:sub(1, n)
+    while #cut > 0 and cut:sub(-1):match("[\128-\191]") do
+        cut = cut:sub(1, -2)
+    end
+    return cut, true
+end
+
+-- 输出辅助：Lua 5.1 没有 goto，用一层函数把"打印并退出"收在一起
+local function die(msg)
+    io.write(tostring(msg) .. "\n")
+    os.exit(1, true)
+end
+
+local function die_usage(msg)
+    die(msg .. "\n用法: tohsakawrt-event-log show [小时数] [--kind 类别,类别] [--level 级别]"
+        .. " [--before epoch] [--text] [--compact] [关键词]")
+end
+
+local function sorted_keys(t, order)
+    local ks = {}
+    for k in pairs(t) do ks[#ks + 1] = k end
+    table.sort(ks, function(a, b)
+        local ia, ib
+        for i, v in ipairs(order) do
+            if v == a then ia = i end
+            if v == b then ib = i end
+        end
+        if ia and ib then return ia < ib end
+        if ia then return true end
+        if ib then return false end
+        return a < b
+    end)
+    return ks
+end
+
+-- ---- 解析参数 ----
+-- 兼容性关键：旧调用只有 "show"、"小时数"、"--text"、"关键词" 四种 token，
+-- 下面这段对它们的处理与旧版完全一致，只是把单横线的 -xxx 也当成关键词
+-- （旧版同样会把它当关键词），保证 "show 2 --text" / "show 2 关键词" 不变。
+local hours = 2
+local plain = false
+local compact = false
+local keyword = nil
+local before = nil
+local kind_set = nil
+local level_min = nil
+local level_name = nil
+local parse_err = nil
+
+local function split_commas(v)
+    local out = {}
+    for item in tostring(v or ""):gmatch("[^,]+") do
+        item = item:match("^%s*(.-)%s*$")   -- 去掉逗号两侧空格，"rat, uplink" 也能用
+        if item ~= "" then out[#out + 1] = item end
+    end
+    return out
+end
+
+local A = arg or {}
+local i = 1
+-- 第一个位置参数固定是子命令（show/raw）；旧脚本不校验，这里也不校验，
+-- 只是跳过它，避免 "show" 被当成关键词
+if A[1] ~= nil and not A[1]:match("^%-%-") and not tonumber(A[1]) then
+    i = 2
+end
+
+while i <= #A do
+    local a = A[i]
+    if a == "--text" then
+        plain = true
+        i = i + 1
+    elseif a == "--compact" then
+        compact = true
+        i = i + 1
+    elseif a == "--help" or a == "-h" then
+        io.write([[
+用法: tohsakawrt-event-log show [小时数] [选项] [关键词]
+      tohsakawrt-event-log raw
+
+  [小时数]           时间窗长度，默认 2（上限 720）
+  --kind <类别>      只看这些类别，多值逗号分隔
+                    可选: avail rat uplink modem proxy bot alert sys
+  --level <级别>     只看该级别及以上
+                    info = 全部 | warn = warn/error/crit | error = error/crit | crit = 仅 crit
+  --before <epoch>   只看该 epoch 之前的事件（往回翻页；与小时数一起用则窗口是 [before-小时数, before)）
+  --text             纯文本输出（默认 HTML）
+  --compact          紧凑模式：每条一行、消息截短，便于一次扫大量事件
+  --help             本帮助
+
+关键词为自由文本，对 message 做字面匹配，可与上面任何选项叠加。
+]])
+        os.exit(0, true)
+    elseif a == "--kind" or a == "--level" or a == "--before" then
+        local v = A[i + 1]
+        if v == nil then
+            parse_err = "选项 " .. a .. " 后面缺少取值。"
+        elseif v:match("^%-%-") then
+            -- 只在缺值时拦：否则 "--kind --level warn" 会被当成 kind="--level" 而看不出问题
+            parse_err = "选项 " .. a .. " 后面缺少取值（不能直接跟另一个 -- 选项）。"
+        elseif a == "--before" then
+            local n = tonumber(v)
+            if not n then
+                parse_err = "--before 需要 epoch 秒数（例如 1791569900），收到：" .. v
+            else
+                before = math.floor(n)
+            end
+        elseif a == "--kind" then
+            local vals = split_commas(v)
+            local out, bad = {}, {}
+            for _, item in ipairs(vals) do
+                if VALID_KIND[item] then out[item] = true else bad[#bad + 1] = item end
+            end
+            if #bad > 0 then
+                parse_err = "未知类别：" .. table.concat(bad, "、")
+                    .. "。可选：" .. table.concat(sorted_keys(VALID_KIND, KIND_ORDER), " ")
+            elseif #vals == 0 then
+                parse_err = "--kind 取值为空。可选：" .. table.concat(sorted_keys(VALID_KIND, KIND_ORDER), " ")
+            else
+                kind_set = out
+            end
+        else -- --level
+            local vals = split_commas(v)
+            local bad = {}
+            for _, item in ipairs(vals) do
+                if not VALID_LEVEL[item] then bad[#bad + 1] = item end
+            end
+            if #bad > 0 then
+                parse_err = "未知级别：" .. table.concat(bad, "、")
+                    .. "。可选：info warn error crit（语义是该级别及以上）"
+            elseif #vals == 0 then
+                parse_err = "--level 取值为空。可选：info warn error crit"
+            else
+                -- 多值时取最严（最严重）的那个当门槛，避免"两个都满足"这种没定义的语义
+                local w = { info = 1, warn = 2, error = 3, crit = 4 }
+                local best, bestn = 0, nil
+                for _, item in ipairs(vals) do
+                    if w[item] > best then best, bestn = w[item], item end
+                end
+                level_min = best
+                level_name = bestn
+            end
+        end
+        i = i + 2
+    elseif a:match("^%-%-") then
+        -- 未知的长选项要报错：静默当关键词会让人以为筛选生效了（看到的是全量）
+        parse_err = "未知选项：" .. a
+    elseif tonumber(a) then
+        hours = tonumber(a)
+        i = i + 1
+    else
+        -- 含单横线开头的 token 也落到这里，与旧版行为一致（旧版全部当关键词）
+        keyword = a
+        i = i + 1
+    end
+end
+
+if parse_err then
+    die_usage("⚠️ 参数错误：" .. parse_err)
+end
+
+if hours < 0 then hours = 0 end
+if hours > MAX_HOURS then hours = MAX_HOURS end
+
+-- raw 必须在参数校验之后、读事件之前
+if (A[1] or "") == "raw" then
+    io.write(readfile(LOG) or "(事件文件为空)\n")
+    os.exit(0, true)
+end
+
+-- ---- 时间窗 ----
+-- 默认 [now - hours*3600, now]；带 --before 时窗口上沿挪到 before，
+-- 于是"往回翻页"就是反复用上一次窗口的最早时刻当 --before。
+local now = os.time()
+local upper = before or now
+local cutoff = upper - hours * 3600
+
+-- ---- 读事件 ----
+local events = {}
+local total_all = 0     -- 能解析出来的行数（含窗口外的）
+local bad_lines = 0     -- 字段不足 / epoch 非数字的坏行
+local skipped = 0       -- 解析后被上限丢弃的条数
+local truncated_parse = false
+
+local s = readfile(LOG)
+if s then
+    for line in s:gmatch("[^\r\n]+") do
+        local ts, level, kind, actor, msg = line:match("^(%d+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(.+)$")
+        if not ts then
+            -- 坏行跳过：字段不足、epoch 不是数字、或者只有 4 个字段没有 message。
+            -- 不能崩 —— 黑匣子正是出事时最需要读的，读不动就失去意义了。
+            -- 只统计不打印，避免刷屏；条数在页脚提示。
+            if line:match("%S") then bad_lines = bad_lines + 1 end
+        else
+            total_all = total_all + 1
+            ts = tonumber(ts)
+            if ts and ts >= cutoff and ts < upper then
+                if #events < MAX_PARSE then
+                    events[#events + 1] = {
+                        ts = ts, level = level, kind = kind, actor = actor, msg = msg,
+                    }
+                else
+                    skipped = skipped + 1
+                    truncated_parse = true
+                end
+            end
+        end
+    end
+end
+
+-- ---- 筛选（在时间窗之后，与关键词叠加）----
+local selected = {}
+for _, e in ipairs(events) do
+    local ok = true
+    if kind_set and not kind_set[e.kind] then ok = false end
+    if ok and level_min then
+        if level_weight(e.level) < level_min then ok = false end
+    end
+    -- 关键词对 message 做字面匹配（plain=true 不解释模式字符），与旧版一致
+    if ok and keyword and not e.msg:find(keyword, 1, true) then ok = false end
+    if ok then selected[#selected + 1] = e end
+end
+
+-- 文件本身按时间追加，但轮转/手工编辑都可能打乱顺序，所以照旧显式排序
+table.sort(selected, function(a, b)
+    if a.ts == b.ts then
+        -- 同一秒内保持文件顺序（时间线顺序），避免同类事件在同秒内来回跳
+        return false
+    end
+    return a.ts < b.ts
+end)
+
+local selected_n = #selected
+
+-- ---- 折叠重复 ----
+-- 同一条消息（level/kind/actor/msg 全同）在 FOLD_WINDOW 秒内连续出现 → 合成一条 ×N。
+-- 只折叠"连续"的：中间插了别的事件就说明不是同一串刷屏，分开更利于看因果。
+local function fold(evs)
+    local out = {}
+    for _, e in ipairs(evs) do
+        local last = out[#out]
+        -- 关键：比的是"上一条的结束时刻"到"当前这条"的间隔（e.ts - last.ts_end），
+        -- 不是 last.ts_end - last.ts（后者对第一条恒为 0，会把相隔几小时的同类事件
+        -- 也折成一条 —— 那会掩盖"故障反复复发"这个最重要的事实）。
+        if last and e.ts - last.ts_end <= FOLD_WINDOW
+            and last.level == e.level and last.kind == e.kind
+            and last.actor == e.actor and last.msg == e.msg then
+            last.n = last.n + 1
+            last.ts_end = e.ts
+        else
+            out[#out + 1] = {
+                ts = e.ts, ts_end = e.ts, n = 1,
+                level = e.level, kind = e.kind, actor = e.actor, msg = e.msg,
+            }
+        end
+    end
+    return out
+end
+
+local folded = fold(selected)
+local folded_n = #folded
+
+-- ---- 空态 ----
+local function window_text()
+    if before then
+        return string.format("截至 %s 之前的 %s", fmt_ts(upper), fmt_dur(hours * 3600))
+    end
+    return string.format("最近 %s", fmt_dur(hours * 3600))
+end
+
+local function filter_text()
+    local parts = {}
+    if kind_set then
+        local ks = sorted_keys(kind_set, KIND_ORDER)
+        local ls = {}
+        for _, k in ipairs(ks) do ls[#ls + 1] = KIND_LABEL[k] or k end
+        parts[#parts + 1] = "类别 " .. table.concat(ls, "/")
+    end
+    if level_name then parts[#parts + 1] = "级别 ≥ " .. level_name end
+    if keyword then parts[#parts + 1] = "含「" .. keyword .. "」" end
+    if #parts == 0 then return "" end
+    return table.concat(parts, " · ")
+end
+
+if selected_n == 0 then
+    local hint
+    if total_all == 0 and bad_lines == 0 then
+        hint = "事件文件还是空的 —— 采集器每分钟运行一次，稍后再看。"
+    elseif total_all == 0 then
+        hint = string.format("事件文件里没有一行可解析（坏行 %d 行）。", bad_lines)
+    else
+        local ft = filter_text()
+        if ft ~= "" then
+            -- 用冒号而不是「」包住筛选条件：filter_text 里关键词已经带了「」，
+            -- 再包一层会变成「含「开机」」这种叠引号。
+            hint = string.format("%s内没有符合条件的事件：%s（共 %d 条历史）。", window_text(), ft, total_all)
+        else
+            hint = string.format("%s内没有事件（共 %d 条历史）。", window_text(), total_all)
+        end
+    end
+    if bad_lines > 0 then
+        hint = hint .. string.format("（另有 %d 行格式损坏已跳过）", bad_lines)
+    end
+    if plain or compact then
+        print("网络黑匣子")
+        print(hint)
+    else
+        print("🗃️ <b>网络黑匣子</b>\n\n<i>" .. esc(hint) .. "</i>")
+    end
+    os.exit(0, true)
+end
+
+-- ---- 单条渲染 ----
+-- 注意：--text 必须用【原样】的 message，不能过 esc()。
+-- 旧版在 plain 分支里就是直接拼 e.msg，所以 "a<b & c>d" 原样输出；
+-- 如果这里偷懒复用 html_line，--text 就会输出 a&lt;b &amp; c&gt;d ——
+-- 现有校验脚本 validate-blackbox.sh 的「纯文本原样保留特殊字符」一项正是查这个。
+local function plain_line(e)
+    local body, cut = trunc_bytes(e.msg, MAX_LINE_MSG_BYTES)
+    local tail = cut and "…" or ""
+    local t = fmt_ts(e.ts)
+    local cnt = ""
+    if e.n > 1 then
+        local range = t
+        local t2 = os.date("%H:%M", e.ts_end)
+        if t2 ~= os.date("%H:%M", e.ts) then range = t .. "–" .. t2 end
+        cnt = " ×" .. e.n
+        t = range
+    end
+    return string.format("%s %s %-4s%s %s%s",
+        t, LEVEL_ICON[e.level] or "⚪", KIND_LABEL[e.kind] or e.kind, cnt, body, tail)
+end
+
+local function compact_line(e)
+    local body, cut = trunc_bytes(e.msg, MAX_LINE_MSG_BYTES)
+    local tail = cut and "…" or ""
+    local t = fmt_ts(e.ts)
+    if e.n > 1 then
+        local range = t
+        local t2 = os.date("%H:%M", e.ts_end)
+        if t2 ~= os.date("%H:%M", e.ts) then range = t .. "–" .. t2 end
+        return string.format("%s %s %s ×%d %s%s",
+            range, LEVEL_MARK[e.level] or "·", KIND_LABEL[e.kind] or e.kind, e.n, body, tail)
+    end
+    return string.format("%s %s %s %s%s",
+        t, LEVEL_MARK[e.level] or "·", KIND_LABEL[e.kind] or e.kind, body, tail)
+end
+
+local function html_line(e)
+    local body, cut = trunc_bytes(e.msg, MAX_LINE_MSG_BYTES)
+    local tail = cut and "…" or ""
+    local t = fmt_ts(e.ts)
+    local cnt = ""
+    if e.n > 1 then
+        local range = t
+        local t2 = os.date("%H:%M", e.ts_end)
+        if t2 ~= os.date("%H:%M", e.ts) then range = t .. "–" .. t2 end
+        cnt = " <b>×" .. e.n .. "</b>"
+        t = range
+    end
+    return string.format("<code>%s</code> %s <b>%s</b>%s  %s%s",
+        t, LEVEL_ICON[e.level] or "⚪", KIND_LABEL[e.kind] or esc(e.kind), cnt, esc(body), tail)
+end
+
+-- ---- 头部 / 尾部文案 ----
+local title_parts = { window_text() }
+local ft = filter_text()
+if ft ~= "" then title_parts[#title_parts + 1] = ft end
+local title = table.concat(title_parts, " · ")
+
+local head
+if compact then
+    -- 紧凑模式刻意不用 emoji 标题：这里的目标是"一屏塞下尽可能多的事件"
+    head = "🗃 网络黑匣子 · " .. title
+elseif plain then
+    head = "网络黑匣子 · " .. title
+else
+    head = "🗃️ <b>网络黑匣子</b> · " .. esc(title)
+end
+
+local bar
+if compact then
+    bar = string.rep("-", 40)
+elseif plain then
+    bar = string.rep("=", 46)
+else
+    bar = "━━━━━━━━━━━━━━━━━━"
+end
+
+local function omitted_note(n)
+    if n <= 0 then return nil end
+    if plain or compact then return string.format("(更早的 %d 条已省略)", n) end
+    return string.format("<i>（更早的 %d 条已省略）</i>", n)
+end
+
+-- ---- 装填：按字节预算从最新往回装 ----
+-- 先给"头部 + 省略提示 + 分隔线 + 页脚"留固定额度，剩下才是事件的额度。
+-- 页脚最长约 300 字节（统计 + 构成 + 最活跃 + 最长静默），所以按 300 预留。
+local FOOTER_RESERVE = 300
+local budget = BUDGET - #head - #bar * 2 - 60 - FOOTER_RESERVE
+if budget < 200 then budget = 200 end
+
+local chosen, used = {}, 0
+local stop = false
+for k = #folded, 1, -1 do
+    if stop then break end
+    local e = folded[k]
+    -- 三选一：compact 用 ASCII 标记；--text 用原样 message；默认 HTML（转义）
+    local line
+    if compact then
+        line = compact_line(e)
+    elseif plain then
+        line = plain_line(e)
+    else
+        line = html_line(e)
+    end
+    if #chosen >= MAX_SHOW then
+        stop = true
+    elseif used + #line + 1 > budget then
+        stop = true
+    else
+        chosen[#chosen + 1] = line
+        used = used + #line + 1
+    end
+end
+
+-- 兜底：任何情况下至少显示一条（否则正文只剩"已省略"提示，时间线就空了）。
+-- 正常情况下用不到 —— 单条最长 MAX_LINE_MSG_BYTES + 约 53 字节前缀 < budget。
+if #chosen == 0 then
+    local e = folded[#folded]
+    local body = trunc_bytes(e.msg, MAX_LINE_MSG_BYTES)
+    if compact then
+        chosen[1] = string.format("%s %s %s %s…",
+            fmt_ts(e.ts), LEVEL_MARK[e.level] or "·", KIND_LABEL[e.kind] or e.kind, body)
+    elseif plain then
+        chosen[1] = string.format("%s %s %-4s %s…",
+            fmt_ts(e.ts), LEVEL_ICON[e.level] or "⚪", KIND_LABEL[e.kind] or e.kind, body)
+    else
+        chosen[1] = string.format("<code>%s</code> %s <b>%s</b>  %s…",
+            fmt_ts(e.ts), LEVEL_ICON[e.level] or "⚪",
+            KIND_LABEL[e.kind] or esc(e.kind), esc(body))
+    end
+end
+
+local shown = #chosen
+-- 从最新往回装，所以 chosen 里是"新的在前"，输出时要反过来变成时间正序
+local disp = {}
+for k = shown, 1, -1 do disp[#disp + 1] = chosen[k] end
+
+-- ---- 页脚统计（只统计真正显示出来的那些条，跟用户看到的画面一致）----
+local shown_folded = {}
+for k = #folded - shown + 1, #folded do shown_folded[#shown_folded + 1] = folded[k] end
+
+local by_kind = {}
+local warn_plus = 0
+local disp_events = 0
+for _, e in ipairs(shown_folded) do
+    by_kind[e.kind] = (by_kind[e.kind] or 0) + 1
+    if level_weight(e.level) >= 2 then warn_plus = warn_plus + e.n end
+    disp_events = disp_events + e.n
+end
+
+local max_gap, max_gap_at = 0, nil
+for k = 2, #shown_folded do
+    local gap = shown_folded[k].ts - shown_folded[k - 1].ts_end
+    if gap > max_gap then max_gap, max_gap_at = gap, shown_folded[k - 1].ts_end end
+end
+local span = shown_folded[#shown_folded].ts_end - shown_folded[1].ts
+
+local kinds = sorted_keys(by_kind, KIND_ORDER)
+local top_kind, top_n = nil, 0
+for _, k in ipairs(kinds) do
+    if by_kind[k] > top_n then top_kind, top_n = k, by_kind[k] end
+end
+
+local L = {}
+local function add(x) L[#L + 1] = x end
+
+add(head)
+add(bar)
+
+-- 省略条数 = 选中但没显示出来的条数。
+-- 注意这里必须用"选中总数 - 实际显示的事件数"，而不是"折叠条目数 - 显示条目数"：
+-- 折叠会把 N 条并成 1 条，用条目数相减会把折叠掉的重复条也算进"省略"，
+-- 和下面的折叠提示重复计数（一个 bug 会造成"省略 5 条"和"折叠 5 条"同时出现）。
+local omitted = selected_n - disp_events
+
+-- 解析上限丢弃的条数（极端情况：窗口内事件超过 MAX_PARSE）。
+-- 它发生在筛选之前，语义和"省略"不同，所以单独提示。
+if truncated_parse and skipped > 0 then
+    local note = omitted_note(skipped)
+    if note then add(note) end
+end
+if omitted > 0 then
+    local note = omitted_note(omitted)
+    if note then add(note) end
+end
+if folded_n < selected_n then
+    -- 只报"有多少条被并掉了"，不说"并为 N 条"：
+    -- 折叠掉的条数 ≠ 折叠后的条目数，写"N 条并为 N 条"是错的，会让人以为没生效。
+    local saved = selected_n - folded_n
+    if plain or compact then
+        add(string.format("(另有 %d 条重复消息已折叠)", saved))
+    else
+        add(string.format("<i>（另有 %d 条重复消息已折叠）</i>", saved))
+    end
+end
+
+for _, line in ipairs(disp) do add(line) end
+
+add(bar)
+if plain or compact then
+    add(string.format("共 %d 条 · 跨度 %s · 最长静默 %s · ⚠ %d 条",
+        disp_events, fmt_dur(span), fmt_dur(max_gap), warn_plus))
+else
+    add(string.format("📊 共 <b>%d</b> 条 · 跨度 <code>%s</code> · 最长静默 <code>%s</code> · ⚠️ <b>%d</b> 条",
+        disp_events, fmt_dur(span), fmt_dur(max_gap), warn_plus))
+end
+
+local kp = {}
+for _, k in ipairs(kinds) do
+    if plain or compact then
+        kp[#kp + 1] = string.format("%s %d", KIND_LABEL[k] or k, by_kind[k])
+    else
+        kp[#kp + 1] = string.format("%s <b>%d</b>", KIND_LABEL[k] or esc(k), by_kind[k])
+    end
+end
+if #kp > 0 then
+    if plain or compact then
+        add("构成: " .. table.concat(kp, " · "))
+    else
+        add("📋 " .. table.concat(kp, " · "))
+    end
+end
+
+if top_kind then
+    local label = KIND_LABEL[top_kind] or top_kind
+    if plain or compact then
+        add(string.format("最活跃: %s %d 条", label, top_n))
+    else
+        add(string.format("🔥 最活跃：<b>%s</b> %d 条", esc(label), top_n))
+    end
+end
+
+if max_gap_at then
+    if plain or compact then
+        add(string.format("最长静默起于 %s", fmt_ts(max_gap_at)))
+    else
+        add(string.format("💤 最长静默起于 <code>%s</code>", fmt_ts(max_gap_at)))
+    end
+end
+
+if bad_lines > 0 then
+    if plain or compact then
+        add(string.format("另有 %d 行格式损坏已跳过", bad_lines))
+    else
+        add(string.format("<i>另有 %d 行格式损坏已跳过</i>", bad_lines))
+    end
+end
+
+local out = table.concat(L, "\n")
+
+-- 最后一道保险：任何没预料到的组合（比如超长关键词把标题撑大）也不能超过硬上限。
+-- 按字节截断（不切 UTF-8 字符），宁可少一段也不能让 Telegram 整条拒收。
+if #out > LIMIT_BYTES then
+    out = trunc_bytes(out, LIMIT_BYTES - 40) .. "\n<i>…（内容过长，已截断）</i>"
+end
+
+print(out)

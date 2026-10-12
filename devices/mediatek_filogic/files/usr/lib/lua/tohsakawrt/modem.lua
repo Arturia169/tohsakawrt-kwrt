@@ -7,6 +7,29 @@ local json = require("luci.jsonc")
 
 local MODEM_AT = "/usr/share/modem/modem_at.sh"
 
+-- AT 口全局互斥锁包装器。
+-- 背景：AT 口原先有三个互不互斥的写者 —— modem_at.sh（有 flock）、
+-- sms_tool（直接用串口，无锁）、lpac（无锁）。modem_at.sh 的注释自称"全局 AT 互斥"，
+-- 实际只覆盖三分之一；并发下 sms_tool 会挂住，而它是从机器人主循环每 12 秒无条件调用的。
+local AT_LOCK = "/usr/bin/tohsakawrt-at-lock"
+local AT_LOCK_OK = (function()
+    local f = io.open(AT_LOCK, "r")
+    if f then f:close() return true end
+    return false
+end)()
+
+-- 把一条需要独占 AT 口的命令包装成"持锁执行"。
+-- wait 可选：抢锁最长等待秒数（默认 8）。高频轮询传小值，锁忙时宁可本轮跳过也不空等。
+local function at_locked(cmd, wait)
+    if AT_LOCK_OK then
+        if wait then
+            return string.format("TWR_AT_LOCK_WAIT=%d %s %s", wait, AT_LOCK, cmd)
+        end
+        return string.format("%s %s", AT_LOCK, cmd)
+    end
+    return cmd
+end
+
 function M.get_port()
     local port = core.get_uci("modem", "modem0", "at_port", "/dev/ttyUSB3")
     if nixio and nixio.fs and nixio.fs.stat(port) then
@@ -26,7 +49,10 @@ function M.at(cmd, timeout)
     if not nixio.fs.stat(port) or not nixio.fs.stat(MODEM_AT) then
         return nil, "Modem AT port or script not found"
     end
-    local inner = string.format("sh %s %s '%s' 2>/dev/null", MODEM_AT, port, cmd)
+    -- cmd 会被拼进 shell 命令，必须转义。原先直接套一对单引号，输入里带 ' 就会截断引号，
+    -- 命令被拆成两段后静默失败（2>/dev/null 把错误也吞了）。
+    -- 唯一的外部入口是 cli.lua 的 `tohsakawrt modem at <用户输入>`。
+    local inner = string.format("sh %s %s %s 2>/dev/null", MODEM_AT, port, core.shell_quote(cmd))
     local run_cmd = string.format(
         "if command -v timeout >/dev/null 2>&1; then timeout %d %s; else %s & __p=$!; ( sleep %d; kill -9 $__p 2>/dev/null ) >/dev/null 2>&1 & __w=$!; wait $__p; kill $__w 2>/dev/null; fi",
         timeout, inner, inner, timeout)
@@ -47,6 +73,49 @@ local function flatten_info_array(arr)
         end
     end
     return t
+end
+
+-- 解析 AT+QENG="servingcell"，取出小区标识（Cell ID / PCID）。
+--
+-- 为什么需要它：厂商脚本在 NR5G-SA 下不给这两项（实测 cell 表里 RSRP/SINR/Band 都有，
+-- 唯独 Cell ID 与 Physical Cell ID 为空），于是信号趋势里"最近小区"永远是 "-"。
+-- 而这两个值决定了完全不同的处理方式：
+--   * 同一个小区、信号变差 → 覆盖/干扰问题，可考虑锁频段或锁小区
+--   * 换了另一个小区     → 是驻留策略/重选问题，锁频段没用
+-- 不看小区 ID 就无法区分这两种情况。
+--
+-- ⚠️ 两种布局必须分开处理，字段位置不同，混用会取到完全无关的数字：
+--   SA / LTE: "servingcell","NOCONN","NR5G-SA","TDD",460,01,<CellID>,<PCID>,...
+--             → 切分后 f[6]=CellID（十六进制字符串） f[7]=PCID
+--   NSA:      "servingcell","NOCONN","NR5G-NSA",460,01,<PCID>,...
+--             → NSA 响应里【没有 CellID】，f[5]=PCID
+-- 取不到就返回 nil，绝不编造占位值（前车之鉴：旧代码编造 n78/"6" 污染过趋势）。
+local function parse_qeng_cell(resp)
+    if not resp or resp == "" then return nil end
+    local body = resp:match('+QENG:%s*"servingcell",(.*)')
+    if not body then return nil end
+
+    local f = {}
+    for part in (body .. ","):gmatch("([^,]*),") do
+        part = part:gsub('^%s*"', ""):gsub('"%s*$', ""):gsub("^%s+", ""):gsub("%s+$", "")
+        f[#f + 1] = part
+    end
+
+    local rat = f[2] or ""
+    local cid, pci
+    if rat:match("NSA") then
+        pci = f[5]
+    else
+        cid, pci = f[6], f[7]
+    end
+
+    local function clean(v)
+        if v == nil or v == "" or v == "-" then return nil end
+        return v
+    end
+    local c, p = clean(cid), clean(pci)
+    if not c and not p then return nil end
+    return { cell_id = c, pci = p }
 end
 
 function M.info()
@@ -83,10 +152,57 @@ function M.info()
             end
         end
 
+        -- 厂商脚本在某些制式下不给 cell.Band：实测切到 LTE 时 cell 里 RSRP/SINR 都有、
+        -- 唯独 Band 为空，于是趋势样本把频段记成 "-"，凌晨 5G 基站关闭那 1.5 小时
+        -- 就完全看不出自己落在哪个 LTE 频段上（而这正是用户最需要看到的一段）。
+        -- 这里只在 cell.Band 为空时才补一次 AT+QNWINFO —— 该响应里本来就带
+        -- "LTE BAND 3" / "NR5G BAND 78"，所以【正常路径零额外开销】。
+        if band == "" then
+            local qnw = M.at("AT+QNWINFO") or ""
+            local qband = qnw:match('%+QNWINFO:%s*"[^"]*","[^"]*","([^"]*)"')
+            if qband and qband ~= "" then
+                -- 必须取 "BAND"【之后】的数字。不能用 qband:match("(%d+)")：那会取到
+                -- "NR5G BAND 78" 里的 "5"（来自 NR5G 自身），把频段记成 n5 ——
+                -- 一个看起来合理、却完全错误的频段，会静默污染趋势。
+                -- 注意 "LTE BAND 3" 没有前置数字，所以只有 NR 这条路径会踩坑，更难发现。
+                local num = qband:match("[Bb][Aa][Nn][Dd]%s*(%d+)")
+                if num then
+                    -- "NR5G BAND 78" → n78 ; "LTE BAND 3" → B3 ; "WCDMA BAND 1" → B1
+                    if qband:upper():match("NR") then
+                        band = "n" .. num
+                    else
+                        band = "B" .. num
+                    end
+                end
+            end
+        end
+
+        -- 小区标识兜底：厂商脚本在 NR5G-SA 下不给 Cell ID / PCID（RSRP/SINR/Band 都有，
+        -- 唯独这两项为空）。与上面 Band 的兜底同一思路 —— 只在缺失时才补一次
+        -- AT+QENG="servingcell"，读得到就零额外开销。
+        local pci = cell["Physical Cell ID"]
+        local cid = cell["Cell ID"]
+        local function missing(v) return v == nil or v == "" or v == "-" end
+        if missing(cid) or missing(pci) then
+            local q = parse_qeng_cell(M.at('AT+QENG="servingcell"') or "")
+            if q then
+                if missing(cid) and q.cell_id then cid = q.cell_id end
+                if missing(pci) and q.pci then pci = q.pci end
+            end
+        end
+
+        -- 频段读不到就保持 nil：旧代码在此补 "n78"，而 tohsakawrt-signal-log 会把
+        -- m.band 当作真实驻留频段记入趋势样本，频段设置页的"当前驻留频段"也照此显示，
+        -- 于是编造的 n78 会污染趋势图，且用户无法区分真实读数与默认值。
+        if band == "" then band = nil end
+
+        -- oper/mode/band 读不到就是 nil，由展示层显示"未获取"。
+        -- 旧代码分别补 "中国联通" / "5G SA" / "n78"：这些是编造的具体事实（而非"未知"占位），
+        -- 会把默认值伪装成真实网络状态。
         return {
-            oper = sim.ISP or "中国联通",
-            mode = net["Network Type"] or cell.mode_name or "5G SA",
-            band = (band ~= "") and band or "n78",
+            oper = sim.ISP,
+            mode = net["Network Type"] or cell.mode_name,
+            band = band,
             sim_ip = sim_ip,
             temp = base.temperature or "未知",
             rsrp = rsrp and (rsrp .. " dBm") or nil,
@@ -96,13 +212,18 @@ function M.info()
             sinr_num = tonumber(sinr),
             ambr_dl = net["AMBR DL"] and (net["AMBR DL"] .. " Mbps") or nil,
             ambr_ul = net["AMBR UL"] and (net["AMBR UL"] .. " Mbps") or nil,
-            qci = net["CQI DL"] or "6",
-            pci = cell["Physical Cell ID"],
-            cell_id = cell["Cell ID"]
+            -- CQI（信道质量指示，0–15）与 5QI（5G QoS 标识，1–9）是两个完全不同的量。
+            -- 旧代码把它命名为 qci 并补默认值 "6"，展示层再标成"5QI 标准移动宽带"，
+            -- 等于用信道质量冒充业务 QoS 等级。读不到就是 nil，不再补 "6"。
+            cqi = net["CQI DL"],
+            pci = pci,
+            cell_id = cid
         }
     end
 
     -- 兜底旧逻辑
+    -- 本分支的 "未知运营商" / "未知频段" / "未知制式" 是"未知"占位而非编造事实，予以保留；
+    -- oper 由 PLMN 映射得出（46001→中国联通）属于对真实数据的推断，也不是默认值。
     local cgpaddr = M.at("AT+CGPADDR=1") or ""
     local qnwinfo = M.at("AT+QNWINFO") or ""
 
@@ -160,7 +281,8 @@ function M.sms_list(storage, limit)
     limit = limit or 5
     local port = M.get_port()
 
-    local cmd = string.format("sms_tool -d %s -s %s -j recv 2>/dev/null", port, storage)
+    -- 纳入 AT 全局互斥锁：原先是三个写者之一，无锁直连串口
+    local cmd = at_locked(string.format("sms_tool -d %s -s %s -j recv 2>/dev/null", port, storage))
     local raw = core.exec(cmd)
     if not raw or raw == "" then return nil end
     local ok, data = pcall(json.parse, raw)
@@ -229,8 +351,18 @@ end
 
 function M.sms_poll_new()
     local port = M.get_port()
-    local st_raw = core.exec(string.format("sms_tool -d %s -s ME status 2>/dev/null", port))
-    local cur_used = tonumber(st_raw and st_raw:match("used:%s*(%d+)")) or 0
+    -- 这条由机器人主循环每 12 秒无条件调用，是全局风险最高的一处 AT 访问：
+    -- 原先是无锁 + 无超时，一旦挂住整个机器人事件循环永久停止（pcall 拦不住 C 层 read）。
+    local st_raw = core.exec(at_locked(string.format("sms_tool -d %s -s ME status 2>/dev/null", port), 2))
+    -- 必须区分"读不到"与"数量为 0"：
+    -- AT 锁争用时包装器返回 AT_BUSY，超时或端口异常时返回空串。
+    -- 若把这些当成 used=0，就会把台账清零，下一轮成功读取时
+    -- 全部历史短信都会被判定为新短信并逐条推送（短信轰炸）。
+    local used_str = st_raw and st_raw:match("used:%s*(%d+)")
+    if not used_str then
+        return {}
+    end
+    local cur_used = tonumber(used_str) or 0
 
     local last_used = tonumber(core.get_state("sms_last_used", "-1")) or -1
     local last_ts = tonumber(core.get_state("sms_last_ts", "0")) or 0

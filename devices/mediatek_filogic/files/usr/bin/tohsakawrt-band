@@ -33,7 +33,39 @@ PING_IFACE="${TWR_BAND_PING_IFACE:-usb0}"
 at_cmd() {
     [ -x "$AT_SCRIPT" ] || return 1
     { [ -e "$AT_PORT" ] || [ "$AT_FAKE" = "1" ]; } || return 1
-    AT_TIMEOUT="${AT_TIMEOUT:-6}" sh "$AT_SCRIPT" "$AT_PORT" "$1" 2>/dev/null | tr -d '\r'
+    # 为什么必须先把输出收进变量再打印：
+    # 函数体若以管道结尾，返回码恒等于管道末端 tr 的返回码（恒为 0），
+    # sh "$AT_SCRIPT" 的失败状态被整条丢掉。后果是 apply_bands 里那句
+    # `at_cmd ... >/dev/null 2>&1 || return 1` 成了死代码 —— 写频段实际失败
+    # （抢锁超时回 AT_BUSY、模组回 +CME ERROR、端口无响应）时仍返回 0，
+    # 脚本继续 echo OK_LOCKED，机器人显示「✅ 已提交频段锁定」，
+    # 用户以为锁上了，实际模组还是原来的频段设置。
+    # 收进变量后按内容显式判定，才能把失败真正上抛。
+    local out
+    out="$(AT_TIMEOUT="${AT_TIMEOUT:-6}" sh "$AT_SCRIPT" "$AT_PORT" "$1" 2>/dev/null | tr -d '\r')"
+    # 补回命令替换剥掉的尾部换行，保持与改动前管道输出一致的字节流，
+    # 让 current_bands 里 sed/head/tr 这些按行处理的消费者行为不变。
+    printf '%s\n' "$out"
+    # 只认内容不认退出码：退出码已被管道吞掉，而且"端口在、模组不响应"时
+    # sms_tool 打印 "No response from modem." 后【仍然 exit 0】，靠退出码根本判不出来。
+    # 这些失败文本之所以会出现在 stdout 里，是因为 modem_debug.sh 的 at() 用了
+    # `sms_tool ... 2>&1`，把 sms_tool 的 stderr 合并进了 stdout，本层的 2>/dev/null 挡不住。
+    #
+    # 各模式的实测来源（2026-10-09 在设备上确认）：
+    #   空输出                 → 端口无响应/被 timeout 杀掉
+    #   AT_BUSY                → modem_at.sh 抢锁超时（它自己 echo 的）
+    #   +CME ERROR / +CMS ERROR→ 模组级错误
+    #   No response from modem.→ 端口存在但模组不吭声（实测 /dev/ttyUSB0 得此文本）
+    #   failed tcsetattr(...)  → 设备不是 tty / 坏文件描述符（实测 /dev/ttyUSB99）
+    #
+    # 已实测核对：这两条命令的【成功】输出（`+QNWPREFCFG: "nr5g_band",<列表>`、仅 `OK`、
+    # ATI 的型号行）对这些子串全部 0 命中，不会误判。
+    # ⚠️ 注意 `*ERROR*` 与 `*failed*` 很宽：本文件只接这两条 AT 命令所以安全，
+    #    将来若把别的命令接进 at_cmd，必须重新评估这两条模式。
+    case "$out" in
+        ''|*AT_BUSY*|*'+CME ERROR'*|*'+CMS ERROR'*|*ERROR*|*'No response'*|*failed*) return 1 ;;
+    esac
+    return 0
 }
 
 notify() {

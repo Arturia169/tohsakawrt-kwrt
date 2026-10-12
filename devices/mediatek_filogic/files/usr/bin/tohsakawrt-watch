@@ -15,10 +15,19 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
         ''|*[!0-9]*) LOCK_STALE=1 ;;
         *)
             if kill -0 "$LOCK_PID" 2>/dev/null; then
-                logger -t TohsakaWrt-Watch "Top-level watch already active, skip"
-                exit 0
+                # 关键：仅凭 kill -0 无法识别"活着但已经卡死"的进程。本脚本是顶层巡检器，
+                # 一旦锁被永久占住，crond 又拒绝重入同一命令，整套巡检（温度/服务/模组自愈）
+                # 会静默死亡且无法自恢复。叠加年龄硬上限兜底。
+                if twr_lock_is_hung "$LOCK_DIR"; then
+                    logger -t TohsakaWrt-Watch "Top-level lock held by LIVE pid ${LOCK_PID} for $(twr_lock_age "$LOCK_DIR")s (>${TWR_LOCK_MAX_AGE}s) — 判定为卡死，强制回收"
+                    LOCK_STALE=1
+                else
+                    logger -t TohsakaWrt-Watch "Top-level watch already active, skip"
+                    exit 0
+                fi
+            else
+                LOCK_STALE=1
             fi
-            LOCK_STALE=1
             ;;
     esac
     logger -t TohsakaWrt-Watch "Removing stale top-level lock (pid=${LOCK_PID:-missing})"

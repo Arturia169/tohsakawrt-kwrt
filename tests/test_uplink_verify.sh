@@ -107,8 +107,11 @@ if TEST_ROUTE_GET_DEV=towan TEST_USB_IP=1 TEST_USB_GW=1 TEST_PROBE_FAIL=1 \
      "$SCRIPT" wan > "$TMP/wan-probe-fail.out" 2>&1; then rc=0; else rc=1; fi
 check '切 WAN 探测失败时非零退出并给出原因' \
     "$([ "$rc" -eq 1 ] && grep -Fq 'ERROR_UNVERIFIED_WAN' "$TMP/wan-probe-fail.out" && echo 1 || echo 0)"
-check '切 WAN 探测失败时恢复 5G 优先路由（回滚）' \
-    "$(grep -Fq 'ip route replace default via 192.168.225.1 dev usb0 metric 1' "$CALLS" && echo 1 || echo 0)"
+# 新实现把顺序倒过来了：先绑定 usb0 探通，探不通就一条路由都不碰（旧实现是先改再回滚，
+# 中间那个窗口里全屋只剩一条指向死链路的默认路由 —— 那才是"点一下全家断网"的根因）。
+# 所以这里断言更强的不变量：探测失败时不得出现任何改路由动作。
+check '切 WAN 探测失败时完全不碰路由（预检在改路由之前）' \
+    "$(grep -Eq '^ip route (replace|del|add) ' "$CALLS" && echo 0 || echo 1)"
 check '探测失败时不写"期望出口"' \
     "$([ ! -f "$TOHSAKA_UPLINK_DESIRED" ] && echo 1 || echo 0)"
 check '探测确实走了两个独立目标（ping + curl）' \
@@ -120,8 +123,8 @@ if TEST_ROUTE_GET_DEV=to5g TEST_USB_IP=1 TEST_USB_GW=1 TEST_PROBE_FAIL=1 \
      "$SCRIPT" 5g > "$TMP/5g-probe-fail.out" 2>&1; then rc=0; else rc=1; fi
 check '切 5G 探测失败时非零退出并给出原因' \
     "$([ "$rc" -eq 1 ] && grep -Fq 'ERROR_UNVERIFIED_5G' "$TMP/5g-probe-fail.out" && echo 1 || echo 0)"
-check '切 5G 探测失败时撤销刚加的优先路由' \
-    "$(grep -Fq 'ip route del default via 192.168.225.1 dev usb0 metric 1' "$CALLS" && echo 1 || echo 0)"
+check '切 5G 探测失败时完全不碰路由（预检在改路由之前）' \
+    "$(grep -Eq '^ip route (replace|del|add) ' "$CALLS" && echo 0 || echo 1)"
 
 # ---------- 探测成功才写"期望出口" ----------
 : > "$CALLS"

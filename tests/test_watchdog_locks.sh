@@ -46,6 +46,29 @@ cat > "$TMP/bin/ping" <<'SH'
 #!/bin/sh
 exit 1
 SH
+# 新代码用 common.sh 的 twr_timeout 给 mmcli 之类的外部调用加超时；
+# 测试环境没有 common.sh，所以这里放一个等价的外部桩（丢掉秒数后直接执行）。
+cat > "$TMP/bin/twr_timeout" <<'SH'
+#!/bin/sh
+shift
+exec "$@"
+SH
+# 新负载依赖 common.sh 的三个助手（有界执行 + 卡死锁识别）。测试环境不加载
+# common.sh，所以放等价的外部桩：
+cat > "$TMP/bin/twr_timeout" <<'SH'
+#!/bin/sh
+shift
+exec "$@"
+SH
+cat > "$TMP/bin/twr_lock_is_hung" <<'SH'
+#!/bin/sh
+# 0 = 判定为卡死（可回收），1 = 正常
+exit 1
+SH
+cat > "$TMP/bin/twr_lock_age" <<'SH'
+#!/bin/sh
+echo 0
+SH
 chmod +x "$TMP/bin/"*
 export PATH="$TMP/bin:$PATH" TEST_MARKER="$TMP/mmcli.log" TEST_DATE_MARKER="$TMP/date.log" TEST_LOG="$TMP/logger.log"
 HEAL="$PAYLOAD/tohsakawrt-modem-heal"

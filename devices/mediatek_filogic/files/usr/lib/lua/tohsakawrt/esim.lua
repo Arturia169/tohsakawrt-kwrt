@@ -60,8 +60,26 @@ function M.resolve(profiles, selector)
     return nil, "not_found"
 end
 
+-- lpac 直连 eUICC（经模组 AT/APDU 通道），原先也是无超时的裸 io.popen，
+-- 绕过了 core.exec 的统一保护。修复两点：
+--   ① 经 core.bounded 加硬超时（timeout -s KILL），挂起时可被强制终止；
+--   ② 经 tohsakawrt-at-lock 纳入全局 AT 互斥锁，与 modem_at.sh / sms_tool 串行化 ——
+--      原先 AT 口有三个互不互斥的写者，这是并发下挂起的根因之一。
+local AT_LOCK = "/usr/bin/tohsakawrt-at-lock"
+local AT_LOCK_OK = (function()
+    local f = io.open(AT_LOCK, "r")
+    if f then f:close() return true end
+    return false
+end)()
+
 local function lpac(command)
-    local p = io.popen(command .. " 2>/dev/null", "r")
+    local full
+    if AT_LOCK_OK then
+        full = string.format("%s %s 2>/dev/null", AT_LOCK, command)
+    else
+        full = command .. " 2>/dev/null"
+    end
+    local p = io.popen(core.bounded(full, 90), "r")
     if not p then return nil end
     local out = p:read("*a") or ""
     p:close()

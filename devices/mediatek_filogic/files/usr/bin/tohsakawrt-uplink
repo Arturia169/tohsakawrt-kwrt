@@ -97,8 +97,12 @@ write_desired() {
 # 为什么不止一个：只依赖 ICMP 时，对方封禁 ICMP 会让我们误判成断网并回滚 —— 那比不检查更糟。
 probe_uplink() {
     local dev="$1"
-    ping -c 2 -W 2 223.5.5.5 >/dev/null 2>&1 && return 0
-    curl -s -m 5 -k -o /dev/null "https://1.1.1.1/" >/dev/null 2>&1 && return 0
+    # 每条探测都必须绑定 $dev。原实现前两条没绑定，测的是"当前默认路由"，
+    # 于是切换前预检形同虚设、切换后测的又恰好是新线路，结论自相矛盾。
+    # BusyBox ping 的 -I <设备名> 走 SO_BINDTODEVICE，实测确实能选路：
+    # 同一时刻默认路由为 usb0 时，-I eth0 得 9ms、-I usb0 得 30~45ms。
+    ping -c 2 -W 2 -I "$dev" 223.5.5.5 >/dev/null 2>&1 && return 0
+    ping -c 2 -W 2 -I "$dev" 119.29.29.29 >/dev/null 2>&1 && return 0
     curl -s -m 5 -k -o /dev/null --interface "$dev" "https://1.1.1.1/" >/dev/null 2>&1 && return 0
     return 1
 }
@@ -114,6 +118,14 @@ switch_to_wan() {
     if [ -z "$eth_gw" ]; then
         logger -t TohsakaWrt-Uplink "WAN route validation failed: no default gateway on eth0"
         echo "ERROR_SWITCH_FAILED"
+        return 1
+    fi
+
+    # 先绑定 eth0 预检，探通了再撤 5G 路由。
+    # 探不通就一条路由都不动，保证任何时刻都存在可用的默认路由，不留"无出口"窗口。
+    if ! probe_uplink eth0; then
+        logger -t TohsakaWrt-Uplink "WAN 预检未通过，未改动任何路由（保持 5G）"
+        echo "ERROR_UNVERIFIED_WAN"
         return 1
     fi
 
@@ -135,17 +147,7 @@ switch_to_wan() {
         return 1
     fi
 
-    # 真实连通性探测：路由已指向 eth0，但未必真的能上网（光猫上游断网/拨号失败等）
-    if ! probe_uplink eth0; then
-        if [ -n "$usb_gw" ]; then
-            ip route replace default via "$usb_gw" dev usb0 metric 1 2>/dev/null || true
-            ip route replace default via "$usb_gw" dev usb0 metric 5 2>/dev/null || true
-        fi
-        logger -t TohsakaWrt-Uplink "WAN connectivity probe failed, rolled back to 5G"
-        echo "ERROR_UNVERIFIED_WAN"
-        return 1
-    fi
-
+    # 连通性已在切换前绑定 eth0 预检通过，此处不再重复探测（原实现是切换后才探，属多余）
     normalize_metrics
     if [ "${TOHSAKA_UPLINK_KEEP_DESIRED:-0}" = "1" ]; then
         # 临时回落：期望出口保持不变（否则 reconcile 会与回落互相打架）
@@ -172,6 +174,17 @@ switch_to_5g() {
         return 1
     fi
 
+    # 关键修复：模组附着上了不代表数据面通（流量卡欠费/停机时尤其如此）。
+    # 必须"先绑定 usb0 探通，再动默认路由"。原实现顺序相反 ——
+    # 先 ip route replace default via "$usb_gw" dev usb0 metric 1，然后再探测，
+    # 探不通才回滚；在那个窗口里整个局域网只剩一条指向死链路的默认路由，
+    # 这就是"点一下按钮全家断网"的直接原因。现在探不通就一条路由都不碰。
+    if ! probe_uplink usb0; then
+        logger -t TohsakaWrt-Uplink "5G 预检未通过，未改动任何路由（保持当前出口）"
+        echo "ERROR_UNVERIFIED_5G"
+        return 1
+    fi
+
     local eth_gw="$(get_gateway eth0)"
     if [ -n "$eth_gw" ]; then
         ip route del default via "$eth_gw" dev eth0 metric 1 2>/dev/null || true
@@ -191,14 +204,7 @@ switch_to_5g() {
         return 1
     fi
 
-    # 真实连通性探测：模组附着上了不代表数据面通
-    if ! probe_uplink usb0; then
-        ip route del default via "$usb_gw" dev usb0 metric 1 2>/dev/null || true
-        logger -t TohsakaWrt-Uplink "5G connectivity probe failed, reverted route change"
-        echo "ERROR_UNVERIFIED_5G"
-        return 1
-    fi
-
+    # 连通性已在切换前绑定 usb0 预检通过，此处不再重复探测
     normalize_metrics
     if [ "${TOHSAKA_UPLINK_KEEP_DESIRED:-0}" = "1" ]; then
         # 临时回落：期望出口保持不变（否则 reconcile 会与回落互相打架）

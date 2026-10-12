@@ -136,15 +136,61 @@ jobs:
           unsquashfs -q -no-exit-code -d rfs "$root" >/dev/null
           missing=0
           for f in \
-            usr/bin/tohsakawrt-tgbot usr/bin/tohsakawrt-service-watch usr/bin/tohsakawrt-temp-watch \
-            usr/bin/tohsakawrt-modem-heal usr/bin/tohsakawrt-uplink usr/bin/tohsaka-direct \
-            usr/lib/tohsakawrt/common.sh etc/init.d/tohsakawrt-tgbot \
-            etc/uci-defaults/99-tohsakawrt-setup etc/hotplug.d/tty/40-modem-heal \
-            usr/bin/tohsakawrt usr/bin/tohsakawrt-watch \
-            usr/lib/lua/tohsakawrt/bot.lua usr/lib/lua/tohsakawrt/clash.lua usr/lib/lua/tohsakawrt/cli.lua \
-            usr/lib/lua/tohsakawrt/core.lua usr/lib/lua/tohsakawrt/modem.lua usr/lib/lua/tohsakawrt/system.lua \
+            etc/banner \
+            etc/config/fstab \
+            etc/config/modem \
+            etc/config/tohsakawrt-tgbot \
+            etc/crontabs/root \
+            etc/hotplug.d/tty/40-modem-heal \
+            etc/init.d/tohsakawrt-tgbot \
+            etc/opkg.conf \
+            etc/profile.d/20-opt.sh \
+            etc/sysctl.conf \
+            etc/tohsakawrt-aliases \
+            etc/tohsakawrt-known-macs \
+            etc/uci-defaults/99-tohsakawrt-setup \
+            lib/udev/rules.d/77-mm-quectel-port-types.rules \
+            usr/bin/tohsakawrt \
+            usr/bin/tohsakawrt-at-lock \
+            usr/bin/tohsakawrt-band \
+            usr/bin/tohsakawrt-clash-direct \
+            usr/bin/tohsakawrt-event \
+            usr/bin/tohsakawrt-event-collect \
+            usr/bin/tohsakawrt-event-correlate \
+            usr/bin/tohsakawrt-event-files \
+            usr/bin/tohsakawrt-event-log \
+            usr/bin/tohsakawrt-event-watch \
+            usr/bin/tohsakawrt-flowcard-daily \
+            usr/bin/tohsakawrt-gnss \
+            usr/bin/tohsakawrt-modem-heal \
+            usr/bin/tohsakawrt-service-watch \
+            usr/bin/tohsakawrt-signal-log \
+            usr/bin/tohsakawrt-temp-watch \
+            usr/bin/tohsakawrt-tgbot \
+            usr/bin/tohsakawrt-uplink \
+            usr/bin/tohsakawrt-uptime \
+            usr/bin/tohsakawrt-watch \
+            usr/lib/lua/luci/view/modem/modem_info.htm \
+            usr/lib/lua/tohsakawrt/bot.lua \
+            usr/lib/lua/tohsakawrt/bot_common.lua \
+            usr/lib/lua/tohsakawrt/bot_direct.lua \
+            usr/lib/lua/tohsakawrt/bot_esim.lua \
+            usr/lib/lua/tohsakawrt/bot_modem.lua \
+            usr/lib/lua/tohsakawrt/bot_net.lua \
+            usr/lib/lua/tohsakawrt/bot_sys.lua \
+            usr/lib/lua/tohsakawrt/clash.lua \
+            usr/lib/lua/tohsakawrt/cli.lua \
+            usr/lib/lua/tohsakawrt/core.lua \
+            usr/lib/lua/tohsakawrt/esim.lua \
+            usr/lib/lua/tohsakawrt/modem.lua \
+            usr/lib/lua/tohsakawrt/system.lua \
             usr/lib/lua/tohsakawrt/tg.lua \
-            etc/config/tohsakawrt-tgbot etc/crontabs/root ; do
+            usr/lib/tohsakawrt/common.sh \
+            usr/share/modem/modem_at.sh \
+            usr/share/modem/modem_debug.sh \
+            usr/share/modem/modem_info.sh \
+            usr/share/modem/quectel.sh
+          ; do
             if [ -x "rfs/$f" ] || [ -f "rfs/$f" ]; then echo "  ok  $f"; else echo "  MISSING  $f"; missing=1; fi
           done
           grep -q "TohsakaWrt" rfs/etc/openwrt_release && echo "  ok  brand=TohsakaWrt" || { echo "  MISSING brand"; missing=1; }

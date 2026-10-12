@@ -125,7 +125,11 @@ end
 
 function M.wan_gateway()
     local out = core.exec_line("ip route show default 2>/dev/null | awk '{print $3; exit}'")
-    return out ~= "" and out or "192.168.1.1"
+    -- 不编造网关：读不到（没有默认路由）就返回 nil，由展示层写"未获取"。
+    -- 原先兜底 "192.168.1.1"：那会去 ping 一个可能毫不相干的主机，
+    -- 并把结果显示成"局域网关"——等于把猜测当事实展示（与已修的编造运营商同类）。
+    if out == "" then return nil end
+    return out
 end
 
 function M.uplink_status()
@@ -256,7 +260,9 @@ function M.switch_uplink(target)
         return "INVALID_TARGET"
     end
 
-    local raw = core.exec_line("/usr/bin/tohsakawrt-uplink " .. arg .. " 2>/dev/null") or ""
+    -- 显式放宽到 90 秒：出口切换含锁等待（最多 8s）+ 绑定网卡连通性探测（最多 13s），
+    -- 叠加 reconcile 场景实测最坏约 29 秒。
+    local raw = core.exec_line("/usr/bin/tohsakawrt-uplink " .. arg .. " 2>/dev/null", 90) or ""
     raw = raw:gsub("%s+$", "")
     local code = raw:match("^([A-Z0-9_]+)")
     local res = code or raw
@@ -343,6 +349,12 @@ function M.wan_speed(dev)
 end
 
 function M.ping_metric(target, count)
+    -- target 可能为 nil（例如 wan_gateway() 在没有默认路由时返回 nil）。
+    -- 必须在这里拦住：Lua 5.1 的 %s 收到 nil 会抛 "string expected, got nil"，
+    -- 会把整张卡片打断，而不是显示成"未获取"。
+    if type(target) ~= "string" or target == "" then
+        return false, "⚪", "未获取到目标", ""
+    end
     count = count or 2
     local cmd = string.format("ping -c %d -W 1 %s 2>&1", count, target)
     local res = core.exec(cmd)

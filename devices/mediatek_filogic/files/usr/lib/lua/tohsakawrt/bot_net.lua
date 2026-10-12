@@ -28,6 +28,12 @@ function M.build_uplink_menu()
     local m_info = modem.info()
     local pub_ip = sys.public_ip()
 
+    -- modem.info() 读不到运营商/频段时现在返回 nil（不再编造"中国联通"/"n78"），
+    -- 而 html_escape(nil) 得到空串，会渲染成"制式频段：<code> · </code>"，
+    -- 用户看不出是"没读到"还是"读到空值"。这里统一兜成"未获取"。
+    local oper_s = m_info.oper and html_escape(m_info.oper) or "未获取"
+    local band_s = m_info.band and html_escape(m_info.band) or "未获取"
+
     local wan_pub_line = ""
     local cell_pub_line = ""
     local cell_mode_line = ""
@@ -36,13 +42,13 @@ function M.build_uplink_menu()
         if pub_ip ~= "未获取到" then core.set_state("last_wan_pubip", pub_ip) end
         local wan_pub = (pub_ip ~= "未获取到") and pub_ip or core.get_state("last_wan_pubip", "未获取到")
         wan_pub_line = string.format("└ <b>公网归属</b>：<code>%s</code> 🟢", html_escape(wan_pub))
-        cell_mode_line = string.format("└ <b>制式频段</b>：<code>%s · %s</code> ℹ️", html_escape(m_info.oper), html_escape(m_info.band))
+        cell_mode_line = string.format("└ <b>制式频段</b>：<code>%s · %s</code> ℹ️", oper_s, band_s)
     elseif uplink.type == "5g" then
         if pub_ip ~= "未获取到" then core.set_state("last_5g_pubip", pub_ip) end
         local cell_pub = (pub_ip ~= "未获取到") and pub_ip or core.get_state("last_5g_pubip", "未获取到")
         local wan_last = core.get_state("last_wan_pubip", "备用待命")
         wan_pub_line = string.format("└ <b>上次出口</b>：<code>%s</code> ℹ️", html_escape(wan_last))
-        cell_mode_line = string.format("├ <b>制式频段</b>：<code>%s · %s</code>", html_escape(m_info.oper), html_escape(m_info.band))
+        cell_mode_line = string.format("├ <b>制式频段</b>：<code>%s · %s</code>", oper_s, band_s)
         cell_pub_line = string.format("\n└ <b>公网归属</b>：<code>%s</code> 🟢", html_escape(cell_pub))
     else
         wan_pub_line = string.format("└ <b>物理内网</b>：<code>%s</code>", html_escape(ip_wan))
@@ -133,7 +139,7 @@ function M.cmd_ping()
 💡 <i>评级：🟢 良好  🟡 一般  🟠 偏高  🔴 不可达</i>
 📏 <i>阈值：ICMP 80 / 150 ms · HTTP 500 / 1000 ms</i>
 
-🕰️ <i>%s</i>]], html_escape(gw), p_gw_icon, html_escape(metric_display(p_gw_ok, p_gw_ms)), html_escape(p_gw_loss),
+🕰️ <i>%s</i>]], html_escape(gw or "未获取"), p_gw_icon, html_escape(metric_display(p_gw_ok, p_gw_ms)), html_escape(p_gw_loss),
         p_ali_icon, html_escape(metric_display(p_ali_ok, p_ali_ms)), html_escape(p_ali_loss),
         p_cf_icon, html_escape(metric_display(p_cf_ok, p_cf_ms)), html_escape(p_cf_loss),
         h_direct_icon, html_escape(metric_display(h_direct_ok, h_direct_ms)), p_node_icon, html_escape(p_node_ms),
@@ -348,7 +354,7 @@ function M.cmd_wan()
 <b>默认路由：</b>
 <pre><code>%s</code></pre>
 
-🕰️ <i>%s</i>]], html_escape(dev), html_escape(gw), html_escape(ip), safe_pub_ip, safe_proxy_ip, html_escape(ip6), (routes ~= "" and routes or "无"), html_escape(now))
+🕰️ <i>%s</i>]], html_escape(dev), html_escape(gw or "未获取"), html_escape(ip), safe_pub_ip, safe_proxy_ip, html_escape(ip6), (routes ~= "" and routes or "无"), html_escape(now))
 
     tg.send_msg(text)
 end

@@ -1,0 +1,277 @@
+#!/bin/sh
+# TohsakaWrt 网络黑匣子 —— 从"文件型"日志源采集事件
+#
+#   collect    增量采集（每分钟由巡检调用）
+#   status     显示各文件的读取位置（排查用）
+#   reset      清空读取位置（会重新采集整个文件，仅用于排查）
+#
+# 为什么单独一个脚本：
+#   系统日志型来源由 tohsakawrt-event-collect 负责（它读 logread）。
+#   而代理核心（OpenClash/Mihomo）的日志是【独立文件】、不经过 syslog，
+#   而且两种时间格式混在一起（一个本地时间、一个 UTC）。分开实现更清晰，
+#   也避免两个来源的读取位置互相干扰。
+#
+# 处理的文件与规则：
+#   /tmp/openclash_start.log   OpenClash 启停生命周期（本地时间 YYYY-MM-DD HH:MM:SS）
+#   /tmp/openclash.log         代理核心运行日志（UTC 时间，只取 level=error/warning）
+#
+# ── 读取位置（.pos 文件里存 "<行号> <字节数>" 两个值）──────────────────
+#   只存行号是不够的：如果文件被清空后又重新长回超过旧行号，就检测不到轮转，
+#   `tail -n +N` 会静默跳过新文件的前 N 行（实测会丢掉「OpenClash 重启」这类事件）。
+#   所以同时存字节数，发现"当前字节数 < 上次字节数"就判定轮转、位置归零。
+#
+# ── 为什么上限按"产出条数"而不是"扫描行数"──────────────────────────
+#   早先的写法用同一个计数器兼管两件事，于是"扫满 N 行就停"但位置却推到文件末尾
+#   —— 剩余行【永久丢失】（不是下次再读，是再也不读）。实测：30 行文件里第 25 行
+#   是唯一的 [Error]，第一次运行一条都没采到、位置却已是 30，第二次依旧采不到。
+#   现在两个计数器分开：emitted 控上限、scanned 控位置推进，且位置只推进到
+#   "真正扫描过的行"，没扫到的下次继续。
+#
+# ── 凭据防护（安全，不可省）────────────────────────────────────────
+#   代理日志里可能出现带口令的订阅地址（scheme://user:pass@host）与认证提示
+#   （"You have seted the authentication ... with【...】"）。台账落在【内部闪存】
+#   且会推到 Telegram，所以宁可少记几条也绝不能把口令写进去。
+#   注意：这道过滤必须对【两个源都生效】—— 早先只加在 openclash_start.log 那条
+#   路径上，openclash.log 完全没有过滤（审计发现 F3）。
+
+EVENT="${TWR_EVENT_BIN:-/usr/bin/tohsakawrt-event}"
+LOG="${TWR_EVENT_LOG:-/etc/tohsakawrt/events.log}"
+STATE_DIR="${TWR_EVENT_FILES_STATE:-/tmp/tohsakawrt/state}"
+START_LOG="${TWR_OPENCLASH_START_LOG:-/tmp/openclash_start.log}"
+CORE_LOG="${TWR_OPENCLASH_CORE_LOG:-/tmp/openclash.log}"
+MAX_PER_RUN="${TWR_EVENT_FILES_MAX:-20}"
+MSG_MAX=120
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+# 本地时区相对 UTC 的偏移（秒）。用于把日志里的 UTC 时间换算成本地 epoch。
+tz_offset() {
+    z="$(date +%z 2>/dev/null)"
+    # 兼容 "+0800" 与 "+08:00" 两种形式（后者若不处理会静默算成 0，时间差好几小时）
+    z="$(printf '%s' "$z" | tr -d ':')"
+    case "$z" in
+        [+-][0-9][0-9][0-9][0-9]) ;;
+        *) echo 0; return ;;
+    esac
+    sign="$(printf '%s' "$z" | cut -c1)"
+    h="$(printf '%s' "$z" | cut -c2-3)"; h="${h#0}"; [ -n "$h" ] || h=0
+    m="$(printf '%s' "$z" | cut -c4-5)"; m="${m#0}"; [ -n "$m" ] || m=0
+    s=$(( h * 3600 + m * 60 ))
+    [ "$sign" = "-" ] && s=$(( 0 - s ))
+    echo "$s"
+}
+
+trim() {
+    printf '%s' "$1" | cut -c1-"$MSG_MAX"
+}
+
+# 凭据/敏感信息判定。返回 0 表示"敏感，不能记"。
+#
+# 为什么这么宽：台账落在【内部闪存】且会推到 Telegram，一旦写进去就难以收回；
+# 而少记一条 OpenClash 错误几乎没有代价（原始日志文件还在，随时能查）。
+# 所以这里宁可多拦。
+sensitive() {
+    case "$1" in
+        *authentication*|*Authentication*|*AUTHENTICATION*) return 0 ;;
+        *【*) return 0 ;;
+        *token=*|*Token=*|*TOKEN=*) return 0 ;;
+        *secret=*|*Secret=*|*SECRET=*) return 0 ;;
+        *password=*|*passwd=*) return 0 ;;
+        # 订阅相关消息几乎必然带口令或订阅地址（实测 "subscription <口令> failed" 这种形态）
+        *subscription*|*Subscription*|*SUBSCRIPTION*) return 0 ;;
+        *subscribe*|*Subscribe*) return 0 ;;
+    esac
+    # URL 内嵌凭据：scheme://user:pass@host
+    printf '%s' "$1" | grep -qE '[a-zA-Z][a-zA-Z0-9+.-]*://[^/@:[:space:]]+:[^/@[:space:]]+@' && return 0
+    # URL 带查询串：订阅链接最常见的形态（?token=...），查询串里通常就是凭据
+    printf '%s' "$1" | grep -qE '[a-zA-Z][a-zA-Z0-9+.-]*://[^[:space:]]*\?' && return 0
+    return 1
+}
+
+# 追加事件：显式带时间戳 + 内容去重（位置记在 /tmp，重启会丢，必须再兜一道）
+#
+# ⚠️ 返回值语义很重要：0 = 真的写入了；1 = 被去重跳过或写入失败。
+# 调用方用它来决定是否消耗 MAX_PER_RUN 配额。
+# 早先无论写入还是被去重都返回 0，于是"已存在的事件"照样占用配额 ——
+# 每轮都被前几条老事件占满，位置永远推进不下去（实测 30 行只产出 5 条就卡死）。
+emit() {
+    line="$1 $2 $3 $4 $5"
+    if tail -n 300 "$LOG" 2>/dev/null | grep -qxF "$line"; then
+        return 1
+    fi
+    TWR_EVENT_TS="$1" "$EVENT" "$2" "$3" "$4" "$5" || return 1
+    return 0
+}
+
+# 行校验和。用它判断"上次读到的第 N 行还是不是原来那一行"。
+# 注意必须用本机【确实存在】的命令：早先用 cksum，而 BusyBox 没装它，
+# 于是校验恒失败、位置每次都被重置为 0（退化成全量重读）。
+line_ck() {
+    sed -n "${2}p" "$1" 2>/dev/null | md5sum 2>/dev/null | awk '{print $1}'
+}
+
+posfile() { echo "$STATE_DIR/event-files-$(basename "$1").pos"; }
+
+# 读取位置：输出 "<行号> <字节数> <末行校验和>"
+get_pos() {
+    p="$(cat "$(posfile "$1")" 2>/dev/null)"
+    ln="$(printf '%s' "$p" | awk '{print $1}')"
+    sz="$(printf '%s' "$p" | awk '{print $2}')"
+    ck="$(printf '%s' "$p" | awk '{print $3}')"
+    case "$ln" in ''|*[!0-9]*) ln=0 ;; esac
+    case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+    [ -n "$ck" ] || ck="-"
+    echo "$ln $sz $ck"
+}
+
+set_pos() { printf '%s %s %s' "$2" "$3" "$4" > "$(posfile "$1")" 2>/dev/null; }
+
+# 统一的增量读取骨架：$1=文件 $2=处理函数名（每行调用一次，返回 0 表示"已产出事件"）
+#
+# 用【输入重定向】而不是管道 —— 管道会让 while 跑在子 shell 里，
+# 计数器出不来，位置就没法正确推进。
+#
+# 轮转判定用三重条件（只比行数是不够的）：
+#   ① 行号倒退              —— 文件被截断
+#   ② 字节数变小            —— 文件被截断
+#   ③ 第 N 行的校验和变了    —— 文件被清空后【重新长回更大】（①② 都检测不到，
+#                              实测会静默跳过新文件的前 N 行、丢掉开头的事件）
+scan_file() {
+    f="$1"; handler="$2"
+    [ -r "$f" ] || return 0
+
+    cur_lines="$(wc -l < "$f" 2>/dev/null)"
+    cur_size="$(stat -c %s "$f" 2>/dev/null)"
+    case "$cur_lines" in ''|*[!0-9]*) cur_lines=0 ;; esac
+    case "$cur_size" in ''|*[!0-9]*) cur_size=0 ;; esac
+
+    set -- $(get_pos "$f")
+    last_lines="$1"; last_size="$2"; last_ck="$3"
+
+    if [ "$cur_lines" -lt "$last_lines" ] || [ "$cur_size" -lt "$last_size" ]; then
+        last_lines=0
+    fi
+
+    # ③ 校验"第 N 行还是不是原来那一行"
+    if [ "$last_lines" -gt 0 ] && [ "$cur_lines" -ge "$last_lines" ]; then
+        now_ck="$(line_ck "$f" "$last_lines")"
+        [ -n "$now_ck" ] && [ "$now_ck" = "$last_ck" ] || last_lines=0
+    fi
+
+    [ "$cur_lines" -le "$last_lines" ] && return 0
+
+    tmp="$(mktemp)"
+    tail -n +$((last_lines + 1)) "$f" > "$tmp" 2>/dev/null
+
+    emitted=0
+    scanned=0
+    while IFS= read -r line; do
+        [ "$emitted" -ge "$MAX_PER_RUN" ] && break   # 到上限就停，位置只推进到已扫描处
+        scanned=$((scanned + 1))
+        if "$handler" "$line"; then
+            emitted=$((emitted + 1))
+        fi
+    done < "$tmp"
+    rm -f "$tmp"
+
+    # 位置推进到"真正扫描过的行"，未扫描的下次继续 —— 绝不推到文件末尾
+    new_lines=$((last_lines + scanned))
+    set_pos "$f" "$new_lines" "$cur_size" "$(line_ck "$f" "$new_lines")"
+    return 0
+}
+
+# ------------------------------------------------------------------
+# 源一：OpenClash 启停生命周期（本地时间）
+# ------------------------------------------------------------------
+handle_start_line() {
+    line="$1"
+    msg="$(printf '%s' "$line" | cut -c21-)"
+
+    # 先按消息白名单筛，再解析时间 —— 避免为无关行白白 fork 一个 date
+    case "$msg" in
+        "[Tip] OpenClash Restart..."|"[Tip] OpenClash Stoping..."|"[Tip] OpenClash Already Stop!"|\
+        "[Tip] OpenClash Start Running..."|"[Tip] OpenClash Start Successful!") ;;
+        *"[Error]"*) ;;
+        *) return 1 ;;
+    esac
+    sensitive "$msg" && return 1
+
+    d="$(printf '%s' "$line" | cut -c1-19)"
+    ts="$(date -d "$d" +%s 2>/dev/null)"
+    case "$ts" in ''|*[!0-9]*) return 1 ;; esac
+
+    case "$msg" in
+        "[Tip] OpenClash Restart...")      emit "$ts" info proxy openclash "OpenClash 重启" ;;
+        "[Tip] OpenClash Stoping...")      emit "$ts" info proxy openclash "OpenClash 停止中" ;;
+        "[Tip] OpenClash Already Stop!")   emit "$ts" info proxy openclash "OpenClash 已停止" ;;
+        "[Tip] OpenClash Start Running...") emit "$ts" info proxy openclash "OpenClash 启动中" ;;
+        "[Tip] OpenClash Start Successful!") emit "$ts" info proxy openclash "OpenClash 启动成功" ;;
+        *"[Error]"*)                       emit "$ts" error proxy openclash "$(trim "$msg")" ;;
+        *) return 1 ;;
+    esac
+    # case 各分支的最后一条命令就是 emit，它的返回值（0=写入/1=去重跳过）
+    # 需要原样传给调用方，用来决定是否消耗 MAX_PER_RUN 配额。
+    return $?
+}
+
+# ------------------------------------------------------------------
+# 源二：代理核心运行日志（UTC 时间，只取 error/warning）
+# ------------------------------------------------------------------
+handle_core_line() {
+    line="$1"
+
+    lvl="$(printf '%s' "$line" | sed -n 's/.*level=\([a-z]*\).*/\1/p')"
+    case "$lvl" in
+        error)   lvl_out=error ;;
+        warning) lvl_out=warn ;;
+        *) return 1 ;;
+    esac
+
+    msg="$(printf '%s' "$line" | sed -n 's/.*msg="\(.*\)"$/\1/p')"
+    [ -n "$msg" ] || return 1
+    msg="$(trim "$msg")"
+
+    # ⚠️ 凭据过滤对这条路径同样必须生效（审计发现 F3：早先只加在启停日志那条上）
+    sensitive "$msg" && return 1
+
+    utc="$(printf '%s' "$line" | sed -n 's/.*time="\([0-9-]*\)T\([0-9:]*\)\..*/\1 \2/p')"
+    [ -n "$utc" ] || return 1
+    ts="$(date -d "$utc" +%s 2>/dev/null)"
+    case "$ts" in ''|*[!0-9]*) return 1 ;; esac
+
+    # ⚠️ 必须【加】偏移，不是减。`date -d "T"` 把 T 当本地时间解析，
+    # 而日志里的 T 是 UTC 读数；当 UTC 读数为 T 时本地读数是 T+off，
+    # 所以目标时刻 = "本地读 T" 的时刻 + off。写成减号会偏 2×时区（+8 区差 16 小时）。
+    off="$(tz_offset)"
+    ts=$(( ts + off ))
+
+    # emit 的返回值（0=写入/1=去重跳过）要原样传出去，决定是否消耗配额
+    emit "$ts" "$lvl_out" proxy mihomo "$msg"
+    return $?
+}
+
+case "${1:-collect}" in
+    collect)
+        scan_file "$START_LOG" handle_start_line
+        scan_file "$CORE_LOG"  handle_core_line
+        ;;
+    status)
+        for f in "$START_LOG" "$CORE_LOG"; do
+            cur="$(wc -l < "$f" 2>/dev/null)"; case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+            csz="$(stat -c %s "$f" 2>/dev/null)"; case "$csz" in ''|*[!0-9]*) csz=0 ;; esac
+            set -- $(get_pos "$f")
+            printf '  %-30s 当前 %4s 行/%6s 字节, 已读到 %4s 行/%6s 字节\n' \
+                "$(basename "$f")" "$cur" "$csz" "$1" "$2"
+        done
+        ;;
+    reset)
+        rm -f "$(posfile "$START_LOG")" "$(posfile "$CORE_LOG")" 2>/dev/null
+        echo "已清空读取位置"
+        ;;
+    *)
+        echo "用法: $0 {collect|status|reset}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

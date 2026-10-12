@@ -175,7 +175,11 @@ local ok, err = pcall(function()
 
     -- 4. 组装并发送 Telegram HTML 报表
     local icon = quota_icon(percent)
-    local operator = tostring(card.operator_name or "中国联通")
+    -- 不编造运营商：卡商接口没给就是"未知运营商"。
+    -- 原先补 "中国联通" 会把默认值伪装成真实信息（同类缺陷在 modem.lua 的 oper/mode/band 上
+    -- 也已一并修正为"读不到即 nil，由展示层写未获取"）。
+    local operator = tostring(card.operator_name or "")
+    if operator == "" then operator = "未知运营商" end
     local package = tostring(card.package_name or "100G/月享套餐")
     local expiry = tostring(card.package_end_time or "未知")
     local expiry_short = expiry:match("(%d%d%-%d%d)T(%d%d:%d%d)")

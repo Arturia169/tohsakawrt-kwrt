@@ -17,7 +17,9 @@ package.preload["tohsakawrt.core"] = function()
         exec = function() return "" end,
         get_uci = function(_, _, _, default) return default end,
         set_state = function() end,
-        get_state = function(_, default) return default end
+        get_state = function(_, default) return default end,
+        -- 新代码用 core.bounded(cmd, 秒) 统一加超时（原先各模块自己拼 timeout）
+        bounded = function(cmd) return cmd end
     }
 end
 package.preload["tohsakawrt.modem"] = function() return {} end

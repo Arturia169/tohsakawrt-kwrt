@@ -87,6 +87,22 @@ cat > "$BIN/date" <<'EOF'
 printf 'date %s\n' "$*" >> "$CALLS"
 echo "$TEST_NOW"
 EOF
+# 新负载依赖 common.sh 的三个助手（有界执行 + 卡死锁识别）。测试环境不加载
+# common.sh，所以放等价的外部桩：
+cat > "$BIN/twr_timeout" <<'SH'
+#!/bin/sh
+shift
+exec "$@"
+SH
+cat > "$BIN/twr_lock_is_hung" <<'SH'
+#!/bin/sh
+# 0 = 判定为卡死（可回收），1 = 正常
+exit 1
+SH
+cat > "$BIN/twr_lock_age" <<'SH'
+#!/bin/sh
+echo 0
+SH
 chmod +x "$BIN"/*
 export PATH="$BIN:$PATH"
 
@@ -132,7 +148,9 @@ while [ "$i" -lt 6 ]; do
     run_once eth0 $((5000 + i * 60)) "$TMP/state-standby6"
     i=$((i + 1))
 done
-check '失败 6 次且跨度 300 秒时 AT+CFUN=0/1 各出现一次' "$( [ "$(grep -Ec '^sh .* AT\+CFUN=0$' "$CALLS")" -eq 1 ] && [ "$(grep -Ec '^sh .* AT\+CFUN=1$' "$CALLS")" -eq 1 ] && echo 1 || echo 0)"
+# 新实现把"CFUN=0 再 CFUN=1"两步换成单条 AT+CFUN=1,1：两步法若 CFUN=1 未送达，
+# 模组会永久停在无射频状态。这里同时断言"裸 CFUN=0 绝不出现"。
+check '失败 6 次且跨度 300 秒时用单条 AT+CFUN=1,1 复归（且无裸 CFUN=0）' "$( [ "$(grep -Ec '^sh .* AT\+CFUN=1,1$' "$CALLS")" -eq 1 ] && [ "$(grep -Ec '^sh .* AT\+CFUN=0$' "$CALLS")" -eq 0 ] && echo 1 || echo 0)"
 check '自愈脚本通过 sh -n' "$(sh -n "$SCRIPT" && echo 1 || echo 0)"
 
 : > "$CALLS"
@@ -157,7 +175,7 @@ while [ "$i" -lt 6 ]; do
     run_once eth0 $((8000 + i * 70)) "$TMP/state-nodata-ladder" 12345
     i=$((i + 1))
 done
-check '不命中仍按 Stage 1 ifup、Stage 2 QNETDEVCTL、Stage 3 CFUN' "$(grep -q '^ifup 5Ga$' "$CALLS" && grep -q 'AT+QNETDEVCTL=1,1,1' "$CALLS" && grep -q 'AT+CFUN=0' "$CALLS" && grep -q 'AT+CFUN=1' "$CALLS" && echo 1 || echo 0)"
+check '不命中仍按 Stage 1 ifup、Stage 2 QNETDEVCTL、Stage 3 CFUN' "$(grep -q '^ifup 5Ga$' "$CALLS" && grep -q 'AT+QNETDEVCTL=1,1,1' "$CALLS" && grep -q 'AT+CFUN=1,1' "$CALLS" && echo 1 || echo 0)"
 
 : > "$CALLS"
 mkdir -p "$TMP/state-empty-iccid"
@@ -166,18 +184,23 @@ while [ "$i" -lt 6 ]; do
     run_once eth0 $((9000 + i * 70)) "$TMP/state-empty-iccid" '' 1 '89852 89372' 1
     i=$((i + 1))
 done
-check 'ICCID QCCID/CCID 都读失败时按数据卡继续原阶梯' "$(grep -q 'ICCID 读取失败，按数据卡处理并继续数据自愈' "$CALLS" && grep -q '^ifup 5Ga$' "$CALLS" && grep -q 'AT+QNETDEVCTL=1,1,1' "$CALLS" && grep -q 'AT+CFUN=0' "$CALLS" && echo 1 || echo 0)"
+check 'ICCID QCCID/CCID 都读失败时按数据卡继续原阶梯' "$(grep -q 'ICCID 读取失败，按数据卡处理并继续数据自愈' "$CALLS" && grep -q '^ifup 5Ga$' "$CALLS" && grep -q 'AT+QNETDEVCTL=1,1,1' "$CALLS" && grep -q 'AT+CFUN=1,1' "$CALLS" && echo 1 || echo 0)"
 
 : > "$CALLS"
 mkdir -p "$TMP/state-alert-throttle"
-i=0
-while [ "$i" -lt 6 ]; do
-    run_once eth0 $((10000 + i * 70)) "$TMP/state-alert-throttle" 12345
-    i=$((i + 1))
-done
-run_once eth0 10420 "$TMP/state-alert-throttle" 12345
+ALERT_DIR="$TMP/state-alert-throttle"
+# 新实现的语义：Stage 3 先按 60s→300s→900s 退避做最多 3 次射频复位；额度用尽后不再动射频，
+# 只在"距上次告警 ≥1800 秒"时提醒一次（旧实现闸门一旦满足就永久满足、节流只有 60 秒，
+# 复位每 60 秒打断一次附着，模组永远走不完注册流程）。
+# 所以这里把状态直接预置成"已复位 3 次（额度用尽）+ 已连续失败 6 次"，验证告警节流本身。
+printf '3\n' > "$ALERT_DIR/tohsakawrt-5g-data.reset-count"
+printf '6\n' > "$ALERT_DIR/tohsakawrt-5g-data.fails"
+printf '9700\n' > "$ALERT_DIR/tohsakawrt-5g-data.firstfail"
+run_once eth0 10000 "$ALERT_DIR" 12345
+check '热备 Stage 3 复位额度用尽后先告警一次' "$( [ "$(grep -Fc 'send_tg ' "$CALLS")" -eq 1 ] && echo 1 || echo 0)"
+run_once eth0 10600 "$ALERT_DIR" 12345
 check '热备 Stage 3 两次触发间隔小于 1800 秒只告警一次' "$( [ "$(grep -Fc 'send_tg ' "$CALLS")" -eq 1 ] && echo 1 || echo 0)"
-run_once eth0 12221 "$TMP/state-alert-throttle" 12345
+run_once eth0 11901 "$ALERT_DIR" 12345
 check '热备 Stage 3 超过 1800 秒后允许第二次告警' "$( [ "$(grep -Fc 'send_tg ' "$CALLS")" -eq 2 ] && echo 1 || echo 0)"
 
 if [ "${MUTATION_CHILD:-0}" != 1 ]; then

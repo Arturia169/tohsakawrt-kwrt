@@ -27,12 +27,24 @@ function M.status()
     print(string.format("外网公网出口 : %s", pub_ip))
     print(string.format("有线宽带 IP  : %s", wan_ip))
     print(string.format("5G 模组 IP   : %s", usb_ip))
-    print(string.format("5G 蜂窝制式  : %s (%s)", m_info.oper, m_info.band))
+    -- modem.info() 现在读不到就返回 nil（不再编造运营商/频段），而 Lua 5.1 的 %s 收到 nil
+    -- 会直接抛 "string expected, got nil"，把整条状态命令打断，所以这里必须显式兜底。
+    print(string.format("5G 蜂窝制式  : %s (%s)", m_info.oper or "未获取", m_info.band or "未获取"))
     print("==========================================")
 end
 
 function M.temp()
     print("CPU Temperature: " .. sys.cpu_temp())
+end
+
+-- 📡 网络可用性台账：直接转发脚本的纯文本报表（--text 模式）
+function M.uptime()
+    local out = core.exec("/usr/bin/tohsakawrt-uptime show --text 2>/dev/null") or ""
+    if out == "" then
+        print("可用性台账读取失败（脚本无输出）")
+        return
+    end
+    io.write(out)
 end
 
 function M.uplink(args)
@@ -63,7 +75,8 @@ function M.modem(args)
         if m.temp then print("Temp: " .. m.temp) end
         if m.rsrp then print("RSRP: " .. m.rsrp) end
         if m.sinr then print("SINR: " .. m.sinr) end
-        if m.qci then print("5QI: " .. m.qci) end
+        -- CQI 是信道质量指示（0–15），不是 5QI 业务等级（1–9）：旧代码把前者当后者打印。
+        if m.cqi then print("CQI: " .. m.cqi) end
         if m.ambr_dl then print("AMBR DL: " .. m.ambr_dl) end
         print("Cellular IP: " .. (m.sim_ip or "未获取"))
     elseif sub == "sms" then
@@ -80,7 +93,9 @@ function M.modem(args)
         if out then io.write(out) end
     elseif sub == "heal" then
         -- 模组自愈只保留一份实现：shell 脚本 /usr/bin/tohsakawrt-modem-heal
-        local out = core.exec("/usr/bin/tohsakawrt-modem-heal 2>&1")
+        -- 显式放宽到 240 秒：heal 全流程合法耗时可观（最多 30 秒轮询 + 10 秒复归等待
+        -- + 45 秒 ifup），用默认 60 秒会把它误杀在半途。
+        local out = core.exec("/usr/bin/tohsakawrt-modem-heal 2>&1", 240)
         if out and out ~= "" then
             io.write(out)
         else
@@ -150,6 +165,8 @@ function M.main(argv)
         M.direct(rest)
     elseif cmd == "temp" then
         M.temp()
+    elseif cmd == "uptime" then
+        M.uptime()
     elseif cmd == "notify" then
         M.notify(rest)
     else
@@ -161,6 +178,7 @@ function M.main(argv)
         print("  direct   [add | del | list]            OpenClash 直连白名单管理")
         print("  modem    [status | heal | at <cmd>]    5G 蜂窝模组状态与自愈")
         print("  temp     [status]                      CPU 温度查询")
+        print("  uptime                                 网络可用性台账（可用率与断网记录）")
         print("  notify   <text>                        向 Telegram 发送通知")
         print("  status                                 查看系统综合看板")
         print("  watch    [all | temp | service | heal] 执行周期巡检看门狗")

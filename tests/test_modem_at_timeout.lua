@@ -4,6 +4,9 @@ local captured_command
 package.preload["tohsakawrt.core"] = function()
     return {
         get_uci = function(_, _, _, default) return default end,
+        -- 新代码把 shell 转义收进了 core.shell_quote（原先是各模块自己拼单引号）
+        shell_quote = function(value) return "'" .. tostring(value):gsub("'", "'\\''") .. "'" end,
+        bounded = function(cmd) return cmd end,
         exec = function(command) captured_command = command; return "OK" end
     }
 end

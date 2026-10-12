@@ -33,15 +33,24 @@ acquire_lock() {
             ''|*[!0-9]*) STALE=1 ;;
             *)
                 if kill -0 "$LOCK_PID" 2>/dev/null; then
-                    logger -t TohsakaWrt-Watch "Previous run still active, skip"
-                    return 1
+                    # 关键：原先这里无条件跳过，下面的"锁年龄"检测只在进程已死时才走到。
+                    # 于是一个活着但永久阻塞的运行会永久占住锁（连同顶层 watch 锁），
+                    # 整套巡检静默死亡且无法自恢复。年龄硬上限同样适用于存活 PID。
+                    if twr_lock_is_hung "$LOCK_DIR"; then
+                        logger -t TohsakaWrt-Watch "Lock held by LIVE pid ${LOCK_PID} for $(twr_lock_age "$LOCK_DIR")s (>${TWR_LOCK_MAX_AGE}s) — 判定为卡死，强制回收"
+                        STALE=1
+                    else
+                        logger -t TohsakaWrt-Watch "Previous run still active, skip"
+                        return 1
+                    fi
+                else
+                    LOCK_AGE=0
+                    LOCK_MTIME="$(stat -c %Y "$LOCK_DIR" 2>/dev/null)"
+                    NOW_EPOCH="$(date +%s 2>/dev/null)"
+                    case "$LOCK_MTIME:$NOW_EPOCH" in *[!0-9:]*) LOCK_AGE=601 ;; *) LOCK_AGE=$((NOW_EPOCH - LOCK_MTIME)) ;; esac
+                    [ "$LOCK_AGE" -gt 600 ] && STALE=1
+                    [ "$STALE" -eq 0 ] && { logger -t TohsakaWrt-Watch "Dead lock pid is recent; skip recovery"; return 1; }
                 fi
-                LOCK_AGE=0
-                LOCK_MTIME="$(stat -c %Y "$LOCK_DIR" 2>/dev/null)"
-                NOW_EPOCH="$(date +%s 2>/dev/null)"
-                case "$LOCK_MTIME:$NOW_EPOCH" in *[!0-9:]*) LOCK_AGE=601 ;; *) LOCK_AGE=$((NOW_EPOCH - LOCK_MTIME)) ;; esac
-                [ "$LOCK_AGE" -gt 600 ] && STALE=1
-                [ "$STALE" -eq 0 ] && { logger -t TohsakaWrt-Watch "Dead lock pid is recent; skip recovery"; return 1; }
                 ;;
         esac
         logger -t TohsakaWrt-Watch "Removing stale lock (pid=${LOCK_PID:-missing})"
@@ -122,6 +131,66 @@ else
     WAN_UP=0
 fi
 
+# ==========================================================
+# 网络可用性台账（写内部闪存，正常时【零磁盘写入】）
+# ==========================================================
+# 为什么这样设计：
+#   * 只在"通→断"或"断→通"时追加一行，所以网络正常时一次磁盘写入都没有 ——
+#     既不给路由器增加负载，也不磨损闪存（对比：每分钟记一行 = 每天 1440 次写入）。
+#   * 可用率可以从这些"变化点"精确算出，不需要每分钟的采样（见 tohsakawrt-uptime）。
+#   * 日志量级：一年断网几十次也只有几 KB。
+# 已知局限（如实记录，不粉饰）：
+#   路由器重启期间的离线时长无法计入 —— 断电时它没法写日志。重启会表现为
+#   一条 boot 标记 + 首次探测到的一条 down，因此那段时间只从首次探测起算。
+UPTIME_LOG="${TWR_UPTIME_LOG:-/etc/tohsakawrt/uptime.log}"
+UPTIME_STATE="${TWR_UPTIME_STATE:-/tmp/tohsakawrt/uptime.last}"
+UPTIME_BOOTMARK="${TWR_UPTIME_BOOTMARK:-/tmp/tohsakawrt/uptime.bootmark}"
+
+availability_record() {
+    local now="$1" up="$2" cur prev n
+
+    cur="up"
+    [ "$up" = "1" ] || cur="down"
+
+    # 目录必须在【任何】写入之前建好：boot 那行也在下面写，
+    # 早先的写法把它放在后面，日志目录不存在时 boot 行会静默丢失。
+    mkdir -p "$(dirname "$UPTIME_LOG")" 2>/dev/null
+
+    # 本次开机只写一次 boot 标记（放在 /tmp，重启即清）。
+    # 时间戳取"开机时刻"而非"现在"，这样它在日志里仍按时间顺序排列
+    # （断电前的最后一条 < 开机时刻），读数时能看出这段是重启而非网络故障。
+    if [ ! -e "$UPTIME_BOOTMARK" ]; then
+        mkdir -p "$(dirname "$UPTIME_BOOTMARK")" 2>/dev/null
+        printf '%s boot\n' "$(( now - UPTIME_SEC ))" >> "$UPTIME_LOG" 2>/dev/null || true
+        : > "$UPTIME_BOOTMARK" 2>/dev/null || true
+    fi
+
+    # 上次状态：优先取内存标记；重启后 /tmp 被清，则回落到日志末行，
+    # 避免重启后把"本来就是通的"误记成一次恢复。
+    prev="$(cat "$UPTIME_STATE" 2>/dev/null)"
+    if [ -z "$prev" ]; then
+        prev="$(tail -n 1 "$UPTIME_LOG" 2>/dev/null | awk '{print $2}')"
+    fi
+
+    [ "$prev" = "$cur" ] && return 0
+
+    if printf '%s %s\n' "$now" "$cur" >> "$UPTIME_LOG" 2>/dev/null; then
+        printf '%s\n' "$cur" > "$UPTIME_STATE" 2>/dev/null
+        logger -t TohsakaWrt-Uptime "网络状态变化: ${prev:-未知} -> ${cur}"
+    else
+        return 0
+    fi
+
+    # 轮转只在真正写入时才检查（正常时不会走到这里），保留最近 2000 行
+    n="$(wc -l < "$UPTIME_LOG" 2>/dev/null)"
+    if [ "${n:-0}" -gt 2100 ]; then
+        tail -n 2000 "$UPTIME_LOG" > "$UPTIME_LOG.tmp" 2>/dev/null && mv "$UPTIME_LOG.tmp" "$UPTIME_LOG" 2>/dev/null
+    fi
+    return 0
+}
+
+availability_record "$(date +%s)" "$WAN_UP"
+
 
 # ==========================================================
 # 频段锁定观察期校验：到期仍探测不通就自动恢复原设置
@@ -132,6 +201,43 @@ fi
 # 5G 信号趋势：每分钟记一条样本（落在 /tmp，不写 flash）
 # ==========================================================
 [ -x /usr/bin/tohsakawrt-signal-log ] && /usr/bin/tohsakawrt-signal-log record >/dev/null 2>&1 || true
+
+# ==========================================================
+# 信号长趋势：把上一个【完整小时】聚合成一行写入 flash（每小时一次）
+# ==========================================================
+# 幂等：已聚合过的小时就立刻返回，所以常态下每分钟只是一次比较、零磁盘写入。
+# 这样长趋势能看到多天规律，又不像"每分钟写一行"那样一天写 1440 次。
+[ -x /usr/bin/tohsakawrt-signal-log ] && /usr/bin/tohsakawrt-signal-log rollup >/dev/null 2>&1 || true
+
+# ==========================================================
+# 网络黑匣子：把系统日志里的相关行翻译成统一事件（每分钟一次）
+# ==========================================================
+# collect-all = 首次运行先回溯导入已有台账，之后只做增量。
+# 有"上次处理到的时间戳"做范围限定 + 逐行精确去重，所以重复调用不会产生重复事件；
+# 正常一分钟最多翻译出几条，没有相关日志时几乎零开销。
+[ -x /usr/bin/tohsakawrt-event-collect ] && /usr/bin/tohsakawrt-event-collect collect-all >/dev/null 2>&1 || true
+
+# ==========================================================
+# 网络黑匣子：从"文件型"日志源采集（代理核心的日志不经过 syslog）
+# ==========================================================
+# 代理核心（OpenClash/Mihomo）把日志写在 /tmp/openclash.log 与
+# /tmp/openclash_start.log，不经过 syslog，所以要单独读文件。
+# 它有独立的读取位置记录，与上面那条互不干扰。
+[ -x /usr/bin/tohsakawrt-event-files ] && /usr/bin/tohsakawrt-event-files collect >/dev/null 2>&1 || true
+
+# ==========================================================
+# 网络黑匣子：异常检测与主动告警
+# ==========================================================
+# ⚠️ 必须放在采集器【之后】：它读的是事件台账，先采后检才不会慢一分钟。
+#
+# 它的防误报设计（这几点决定了它会不会变成刷屏源）：
+#   * 每日静默窗 04:30–07:30（用户交代过每天约 5 点 5G 基站关闭、约 7 点恢复）
+#     —— 窗内【抬高阈值】而不是关闭检测：作息不会被报，窗内真出大事仍会报
+#   * 剔除两类"每分钟一条"的常态噪声（出口的"临时回退生效中"、模组的"ICCID 读取失败"）
+#   * 用户手动切出口（紧跟 bot 事件 120 秒内）不计入抖动统计
+#   * 开机 10 分钟宽限；每类独立冷却 + 每日上限
+# 常态零写入零通知；告警走 send_tg_bg / push_bark_bg（后台，不阻塞巡检）。
+[ -x /usr/bin/tohsakawrt-event-watch ] && /usr/bin/tohsakawrt-event-watch run >/dev/null 2>&1 || true
 
 # ==========================================================
 # 出口自愈：期望出口与实际不一致时自动纠正（uci uplink_enforce=0 关闭）
@@ -163,12 +269,12 @@ if [ "$WAN_UP" -eq 1 ]; then
 
         BODY="✅ <b>网络已恢复</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n🟢 <b>状态</b>：网络可用\n⏱️ <b>离线时长</b>：<code>$(html_escape "$DURATION_TEXT")</code>\n━━━━━━━━━━━━━━━━━━\n<i>外网连接已恢复正常。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
-        push_bark \
+        push_bark_bg \
             "✅ 网络已恢复" \
             "$BODY" \
             "active" \
             "glass"
-        send_tg "$BODY" HTML
+        send_tg_bg "$BODY" HTML
         echo "up" > "$WAN_STATE_FILE"
         rm -f "$WAN_DOWN_SINCE"
 
@@ -194,13 +300,13 @@ else
 
         BODY="🔴 <b>网络异常</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n🔴 <b>状态</b>：外网不可达\n📊 <b>检测</b>：连续 3 次失败\n━━━━━━━━━━━━━━━━━━\n<i>已记录离线开始时间。恢复后会自动推送离线时长。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
-        push_bark \
+        push_bark_bg \
             "🔴 网络异常" \
             "$BODY" \
             "timeSensitive" \
             "alarm" || true
 
-        send_tg "$BODY" HTML
+        send_tg_bg "$BODY" HTML
     fi
 fi
 
@@ -222,8 +328,8 @@ if [ -n "$CUR_IP" ] && [ "$WAN_UP" -eq 1 ]; then
     OLD_IP="$(cat "$WAN_IP_FILE" 2>/dev/null)"
     if [ -n "$OLD_IP" ] && [ "$OLD_IP" != "$CUR_IP" ]; then
         IP_BODY="🌐 <b>WAN IP 变动</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n🔻 <b>原 IPv4</b>：<code>$(html_escape "$OLD_IP")</code>\n🔺 <b>新 IPv4</b>：<code>$(html_escape "$CUR_IP")</code>\n━━━━━━━━━━━━━━━━━━\n\n🕰️ <i>$(html_escape "$NOW")</i>"
-        push_bark "🌐 WAN IP 变动提醒" "$IP_BODY" "active" "bell"
-        send_tg "$IP_BODY" HTML
+        push_bark_bg "🌐 WAN IP 变动提醒" "$IP_BODY" "active" "bell"
+        send_tg_bg "$IP_BODY" HTML
         logger -t TohsakaWrt-Watch "WAN IP changed: ${OLD_IP} -> ${CUR_IP}"
     fi
     echo "$CUR_IP" > "$WAN_IP_FILE"
@@ -233,8 +339,8 @@ if [ -n "$CUR_IP6" ] && [ "$WAN_UP" -eq 1 ]; then
     OLD_IP6="$(cat "$WAN_IP6_FILE" 2>/dev/null)"
     if [ -n "$OLD_IP6" ] && [ "$OLD_IP6" != "$CUR_IP6" ]; then
         IP6_BODY="🌐 <b>IPv6 变动</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n🔻 <b>原 IPv6</b>：<code>$(html_escape "$OLD_IP6")</code>\n🔺 <b>新 IPv6</b>：<code>$(html_escape "$CUR_IP6")</code>\n━━━━━━━━━━━━━━━━━━\n\n🕰️ <i>$(html_escape "$NOW")</i>"
-        push_bark "🌐 IPv6 变动提醒" "$IP6_BODY" "active" "bell"
-        send_tg "$IP6_BODY" HTML
+        push_bark_bg "🌐 IPv6 变动提醒" "$IP6_BODY" "active" "bell"
+        send_tg_bg "$IP6_BODY" HTML
         logger -t TohsakaWrt-Watch "WAN IPv6 changed"
     fi
     echo "$CUR_IP6" > "$WAN_IP6_FILE"
@@ -267,12 +373,12 @@ elif [ "$NIKKI_RUNNING" -eq 1 ]; then
 
         BODY="✅ <b>OpenClash 已恢复</b>\n━━━━━━━━━━━━━━━━━━\n🟢 <b>核心</b>：Clash API 正常\n🌐 <b>外网</b>：$([ "$WAN_UP" -eq 1 ] && echo 正常 || echo 异常)\n⏱️ <b>故障时长</b>：<code>$(html_escape "$DURATION_TEXT")</code>\n━━━━━━━━━━━━━━━━━━\n<i>OpenClash 核心已重新响应。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
-        push_bark \
+        push_bark_bg \
             "✅ OpenClash 已恢复" \
             "$BODY" \
             "active" \
             "glass"
-        send_tg "$BODY" HTML
+        send_tg_bg "$BODY" HTML
         echo "running" > "$NIKKI_STATE_FILE"
         rm -f "$NIKKI_DOWN_SINCE" "$NIKKI_ALERTED"
 
@@ -299,12 +405,12 @@ else
 
         BODY="🔴 <b>OpenClash 运行异常</b>\n━━━━━━━━━━━━━━━━━━\n📦 <b>插件</b>：已启用\n🔴 <b>核心</b>：Clash 未响应\n🌐 <b>外网</b>：正常\n━━━━━━━━━━━━━━━━━━\n<i>请检查 OpenClash 核心状态或最近的节点配置。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
-        push_bark \
+        push_bark_bg \
             "🧩 OpenClash 运行异常" \
             "$BODY" \
             "timeSensitive" \
             "alarm"
-        send_tg "$BODY" HTML
+        send_tg_bg "$BODY" HTML
         touch "$NIKKI_ALERTED"
     fi
 fi
@@ -324,7 +430,19 @@ MODEM_AT="/usr/share/modem/modem_at.sh"
 MOBILE_HISTORY_FILE="/root/tohsakawrt-logs/5g-history.log"
 mkdir -p /root/tohsakawrt-logs
 
-[ -e "$AT_PORT" ] || rm -f "$MOBILE_STATE_FILE"
+# 注意：这里【故意不】在 AT 口缺失时删除 state 文件。
+#
+# 早先的写法是 `[ -e "$AT_PORT" ] || rm -f "$MOBILE_STATE_FILE"`，意图是"读不到模组时
+# 清掉状态，避免拿陈旧值误报"。但它有个更严重的副作用：本机 AT 口在模组重枚举时
+# （CFUN 复位、USB 重新绑定、端口漂移 —— 三种情况日志里都实际出现过）会【整体短暂消失】，
+# 此刻状态被清空，于是下一次成功读到的制式会被当成"首次检测"，走 INITIAL 分支
+# 只记一条台账而**不发通知** —— 一次真实的 5G→4G 降级就被静默吞掉了。
+# 实测台账 21 条里有 12 条是 INITIAL，正是这个副作用的痕迹。
+#
+# 而"重启后不重复通知"本来就已经由 STATE_DIR 落在 tmpfs（/tmp）保证：重启即清空，
+# 所以删掉这一行不会改变重启后的行为，只是不再误吞真实切换。
+# （对比两种失败：漏报是静默的、用户无从察觉；万一多报一条也只是可见的噪声，故取前者。）
+
 if [ -e "$AT_PORT" ] && [ -x "$MODEM_AT" ]; then
 
     if command -v timeout >/dev/null 2>&1; then
@@ -394,13 +512,13 @@ if [ -e "$AT_PORT" ] && [ -x "$MODEM_AT" ]; then
 
             MOBILE_BODY="⚠️ <b>5G 已降级</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>运营商</b>：$(html_escape "$MOBILE_OPERATOR")\n📶 <b>当前制式</b>：<code>$(html_escape "$MOBILE_MODE")</code>\n📻 <b>频段</b>：<code>$(html_escape "$MOBILE_BAND")</code>\n🔻 <b>变化</b>：5G → 4G\n━━━━━━━━━━━━━━━━━━\n<i>可能是附近 5G 小区暂时不可用。恢复 5G 后会自动通知。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
-            push_bark \
+            push_bark_bg \
                 "⚠️ 5G 已降级" \
                 "$MOBILE_BODY" \
                 "timeSensitive" \
                 "bell"
 
-            send_tg "$MOBILE_BODY" HTML
+            send_tg_bg "$MOBILE_BODY" HTML
 
             echo "4g" > "$MOBILE_STATE_FILE"
 
@@ -413,13 +531,13 @@ if [ -e "$AT_PORT" ] && [ -x "$MODEM_AT" ]; then
 
             MOBILE_BODY="✅ <b>5G 已恢复</b>\n━━━━━━━━━━━━━━━━━━\n📡 <b>运营商</b>：$(html_escape "$MOBILE_OPERATOR")\n📶 <b>当前制式</b>：<code>$(html_escape "$MOBILE_MODE")</code>\n📻 <b>频段</b>：<code>$(html_escape "$MOBILE_BAND")</code>\n🔺 <b>变化</b>：4G → 5G\n━━━━━━━━━━━━━━━━━━\n<i>移动网络已重新接入 5G。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
-            push_bark \
+            push_bark_bg \
                 "✅ 5G 已恢复" \
                 "$MOBILE_BODY" \
                 "active" \
                 "glass"
 
-            send_tg "$MOBILE_BODY" HTML
+            send_tg_bg "$MOBILE_BODY" HTML
 
             echo "5g" > "$MOBILE_STATE_FILE"
 
@@ -447,12 +565,12 @@ if [ "$WAN_UP" -eq 1 ] && [ ! -f "$BOOT_SENT" ]; then
 
     BODY="✅ <b>TohsakaWrt 已上线</b>\n━━━━━━━━━━━━━━━━━━\n📟 <b>设备</b>：<code>Cudy TR3000</code>\n⏱️ <b>运行时长</b>：<code>$(html_escape "$UPTIME_TEXT")</code>\n🌡️ <b>温度</b>：<code>$(html_escape "$TEMP")</code>\n🧠 <b>可用内存</b>：<code>$(html_escape "$MEM")</code>\n📡 <b>上网接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n🧩 <b>OpenClash</b>：$(html_escape "$NIKKI_TEXT")\n━━━━━━━━━━━━━━━━━━\n<i>启动自检完成。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
-    push_bark \
+    push_bark_bg \
         "✅ TohsakaWrt 已上线" \
         "$BODY" \
         "active" \
         "glass"
-    send_tg "$BODY" HTML
+    send_tg_bg "$BODY" HTML
     touch "$BOOT_SENT"
 
     logger -t TohsakaWrt-Watch \
@@ -490,8 +608,8 @@ if [ -f "$DHCP_LEASES" ]; then
 
                 DEV_BODY="🔔 <b>新设备接入局域网</b>\n━━━━━━━━━━━━━━━━━━\n📱 <b>设备</b>：$(html_escape "$device_name")\n🏠 <b>分配 IP</b>：<code>$(html_escape "$ip")</code>\n🔑 <b>MAC</b>：<code>$(html_escape "$(echo "$mac" | tr '[:lower:]' '[:upper:]')")</code>\n━━━━━━━━━━━━━━━━━━\n<i>如非本人设备请留意网络安全。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
-                push_bark "🔔 新设备接入" "$DEV_BODY" "timeSensitive" "bell"
-                send_tg "$DEV_BODY" HTML
+                push_bark_bg "🔔 新设备接入" "$DEV_BODY" "timeSensitive" "bell"
+                send_tg_bg "$DEV_BODY" HTML
                 logger -t TohsakaWrt-Watch "New device detected: ${device_name} (${ip} / ${mac})"
             fi
         done < "$DHCP_LEASES"
@@ -552,8 +670,8 @@ if [ -n "$WAN_DEV" ] && [ "$WAN_DEV" != "未知" ]; then
                             SPEED_STR="$(format_traffic_speed "$SPEED_BPS")"
                             ALERT_BODY="🚀 <b>检测到持续高带宽下载</b>\n━━━━━━━━━━━━━━━━━━\n⬇️ <b>过去 1 分钟均速</b>：<code>$(html_escape "$SPEED_STR")</code>\n⏱️ <b>持续时间</b>：已持续 &gt; 1 分钟\n📡 <b>监控接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n━━━━━━━━━━━━━━━━━━\n<i>大流量监测中，结束后自动推送汇总。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
-                            push_bark "🚀 持续高带宽下载" "$ALERT_BODY" "timeSensitive" "minuet"
-                            send_tg "$ALERT_BODY" HTML
+                            push_bark_bg "🚀 持续高带宽下载" "$ALERT_BODY" "timeSensitive" "minuet"
+                            send_tg_bg "$ALERT_BODY" HTML
                             logger -t TohsakaWrt-Watch "High traffic alert triggered: ${SPEED_STR} on ${WAN_DEV}"
                         else
                             [ "$SPEED_BPS" -gt "$PEAK_SPEED" ] && PEAK_SPEED="$SPEED_BPS"
@@ -573,8 +691,8 @@ if [ -n "$WAN_DEV" ] && [ "$WAN_DEV" != "未知" ]; then
 
                                 REPORT_BODY="🏁 <b>高带宽下载已结束</b>\n━━━━━━━━━━━━━━━━━━\n⏱️ <b>总持续时长</b>：<code>$(html_escape "$TOTAL_DUR")</code>\n⚡ <b>最高峰值</b>：<code>$(html_escape "$PEAK_STR")</code>\n📊 <b>全程均速</b>：<code>$(html_escape "$AVG_STR")</code>\n💾 <b>总计消耗</b>：<code>$(html_escape "$TOTAL_SIZE")</code>\n📡 <b>监控接口</b>：<code>$(html_escape "$WAN_DEV")</code>\n━━━━━━━━━━━━━━━━━━\n<i>带宽已恢复至日常水平。</i>\n\n🕰️ <i>$(html_escape "$NOW")</i>"
 
-                                push_bark "🏁 高带宽下载已结束" "$REPORT_BODY" "active" "glass"
-                                send_tg "$REPORT_BODY" HTML
+                                push_bark_bg "🏁 高带宽下载已结束" "$REPORT_BODY" "active" "glass"
+                                send_tg_bg "$REPORT_BODY" HTML
                                 logger -t TohsakaWrt-Watch "High traffic finished: ${TOTAL_SIZE} in ${TOTAL_DUR}"
                             fi
 

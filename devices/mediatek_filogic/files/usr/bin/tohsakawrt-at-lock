@@ -1,0 +1,43 @@
+#!/bin/sh
+# TohsakaWrt: 全局 AT 口互斥锁包装器
+#
+# 为什么需要它：
+#   AT 口原先有三个互不互斥的写者，modem_at.sh 的注释自称"全局 AT 互斥"，
+#   实际只覆盖三分之一 —— 另两条绕过锁直连串口：
+#     ① modem_at.sh  → 已自带同一把锁 /var/lock/modem-at.lock
+#     ② sms_tool     → 无锁直连串口（modem.lua 的 sms_list / sms_poll_new）
+#     ③ lpac         → 无锁直连 eUICC 的 AT/APDU 通道（esim.lua）
+#   并发写入同一 AT 通道会导致命令与应答错位、读写挂起。
+#   本包装器把②③纳入①的同一把锁，收敛为一条串行通道。
+#
+# 用法：tohsakawrt-at-lock <命令> [参数...]
+# 退出码：抢锁超时输出 AT_BUSY 并返回 1；否则透传被包装命令的退出码。
+#
+# ⚠️ 不要用它包装 modem_at.sh 自身：同一把锁不可重入，会自锁死。
+
+LOCK_FILE="${TWR_AT_LOCK:-/var/lock/modem-at.lock}"
+WAIT_MAX="${TWR_AT_LOCK_WAIT:-8}"
+
+# 缺少 flock 时不静默降级为无锁：先留痕再直通，避免"以为有保护其实没有"
+if ! command -v flock >/dev/null 2>&1; then
+    logger -t TohsakaWrt-AtLock "警告: flock 缺失，AT 命令将无锁执行: $*"
+    exec "$@"
+fi
+
+if ! exec 9>"$LOCK_FILE" 2>/dev/null; then
+    logger -t TohsakaWrt-AtLock "警告: 无法打开锁文件 ${LOCK_FILE}，无锁执行: $*"
+    exec "$@"
+fi
+
+_w=0
+while ! flock -n 9 2>/dev/null; do
+    _w=$((_w + 1))
+    if [ "$_w" -ge "$WAIT_MAX" ]; then
+        echo "AT_BUSY"
+        logger -t TohsakaWrt-AtLock "等待 AT 锁超时（${WAIT_MAX}s），放弃: $*"
+        exit 1
+    fi
+    sleep 1
+done
+
+exec "$@"

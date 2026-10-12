@@ -15,6 +15,27 @@ WAIT_STEPS=30
 WAIT_INTERVAL=1
 RESTART_MIN_INTERVAL=120
 
+# AT 口健康计数：由 heal_cellular_data 按"本轮 AT+QCCID 是否读取成功"维护。
+# 连续失败达到阈值即判定当前 AT 口失效，触发换口。
+# 关键：这里复用的是脚本本来就每分钟执行的 ICCID 读取结果，
+# 因此正常运行时**不产生任何额外 AT 流量**（实测一次 ATI 约 48ms/43ms CPU，
+# 而 modem_debug.sh 每次要 source 147KB 厂商脚本，能省则省）。
+AT_HEALTH_FILE="$STATE_DIR/tohsakawrt-5g-data.at-fail"
+AT_HEALTH_THRESHOLD="${TWR_AT_HEALTH_THRESHOLD:-3}"
+
+# 判断某个串口是否真的能应答 AT。
+# ttyUSB0 是诊断口、ttyUSB1 是 GPS，都不应答 AT —— 必须实测，不能靠编号猜。
+# 定义在此处是为了让文件开头的"节点消失自救"也能调用它。
+at_port_probe_ok() {
+    local port="$1" reply
+    [ -c "$port" ] || return 1
+    reply="$(AT_TIMEOUT=3 sh "$AT_SCRIPT" "$port" 'ATI' 2>/dev/null)"
+    case "$reply" in
+        *Quectel*|*RM500Q*|*OK*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 VERBOSE=0
 [ "${1:-}" = "--verbose" ] && VERBOSE=1
 
@@ -25,7 +46,55 @@ say() {
     return 0
 }
 
+# 确保"永远有一条能上网的出口"：5G 不通时把默认出口退到有线宽带。
+# 用 KEEP_DESIRED=1，保留用户"期望出口=5g"的选择，5G 恢复后由 resume 自动切回。
+ensure_wan_fallback() {
+    local reason="${1:-5g-down}"
+    [ "$(uci -q get tohsakawrt-tgbot.main.uplink_auto_fallback 2>/dev/null)" = "0" ] && {
+        say "auto fallback disabled by uci"
+        return 1
+    }
+    [ -x /usr/bin/tohsakawrt-uplink ] || return 1
+
+    case "$(/usr/bin/tohsakawrt-uplink status 2>/dev/null)" in
+        ACTIVE:wan*) return 0 ;;
+    esac
+
+    if [ "$(/usr/bin/tohsakawrt-uplink check wan 2>/dev/null)" != "READY" ]; then
+        logger -t tohsakawrt-modem-heal "回落宽带失败：宽带前提不就绪（reason=${reason}）"
+        return 1
+    fi
+
+    TOHSAKA_UPLINK_KEEP_DESIRED=1 /usr/bin/tohsakawrt-uplink set wan >/dev/null 2>&1
+    case "$(/usr/bin/tohsakawrt-uplink status 2>/dev/null)" in
+        ACTIVE:wan*)
+            logger -t tohsakawrt-modem-heal "已回落到有线宽带（reason=${reason}）"
+            return 0
+            ;;
+    esac
+    logger -t tohsakawrt-modem-heal "回落宽带失败：切换未生效（reason=${reason}）"
+    return 1
+}
+
 say "check AT port: $AT_PORT"
+
+# 持久化的 at_port 指向不存在的设备节点时，实测找出可用口并写回 uci。
+# 为什么必须单独做：文件开头第 3-5 行只会在**内存里**把 AT_PORT 挪到 ttyUSB3/ttyUSB2，
+# 并不会修正 uci —— 于是机器人（modem.lua 的 get_port）、巡检脚本等其它读取者
+# 依旧会拿到那个已经消失的设备路径。此块仅在 uci 值失效时执行，正常运行零开销。
+UCI_AT_PORT="$(uci -q get modem.modem0.at_port 2>/dev/null)"
+if [ -n "$UCI_AT_PORT" ] && [ ! -c "$UCI_AT_PORT" ]; then
+    for cand in /dev/ttyUSB3 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0; do
+        [ -c "$cand" ] || continue
+        if at_port_probe_ok "$cand"; then
+            logger -t tohsakawrt-modem-heal "持久化的 AT 口 ${UCI_AT_PORT} 节点不存在，实测改用 ${cand}"
+            uci set modem.modem0.at_port="$cand" 2>/dev/null && uci commit modem 2>/dev/null
+            AT_PORT="$cand"
+            break
+        fi
+    done
+fi
+
 [ -c "$AT_PORT" ] || { [ "${TWR_HEAL_AT_PORT_FAKE:-0}" = "1" ] && [ -f "$AT_PORT" ]; } || exit 0
 
 MODEM_NET="$(uci -q get modem.modem0.network 2>/dev/null)"
@@ -46,10 +115,20 @@ if [ "$VERBOSE" -eq 0 ]; then
             ''|*[!0-9]*) LOCK_STALE=1 ;;
             *)
                 if kill -0 "$LOCK_PID" 2>/dev/null; then
-                    logger -t tohsakawrt-modem-heal "Previous run still active, skip"
-                    exit 0
+                    # 关键：仅凭 kill -0 无法识别"活着但已经卡死"的进程。
+                    # 原先这里无条件跳过，于是一个永久阻塞的运行会永久占住锁，
+                    # 而且顶层 watch 锁也被它held，整套巡检静默死亡、只能重启路由器。
+                    # 叠加年龄硬上限作为兜底（配合有界执行，正常单次运行远不会达到）。
+                    if twr_lock_is_hung "$LOCK_DIR"; then
+                        logger -t tohsakawrt-modem-heal "Lock held by LIVE pid ${LOCK_PID} for $(twr_lock_age "$LOCK_DIR")s (>${TWR_LOCK_MAX_AGE}s) — 判定为卡死，强制回收"
+                        LOCK_STALE=1
+                    else
+                        logger -t tohsakawrt-modem-heal "Previous run still active, skip"
+                        exit 0
+                    fi
+                else
+                    LOCK_STALE=1
                 fi
-                LOCK_STALE=1
                 ;;
         esac
         if [ "$LOCK_STALE" -eq 1 ]; then
@@ -85,13 +164,100 @@ if [ "$VERBOSE" -eq 0 ]; then
 fi
 
 get_index() {
-    mmcli -L 2>/dev/null | awk '
+    # 必须有界：mmcli 通过 D-Bus 通信，ModemManager 繁忙或卡顿时会长时间不返回。
+    # 原先这里是裸调用，而它在下面的 30 次轮询循环里被反复调用 ——
+    # 一旦每次阻塞，单次 heal 就能拖到十几分钟，把顶层看门狗锁长期占住。
+    twr_timeout 10 mmcli -L 2>/dev/null | awk '
         match($0, /\/Modem\/[0-9]+/) {
             print substr($0, RSTART + 7, RLENGTH - 7)
             exit
         }
     '
 }
+
+# AT 端口漂移纠正。
+# 根因（固件行为，已定位到代码）：USB 重新枚举时 hotplug 走 modem_util.sh 的 remove 分支，
+# 因 modem.@global[0].manual_configuration=0 而调用 m_del_modem_config 删除整个 modem0 段；
+# 随后 bind 分支重建该段，m_set_usb_at_port 发现 at_port 为空，就逐个串口探 ATI，
+# 选中第一个能应答的 —— 也就是 ModemManager 自己占用的那个 AT 口（ttyUSB2）。
+# 结果我们的 AT 通道与 ModemManager 抢同一条串口，命令与应答会错位。
+# 这里每分钟对账一次，把 at_port 钉回"ModemManager 标记为未占用"的串口。
+reconcile_at_port() {
+    local current pick desired candidates at_fails
+    current="$(uci -q get modem.modem0.at_port 2>/dev/null)"
+    [ -n "$current" ] || return 0
+
+    # 注意：mmcli 输出的 ports 行会折行，形如
+    #   |  ports: ttyUSB0 (ignored), ttyUSB1 (gps), ttyUSB2 (at),
+    #   |         ttyUSB3 (ignored),
+    # 因此必须用 grep -o 跨行抓取全部带标注的端口，只取第一行会漏掉折到下一行的 ttyUSB3，
+    # 误选到 ttyUSB0（诊断口，不应答 AT）。
+    # 按编号从大到小排序，优先用编号大的（RM500Q-GL 上 ttyUSB3 是第二个 AT 口）。
+    candidates="$(printf '%s\n' "$MODEM_INFO" \
+        | grep -o 'ttyUSB[0-9][0-9]* (ignored)' \
+        | sed 's/^ttyUSB//; s/ (ignored)$//' \
+        | sort -rn)"
+
+    # 上一轮 AT 读取的连续失败次数（健康时恒为 0，不产生任何额外探测）
+    at_fails="$(cat "$AT_HEALTH_FILE" 2>/dev/null)"
+    case "$at_fails" in ''|*[!0-9]*) at_fails=0 ;; esac
+
+    # ---- 场景 A：当前口本身失效（不只是漂移）→ 逐个候选口实测，用第一个能应答的 ----
+    if [ "$at_fails" -ge "$AT_HEALTH_THRESHOLD" ]; then
+        for pick in $candidates; do
+            desired="/dev/ttyUSB${pick}"
+            [ "$desired" = "$current" ] && continue
+            if at_port_probe_ok "$desired"; then
+                logger -t tohsakawrt-modem-heal "AT 口 ${current} 连续 ${at_fails} 次读取失败，实测改用 ${desired}"
+                uci set modem.modem0.at_port="${desired}" 2>/dev/null && uci commit modem 2>/dev/null
+                printf '0\n' > "$AT_HEALTH_FILE" 2>/dev/null
+                return 0
+            fi
+        done
+        logger -t tohsakawrt-modem-heal "AT 口 ${current} 连续 ${at_fails} 次读取失败，候选口中亦无可用口"
+        printf '0\n' > "$AT_HEALTH_FILE" 2>/dev/null
+        return 0
+    fi
+
+    # ---- 场景 B：端口漂移（固件把 at_port 改成了 ModemManager 占用的口）----
+    pick="$(printf '%s\n' "$candidates" | head -n 1)"
+    [ -n "$pick" ] || return 0
+    desired="/dev/ttyUSB${pick}"
+    [ "$current" = "$desired" ] && return 0
+
+    # 候选口必须真的能应答 AT，避免把 at_port 指向诊断口而废掉全部 AT 功能
+    if at_port_probe_ok "$desired"; then
+        logger -t tohsakawrt-modem-heal "AT 端口漂移: ${current} -> ${desired}（避开 ModemManager 占用的口），已纠正"
+        uci set modem.modem0.at_port="${desired}" 2>/dev/null && uci commit modem 2>/dev/null
+    else
+        logger -t tohsakawrt-modem-heal "AT 端口候选 ${desired} 无 AT 应答，保持 ${current} 不变"
+    fi
+    return 0
+}
+
+# 回收被 init 收养的孤立 mmcli 监控进程。
+# 根因在 /usr/sbin/ModemManager-monitor：`mmcli -M | { ... } &` 中 $! 取的是
+# 管道末段子 shell 的 PID，kill $CHILD 只杀掉子 shell，mmcli -M 从未被杀；
+# 而它的 stdout 是管道，只有写数据时才会收到 SIGPIPE，模组平静时永远不写，
+# 于是每次 ModemManager 重启都永久泄漏一个（实测每个约 7.8MB）。
+reap_orphan_monitors() {
+    local pid ppid reaped=0
+    command -v pidof >/dev/null 2>&1 || return 0
+    # 用 pidof 直接定位 mmcli，而不是遍历整个 /proc。
+    # 实测：遍历 119 个进程需 262ms/次（每个进程 fork 一次 tr），
+    # 而 pidof 方案仅 13.6ms/次 —— 19 倍差距，每分钟省下约 250ms。
+    for pid in $(pidof mmcli 2>/dev/null); do
+        tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -q -- '-M' || continue
+        ppid="$(awk '{print $4}' "/proc/${pid}/stat" 2>/dev/null)"
+        # 只回收孤儿（父进程已死、被 init 收养）。在用的监控进程父进程是 ModemManager-monitor。
+        [ "$ppid" = "1" ] || continue
+        kill -9 "$pid" 2>/dev/null && reaped=$((reaped + 1))
+    done
+    [ "$reaped" -gt 0 ] && logger -t tohsakawrt-modem-heal "回收 ${reaped} 个孤立的 mmcli 监控进程"
+    return 0
+}
+
+reap_orphan_monitors
 
 INDEX="$(get_index)"
 say "mmcli -L index: ${INDEX:-<none>}"
@@ -146,14 +312,16 @@ if [ "$CONFIG_CHANGED" -eq 1 ]; then
     ACTIONS="${ACTIONS:+$ACTIONS; }updated SMS port paths"
 fi
 
-MODEM_INFO="$(mmcli -m "$INDEX" 2>/dev/null)"
+MODEM_INFO="$(twr_timeout 15 mmcli -m "$INDEX" 2>/dev/null)"
+reconcile_at_port
 MODEM_STATE="$(printf '%s\n' "$MODEM_INFO" | sed -n 's/.*state:[[:space:]]*\([[:alpha:]_][[:alpha:]_]*\)[[:space:]]*$/\1/p' | head -n 1)"
 say "mmcli -m $INDEX state: ${MODEM_STATE:-<unknown>}"
 if [ "$MODEM_STATE" = "disabled" ]; then
     if [ "$UPLINK_IS_MODEM" -eq 1 ]; then
         say "skipping enable: $MODEM_NET is the active uplink"
     else
-        mmcli -m "$INDEX" --enable >/dev/null 2>&1
+        # --enable 会触发真实的射频启用流程，ModemManager 要等它完成才回，故放宽到 20 秒
+        twr_timeout 20 mmcli -m "$INDEX" --enable >/dev/null 2>&1
         ACTIONS="${ACTIONS:+$ACTIONS; }enabled modem"
     fi
 fi
@@ -191,9 +359,17 @@ heal_cellular_data() {
         done
         if [ -n "$iccid" ]; then
             printf '%s\n' "$iccid" > "$last_iccid_file" 2>/dev/null
+            # 读取成功 → AT 口健康，连续失败计数清零（正常运行时恒为 0，不触发任何额外探测）
+            printf '0\n' > "$AT_HEALTH_FILE" 2>/dev/null
         else
             iccid="$(cat "$last_iccid_file" 2>/dev/null | tr -cd '0-9A-F')"
             [ -z "$iccid" ] || logger -t tohsakawrt-modem-heal "ICCID 实时读取失败，沿用上次成功值"
+            # 读取失败 → 累加连续失败计数。达到阈值后由 reconcile_at_port 实测换口。
+            # 用连续计数而非单次失败，是为了滤掉 AT 锁争用导致的偶发 AT_BUSY。
+            local atf
+            atf="$(cat "$AT_HEALTH_FILE" 2>/dev/null)"
+            case "$atf" in ''|*[!0-9]*) atf=0 ;; esac
+            printf '%s\n' "$((atf + 1))" > "$AT_HEALTH_FILE" 2>/dev/null
         fi
     fi
 
@@ -244,9 +420,12 @@ EOF_NODATA
     fi
 
     if [ "$ping_ok" -eq 1 ]; then
-        # 探测成功，重置失败计数
+        # 探测成功，重置失败计数与复位额度（额度自愈后必须回满，否则下次故障会被直接判死）
         rm -f "$fail_count_file" 2>/dev/null
         rm -f "$first_fail_file" 2>/dev/null
+        rm -f "$STATE_DIR/tohsakawrt-5g-data.reset-count" 2>/dev/null
+        rm -f "$STATE_DIR/tohsakawrt-5g-data.reset-last" 2>/dev/null
+        rm -f "$STATE_DIR/tohsakawrt-5g-data.network-denied" 2>/dev/null
         # 若此前因 5G 掉线临时回落到宽带，现在 5G 恢复 → 切回期望出口
         # （resume 自己判断有没有回落标记：没有就什么都不做，可以无条件调用）
         if [ -x /usr/bin/tohsakawrt-uplink ]; then
@@ -272,25 +451,10 @@ EOF_NODATA
             local last_alert="$(cat "$active_alert_file" 2>/dev/null)"
             case "$last_alert" in *[!0-9]*) last_alert=0 ;; esac
             if [ -z "$last_alert" ] || [ "$((now - last_alert))" -ge 1800 ]; then
-                # 尝试临时回落到宽带：只在宽带"前提就绪"时动作，
+                # 临时回落到宽带：只在宽带"前提就绪"时动作，
                 # 且用 KEEP_DESIRED 保证不改动用户选择的期望出口
                 local fell_back=0
-                local auto_fb="$(uci -q get tohsakawrt-tgbot.main.uplink_auto_fallback 2>/dev/null)"
-                if [ "$auto_fb" != "0" ] && [ -x /usr/bin/tohsakawrt-uplink ]; then
-                    if [ "$(/usr/bin/tohsakawrt-uplink check wan 2>/dev/null)" = "READY" ]; then
-                        TOHSAKA_UPLINK_KEEP_DESIRED=1 /usr/bin/tohsakawrt-uplink set wan >/dev/null 2>&1
-                        case "$(/usr/bin/tohsakawrt-uplink status 2>/dev/null)" in
-                            ACTIVE:wan*) fell_back=1 ;;
-                        esac
-                        if [ "$fell_back" -eq 1 ]; then
-                            logger -t tohsakawrt-modem-heal "5G down as main uplink; temporarily fell back to WAN"
-                        else
-                            logger -t tohsakawrt-modem-heal "5G down as main uplink; WAN fallback attempted but failed"
-                        fi
-                    else
-                        logger -t tohsakawrt-modem-heal "5G down as main uplink; WAN not ready, staying put"
-                    fi
-                fi
+                ensure_wan_fallback "main-uplink-timeout" && fell_back=1
                 if command -v send_tg >/dev/null 2>&1; then
                     if [ "$fell_back" -eq 1 ]; then
                         send_tg "♻️ <b>5G 掉线，已临时切到有线宽带</b>\n━━━━━━━━━━━━━━━━━━\n📊 <b>探测结果</b>：连续 ${fails} 次数据探测超时\n🔄 <b>已执行动作</b>：临时回落到宽带\n🎯 <b>你的期望出口</b>：仍是原选择，5G 恢复后会自动切回\n━━━━━━━━━━━━━━━━━━\n\n🕰️ <i>$(date '+%Y-%m-%d %H:%M:%S')</i>" "HTML" "$TG_KB_STATUS_UPLINK"
@@ -311,48 +475,111 @@ EOF_NODATA
     local last_heal="$(cat "$last_heal_file" 2>/dev/null)"
     case "$last_heal" in ''|*[!0-9]*) last_heal=0 ;; esac
     local heal_interval=$((now - ${last_heal:-0}))
-    # 自愈动作防抖：至少间隔 60 秒
-    if [ "$heal_interval" -lt 60 ]; then
-        say "heal throttled (last heal was ${heal_interval}s ago)"
+
+    # ---- Stage 1/2：轻量动作（重拨接口、重建 PDP），防抖 60 秒 ----
+    if [ "$fails" -le 2 ]; then
+        if [ "$heal_interval" -lt 60 ]; then
+            say "heal throttled (last heal was ${heal_interval}s ago)"
+            return 0
+        fi
+        echo "$now" > "$last_heal_file"
+        if [ "$fails" -eq 1 ]; then
+            logger -t tohsakawrt-modem-heal "5G data heal (Stage 1): ping timeout, triggering ifup 5Ga"
+            # 必须有界：/sbin/ifup 每次都会先执行 `ubus call network reload`（重载整个网络配置），
+            # 随后再下发 down/up —— 共 3 次 ubus 调用，且它不在任何超时保护内。
+            # 若 netifd 或某个 proto 处理器卡住，ubus 默认 30 秒超时 ×3 会把看门狗锁占满。
+            twr_timeout 45 ifup 5Ga 2>/dev/null
+        else
+            logger -t tohsakawrt-modem-heal "5G data heal (Stage 2): sending AT+QNETDEVCTL=1,1,1"
+            if [ -x "$AT_SCRIPT" ] && [ -e "$AT_PORT" ]; then
+                sh "$AT_SCRIPT" "$AT_PORT" 'AT+QNETDEVCTL=1,1,1' >/dev/null 2>&1
+                sleep 2
+                twr_timeout 45 ifup 5Ga 2>/dev/null
+            fi
+        fi
         return 0
     fi
 
-    echo "$now" > "$last_heal_file"
-
-    if [ "$fails" -eq 1 ]; then
-        logger -t tohsakawrt-modem-heal "5G data heal (Stage 1): ping timeout, triggering ifup 5Ga"
-        ifup 5Ga 2>/dev/null
-    elif [ "$fails" -eq 2 ]; then
-        logger -t tohsakawrt-modem-heal "5G data heal (Stage 2): sending AT+QNETDEVCTL=1,1,1"
-        if [ -x "$AT_SCRIPT" ] && [ -e "$AT_PORT" ]; then
-            sh "$AT_SCRIPT" "$AT_PORT" 'AT+QNETDEVCTL=1,1,1' >/dev/null 2>&1
-            sleep 2
-            ifup 5Ga 2>/dev/null
-        fi
-    elif [ "$fails" -ge 3 ]; then
-        local first_fail="$(cat "$first_fail_file" 2>/dev/null)"
-        case "$first_fail" in ''|*[!0-9]*) first_fail=0 ;; esac
-        local failure_duration=$((now - ${first_fail:-now}))
-        if [ "$fails" -lt 5 ] || [ "$failure_duration" -lt 300 ]; then
-            logger -t tohsakawrt-modem-heal "5G data heal (Stage 3): RF reset deferred (failures=$fails, duration=${failure_duration}s; need 5 failures and 300s)"
-            return 0
-        fi
-        logger -t tohsakawrt-modem-heal "5G data heal (Stage 3): resetting cellular RF via AT+CFUN=0/1"
-        if [ -x "$AT_SCRIPT" ] && [ -e "$AT_PORT" ]; then
-            sh "$AT_SCRIPT" "$AT_PORT" 'AT+CFUN=0' >/dev/null 2>&1
-            sleep 2
-            sh "$AT_SCRIPT" "$AT_PORT" 'AT+CFUN=1' >/dev/null 2>&1
-            sleep 3
-            ifup 5Ga 2>/dev/null
-        fi
-        local last_alert="$(cat "$active_alert_file" 2>/dev/null)"
-        case "$last_alert" in *[!0-9]*) last_alert=0 ;; esac
-        if [ -z "$last_alert" ] || [ "$((now - last_alert))" -ge 1800 ]; then
-            if command -v send_tg >/dev/null 2>&1; then
-                send_tg "🔴 <b>5G 热备链路脱网告警</b>\n━━━━━━━━━━━━━━━━━━\n📊 <b>探测结果</b>：连续 5 次数据探测超时\n🔄 <b>已执行动作</b>：射频重注网自愈\n━━━━━━━━━━━━━━━━━━\n<i>请留意模组连接状态。</i>\n\n🕰️ <i>$(date '+%Y-%m-%d %H:%M:%S')</i>" "HTML"
+    # ---- Stage 3 前置判据：先区分"射频故障"与"网络侧拒绝" ----
+    # 流量卡欠费/停机/套餐到期时，网络会拒绝附着（AT+CEER 报 attach failed / denied）。
+    # 这属于卡侧或网络侧问题，复位射频完全无效；更糟的是复位会打断正在进行的附着，
+    # 把本可自愈的故障永久化。判定为网络侧拒绝时只回落宽带，绝不动射频。
+    local ceer=""
+    if [ -x "$AT_SCRIPT" ] && [ -e "$AT_PORT" ]; then
+        ceer="$(AT_TIMEOUT=3 sh "$AT_SCRIPT" "$AT_PORT" 'AT+CEER' 2>/dev/null | sed -n 's/.*+CEER:[[:space:]]*//p' | tr -d '\r' | head -n 1)"
+    fi
+    case "$ceer" in
+        *ttach*failed*|*enied*|*ENIED*|*not\ allowed*|*Illegal*|*illegal*)
+            # 限频：每 10 分钟最多处理一次，避免每分钟刷日志
+            local nd_file="$STATE_DIR/tohsakawrt-5g-data.network-denied"
+            local nd_last="$(cat "$nd_file" 2>/dev/null)"
+            case "$nd_last" in ''|*[!0-9]*) nd_last=0 ;; esac
+            if [ "$((now - nd_last))" -ge 600 ]; then
+                logger -t tohsakawrt-modem-heal "5G 被网络侧拒绝（${ceer}），判定非射频故障，跳过射频复位并回落宽带"
+                ensure_wan_fallback "network-denied"
+                printf '%s\n' "$now" > "$nd_file" 2>/dev/null
             fi
-            echo "$now" > "$active_alert_file"
-        fi
+            return 0
+            ;;
+    esac
+
+    local first_fail="$(cat "$first_fail_file" 2>/dev/null)"
+    case "$first_fail" in ''|*[!0-9]*) first_fail=0 ;; esac
+    local failure_duration=$((now - ${first_fail:-now}))
+
+    # ---- Stage 3：射频复位必须有额度与退避，绝不无限重试 ----
+    # 原实现缺陷：闸门"失败≥5 且持续≥300s"一旦满足就永久满足，而节流只有 60 秒；
+    # 但完成一次 LTE/NR 重新附着需要 30~180 秒，于是复位每 60 秒打断一次附着，
+    # 模组永远走不完注册流程（实测 fails 累积到 15、CSQ 恒为 99,99、QNWINFO 恒为 No Service）。
+    local reset_count_file="$STATE_DIR/tohsakawrt-5g-data.reset-count"
+    local reset_last_file="$STATE_DIR/tohsakawrt-5g-data.reset-last"
+    local resets="$(cat "$reset_count_file" 2>/dev/null)"
+    case "$resets" in ''|*[!0-9]*) resets=0 ;; esac
+
+    if [ "$failure_duration" -lt 300 ] && [ "$resets" -eq 0 ]; then
+        logger -t tohsakawrt-modem-heal "5G data heal (Stage 3): RF reset deferred (failures=$fails, duration=${failure_duration}s; need 300s)"
+        return 0
+    fi
+
+    local backoff
+    case "$resets" in
+        0) backoff=60 ;;
+        1) backoff=300 ;;
+        2) backoff=900 ;;
+        *)
+            # 额度用尽：停止动射频，只保证不丢网并限频告警（每 30 分钟最多一次）
+            local last_alert="$(cat "$active_alert_file" 2>/dev/null)"
+            case "$last_alert" in *[!0-9]*) last_alert=0 ;; esac
+            if [ -z "$last_alert" ] || [ "$((now - last_alert))" -ge 1800 ]; then
+                logger -t tohsakawrt-modem-heal "5G 射频复位额度已用尽（${resets} 次），停止复位并保持宽带出口"
+                ensure_wan_fallback "reset-exhausted"
+                if command -v send_tg >/dev/null 2>&1; then
+                    send_tg "🔴 <b>5G 链路持续异常，已停止自愈复位</b>\n━━━━━━━━━━━━━━━━━━\n📊 <b>已尝试</b>：射频复位 ${resets} 次均未恢复\n🛡️ <b>当前策略</b>：不再反复复位模组（避免打断附着），已退到有线宽带，网络不会中断\n💡 <b>建议排查</b>：流量卡是否欠费/停机、套餐是否到期、天线是否接好\n\n🕰️ <i>$(date '+%Y-%m-%d %H:%M:%S')</i>" "HTML" "$TG_KB_STATUS_MODEM"
+                fi
+                echo "$now" > "$active_alert_file"
+            fi
+            return 0
+            ;;
+    esac
+
+    local last_reset="$(cat "$reset_last_file" 2>/dev/null)"
+    case "$last_reset" in ''|*[!0-9]*) last_reset=0 ;; esac
+    if [ "$last_reset" -ne 0 ] && [ "$((now - last_reset))" -lt "$backoff" ]; then
+        say "reset throttled (backoff ${backoff}s, last reset $((now - last_reset))s ago)"
+        return 0
+    fi
+
+    resets=$((resets + 1))
+    echo "$resets" > "$reset_count_file"
+    echo "$now" > "$reset_last_file"
+    echo "$now" > "$last_heal_file"
+    logger -t tohsakawrt-modem-heal "5G data heal (Stage 3): resetting cellular RF (attempt ${resets}/3, backoff was ${backoff}s)"
+    if [ -x "$AT_SCRIPT" ] && [ -e "$AT_PORT" ]; then
+        # 用 AT+CFUN=1,1 做整模组复归：比"CFUN=0 后 2 秒再 CFUN=1"可靠得多 ——
+        # 若 CFUN=0 关掉射频后 CFUN=1 未送达，模组会永久停在无射频状态。
+        sh "$AT_SCRIPT" "$AT_PORT" 'AT+CFUN=1,1' >/dev/null 2>&1
+        sleep 10
+        twr_timeout 45 ifup 5Ga 2>/dev/null
     fi
 }
 

@@ -1,14 +1,28 @@
 #!/usr/bin/lua
 -- TohsakaWrt 5G 信号趋势记录
---   record        记一条样本（由巡检每分钟调用一次）
---   show [分钟]   输出可直接发到 Telegram 的 HTML 汇总（默认最近 60 分钟）
+--   record          记一条样本（由巡检每分钟调用一次，落在内存）
+--   rollup          把上一个【完整小时】聚合成一行写入闪存（幂等；也由巡检每分钟调用）
+--   show [分钟]     近 N 分钟的细粒度趋势（默认 60 分钟，读内存样本）
+--   show-long [小时] 长趋势（默认 168 小时 = 7 天，读小时聚合），按"一天中的第几小时"分组
 --
 -- 设计要点：
--- * 落在 /tmp（不写 flash，避免长期磨损），上限 3000 行 ≈ 两天；
+-- * 细粒度样本落在 /tmp（不写 flash），上限 3000 行 ≈ 50 小时；
+-- * 长趋势【每小时只往闪存写一行】聚合值（24 次/天），而不是每分钟写一行（1440 次/天）——
+--   这样既能看到多天规律，又不磨损闪存、不给路由器添负载；
+-- * rollup 是幂等的：用标记文件记住已处理到哪一小时，正常情况下每分钟只做一次比较就返回；
 -- * 采集时**惰性加载**模组模块：拿不到模组信息就什么都不写，绝不写脏数据；
 --   这样 `show` 在没有模组的机器上也能用（便于测试）。
+--
+-- 已知局限（如实说明）：路由器重启会清空内存样本，所以"重启时正在进行的那一小时"
+-- 无法聚合；同理模组不在线的小时不会写行。缺行代表"没数据"，而不是"信号为 0"。
 local FILE = os.getenv("TOHSAKA_SIGNAL_LOG") or "/tmp/tohsakawrt/state/signal-trend.log"
 local MAX_LINES = 3000
+
+-- 小时聚合的持久文件（写闪存，每小时一行）
+local HOURLY = os.getenv("TOHSAKA_SIGNAL_HOURLY") or "/etc/tohsakawrt/signal-hourly.log"
+local HOURLY_MAX = 2000          -- 约 83 天，之后自动轮转
+-- 已聚合到哪一小时的标记（放内存；重启后回落到读持久文件末行）
+local ROLLUP_MARK = os.getenv("TOHSAKA_SIGNAL_ROLLUP_MARK") or "/tmp/tohsakawrt/state/signal-rollup.last"
 
 local function ensure_dir(path)
     local dir = path:match("^(.*)/[^/]*$")
@@ -55,6 +69,161 @@ local function record()
     return 0
 end
 
+-- 持久文件最后一行的"小时起点"
+local function last_hourly_key()
+    local f = io.open(HOURLY, "r")
+    if not f then return nil end
+    local last
+    for line in f:lines() do
+        local k = line:match("^(%d+)")
+        if k then last = tonumber(k) end
+    end
+    f:close()
+    return last
+end
+
+local function write_mark(hour_start)
+    ensure_dir(ROLLUP_MARK)
+    local kf = io.open(ROLLUP_MARK, "w")
+    if kf then kf:write(tostring(hour_start), "\n"); kf:close() end
+end
+
+-- 把已过去的完整小时聚合成一行写闪存。
+-- 幂等：已处理过就立刻返回；一次调用可补齐多个漏掉的小时（最多回补 48 小时）。
+local function rollup()
+    local now = os.time()
+    local latest = math.floor(now / 3600) * 3600 - 3600   -- 最近一个完整小时
+
+    local mark
+    local mf = io.open(ROLLUP_MARK, "r")
+    if mf then mark = tonumber(mf:read("*l") or ""); mf:close() end
+    if not mark then mark = last_hourly_key() end        -- 重启后回落到持久文件
+
+    if mark and mark >= latest then return 0 end        -- 常态：一次比较就返回，零写入
+
+    -- 内存样本只读一次，之后在内存里分小时聚合
+    local samples = {}
+    local f = io.open(FILE, "r")
+    if f then
+        for line in f:lines() do
+            -- 趋势行格式（7 字段）：epoch band rsrp sinr rsrq pci cid
+            local ts, band, rsrp, sinr, rsrq, pci, cid = line:match("^(%d+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(%S+)")
+            ts = tonumber(ts)
+            if ts then
+                samples[#samples + 1] = {
+                    ts = ts, band = band,
+                    rsrp = tonumber(rsrp), sinr = tonumber(sinr),
+                    -- 小区 ID 用于回答"信号变差时是不是总在同一个小区"。
+                    -- 取不到（"-"）就保持 nil，聚合时按"没数据"处理，不编造。
+                    cell = (cid and cid ~= "-") and cid or nil,
+                }
+            end
+        end
+        f:close()
+    end
+
+    -- 起始小时。
+    -- 有标记 → 从标记的下一小时开始；
+    -- 没有标记（首次运行 / 重启后 /tmp 被清）→ 从内存样本里【最早】那个小时开始补。
+    -- 这里必须回溯到最早样本：若只处理最新一小时，更早那些小时的样本会被永久丢掉
+    -- （标记会直接跳到最新，再也不会回头看它们）。
+    local from
+    if mark then
+        from = mark + 3600
+    else
+        from = latest
+        for _, s in ipairs(samples) do
+            local hs = math.floor(s.ts / 3600) * 3600
+            if hs < from then from = hs end
+        end
+    end
+    if from < latest - 48 * 3600 then from = latest - 48 * 3600 end   -- 最多回补 48 小时
+    if from > latest then from = latest end
+
+    -- 分桶聚合
+    local buckets = {}      -- [hour_start] = {rsum,rn,rmin,ssum,sn,smin,samples,bands,border,last_band,changes}
+    for _, s in ipairs(samples) do
+        if s.ts >= from and s.ts < latest + 3600 then
+            local hs = math.floor(s.ts / 3600) * 3600
+            local b = buckets[hs]
+            if not b then
+                b = { rsum = 0, rn = 0, rmin = nil, ssum = 0, sn = 0, smin = nil,
+                      samples = 0, bands = {}, border = {}, changes = 0, last_band = nil,
+                      cells = {}, corder = {} }
+                buckets[hs] = b
+            end
+            b.samples = b.samples + 1
+            if not b.bands[s.band] then b.border[#b.border + 1] = s.band end
+            b.bands[s.band] = (b.bands[s.band] or 0) + 1
+            if b.last_band and s.band ~= b.last_band then b.changes = b.changes + 1 end
+            b.last_band = s.band
+            -- 小区统计：记录该小时出现过的所有小区及其样本数，
+            -- 之后取"主导小区"和"不同小区个数"写进小时表。
+            -- 这两个值合起来才能解释信号变化：主导小区不变而 RSRP 下滑 = 同一小区恶化；
+            -- 主导小区变了 = 发生了小区重选（锁频段解决不了）。
+            if s.cell then
+                if not b.cells[s.cell] then b.corder[#b.corder + 1] = s.cell end
+                b.cells[s.cell] = (b.cells[s.cell] or 0) + 1
+            end
+            if s.rsrp then
+                b.rsum = b.rsum + s.rsrp; b.rn = b.rn + 1
+                b.rmin = (not b.rmin or s.rsrp < b.rmin) and s.rsrp or b.rmin
+            end
+            if s.sinr then
+                b.ssum = b.ssum + s.sinr; b.sn = b.sn + 1
+                b.smin = (not b.smin or s.sinr < b.smin) and s.sinr or b.smin
+            end
+        end
+    end
+
+    ensure_dir(HOURLY)
+    local hf = io.open(HOURLY, "a")
+    if not hf then return 1 end
+
+    local wrote = false
+    local hs = from
+    while hs <= latest do
+        local b = buckets[hs]
+        if b and b.samples > 0 then
+            -- 主导频段（按样本数）
+            local top_band, top_n = "-", 0
+            for _, bd in ipairs(b.border) do
+                if b.bands[bd] > top_n then top_band, top_n = bd, b.bands[bd] end
+            end
+            -- 主导小区（按样本数）与该小时出现过的小区个数。
+            -- 末尾两个字段是【后加的】：旧行只有 8 个字段，读取端必须容忍两种长度
+            -- （show_long 原先用 "%d+%s*$" 严格要求 8 个字段，直接加字段会让新行【静默失配】
+            --   而被全部跳过 —— 所以读取端也一并改成按空白切分取前几个）。
+            local top_cell, top_cn = "-", 0
+            for _, c in ipairs(b.corder) do
+                if b.cells[c] > top_cn then top_cell, top_cn = c, b.cells[c] end
+            end
+            hf:write(string.format("%d %s %s %s %s %s %d %d %s %d\n",
+                hs,
+                b.rn > 0 and string.format("%.0f", b.rsum / b.rn) or "-",
+                b.rmin and string.format("%.0f", b.rmin) or "-",
+                b.sn > 0 and string.format("%.0f", b.ssum / b.sn) or "-",
+                b.smin and string.format("%.0f", b.smin) or "-",
+                top_band, b.changes, b.samples, top_cell, #b.corder))
+            wrote = true
+        end
+        -- 该小时没有样本（模组不在线 / 重启）：不写行。缺行代表"没数据"，
+        -- 写 0 会被后面的统计当成"信号极差"，那是在编造事实。
+        hs = hs + 3600
+    end
+    hf:close()
+
+    write_mark(latest)
+
+    if wrote then
+        os.execute(string.format(
+            "n=$(wc -l < '%s' 2>/dev/null || echo 0); [ \"$n\" -gt %d ] && " ..
+            "(tail -n %d '%s' > '%s.tmp' && mv '%s.tmp' '%s') || true",
+            HOURLY, HOURLY_MAX + 100, HOURLY_MAX, HOURLY, HOURLY, HOURLY, HOURLY))
+    end
+    return 0
+end
+
 local BLOCKS = { "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" }
 
 local function level8(v, lo, hi)
@@ -66,8 +235,10 @@ local function level8(v, lo, hi)
 end
 
 -- 把样本按时间分桶（最多 width 桶），每桶取"最差值" → 容易看出什么时候掉过
-local function sparkline(values, lo, hi, width)
-    local n = #values
+-- n 可显式指定：当 values 是稀疏数组（例如"一天 24 小时"里只有几个整点有数据）时，
+-- 必须传 n，否则 Lua 的 # 遇 nil 不增长，横轴会塌缩、无法对齐到具体小时。
+local function sparkline(values, lo, hi, width, n)
+    n = n or #values
     if n == 0 then return "", 0 end
     width = width or 60
     local per = math.ceil(n / width)
@@ -186,12 +357,164 @@ local function show(minutes)
     return 0
 end
 
+-- 长趋势：读小时聚合，按"一天中的第几小时"（0~23）分组，加权平均。
+-- 这个视图就是为了回答"是不是每晚固定时段变差"——按小时分组能把日周期规律显出来，
+-- 而按日期排列则做不到。
+local function show_long(hours)
+    hours = tonumber(hours) or 168
+    local f = io.open(HOURLY, "r")
+    if not f then
+        print("📈 <b>5G 信号长趋势</b>\n\n<i>还没有小时聚合数据 —— 记录器每小时汇总一次，攒够几小时再看。</i>")
+        return 0
+    end
+
+    local cutoff = os.time() - hours * 3600
+    local hod = {}
+    for i = 0, 23 do hod[i] = { rsum = 0, rw = 0, ssum = 0, sw = 0, cnt = 0 } end
+    local total_hours, total_samples, band_changes = 0, 0, 0
+    local bands, band_order = {}, {}
+    local first_ts, last_ts = nil, nil
+    local cells, cell_order = {}, {}      -- 各小区出现过的小时数
+    local multi_cell_hours = 0            -- 一小时里出现过多个小区的小时数
+
+    for line in f:lines() do
+        -- ⚠️ 按空白切分，而不是用"固定字段数 + %s*$"的模式匹配。
+        -- 小时表末尾的"主导小区 / 小区个数"是后加的，旧行只有 8 个字段；
+        -- 严格的模式会让【新行静默失配】而被整行跳过，表现为"长趋势突然没数据了"
+        -- 却没有任何报错 —— 这类静默失效在本项目里已经踩过多次。
+        local w = {}
+        for tok in line:gmatch("%S+") do w[#w + 1] = tok end
+        local ts, ravg, rmin, savg, smin, band, bchg, samples =
+            w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8]
+        local cell, ncell = w[9], tonumber(w[10])
+        ts = tonumber(ts)
+        if ts and ts >= cutoff then
+            local wt = tonumber(samples) or 0
+            total_hours = total_hours + 1
+            total_samples = total_samples + wt
+            band_changes = band_changes + (tonumber(bchg) or 0)
+            -- 取极值而不是"第一条/最后一条"：写入端确实是升序的，
+            -- 但一旦文件顺序异常（手工编辑、轮转中间态），"跨度"会算成负数，看着像坏了。
+            if not first_ts or ts < first_ts then first_ts = ts end
+            if not last_ts or ts > last_ts then last_ts = ts end
+            if not bands[band] then band_order[#band_order + 1] = band end
+            bands[band] = (bands[band] or 0) + wt
+
+            if cell and cell ~= "-" then
+                if not cells[cell] then cell_order[#cell_order + 1] = cell end
+                cells[cell] = (cells[cell] or 0) + 1
+            end
+            if ncell and ncell > 1 then multi_cell_hours = multi_cell_hours + 1 end
+
+            local h = tonumber(os.date("%H", ts))
+            local r, s = tonumber(ravg), tonumber(savg)
+            if h and wt > 0 then
+                local e = hod[h]
+                if r then e.rsum = e.rsum + r * wt; e.rw = e.rw + wt end
+                if s then e.ssum = e.ssum + s * wt; e.sw = e.sw + wt end
+                e.cnt = e.cnt + wt
+            end
+        end
+    end
+    f:close()
+
+    if total_hours == 0 then
+        print(string.format("📈 <b>5G 信号长趋势</b>\n\n<i>最近 %d 小时内没有聚合数据。</i>", hours))
+        return 0
+    end
+
+    -- 构造 0~23 点的序列，并找最好/最差时段（按 SINR 判定质量，SINR 缺失时退回 RSRP）
+    local r_series, s_series = {}, {}
+    local best_h, best_v, worst_h, worst_v = nil, nil, nil, nil
+    for i = 0, 23 do
+        local e = hod[i]
+        local ravg = (e.rw > 0) and (e.rsum / e.rw) or nil
+        local savg = (e.sw > 0) and (e.ssum / e.sw) or nil
+        -- 用显式下标而不是 #t+1：某些小时没有数据时值是 nil，
+        -- 用 #t+1 追加会让后续元素前移，横轴就错位了（0 点的数据会被画到第 1 格）。
+        r_series[i + 1] = ravg
+        s_series[i + 1] = savg
+        local metric = savg or ravg
+        if metric then
+            if best_v == nil or metric > best_v then best_v, best_h = metric, i end
+            if worst_v == nil or metric < worst_v then worst_v, worst_h = metric, i end
+        end
+    end
+
+    -- 显式传 24：横轴必须固定为"一天 24 小时"，缺数据的小时显示为 · 而不是被压缩掉
+    local spark_r = sparkline(r_series, -110, -70, 24, 24)
+    local spark_s = sparkline(s_series, -5, 30, 24, 24)
+
+    local bp = {}
+    for _, b in ipairs(band_order) do
+        bp[#bp + 1] = string.format("%s <code>%.0f%%</code>", b, total_samples > 0 and (bands[b] / total_samples * 100) or 0)
+    end
+
+    local days = (last_ts - first_ts) / 86400
+    local function hour_line(h)
+        if h == nil then return "<i>数据不足</i>" end
+        local e = hod[h]
+        local r = (e.rw > 0) and string.format("%d", math.floor(e.rsum / e.rw + 0.5)) or "-"
+        local s = (e.sw > 0) and string.format("%d", math.floor(e.ssum / e.sw + 0.5)) or "-"
+        return string.format("%02d 点  SINR <code>%s</code> dB · RSRP <code>%s</code> dBm", h, s, r)
+    end
+
+    -- 小区分布：回答"信号变差时是不是总在同一个小区"。
+    -- 主导小区不变而 RSRP 下滑 = 同一小区恶化（覆盖/干扰）；
+    -- 主导小区频繁更换 = 发生了小区重选（该锁频段/锁小区，而不是等它自己变好）。
+    local cp = {}
+    local sorted_cells = {}
+    for _, c in ipairs(cell_order) do sorted_cells[#sorted_cells + 1] = c end
+    table.sort(sorted_cells, function(a, b) return cells[a] > cells[b] end)
+    for i, c in ipairs(sorted_cells) do
+        if i > 4 then break end
+        cp[#cp + 1] = string.format("<code>%s</code> %d 小时", c, cells[c])
+    end
+    local cell_line
+    if #cp == 0 then
+        cell_line = "<i>暂无小区数据（旧记录里没有这一列）</i>"
+    else
+        cell_line = table.concat(cp, " · ")
+        if multi_cell_hours > 0 then
+            cell_line = cell_line .. string.format("\n🔁 <i>其中 %d 个小时里换过小区</i>", multi_cell_hours)
+        end
+    end
+
+    print(string.format([[📈 <b>5G 信号长趋势</b>（近 %d 小时）
+━━━━━━━━━━━━━━━━━━
+📶 <b>RSRP 按小时</b>（0 → 23 点）
+<code>%s</code>
+📊 <b>SINR 按小时</b>（0 → 23 点）
+<code>%s</code>
+<i>0    6    12   18   23</i>
+━━━━━━━━━━━━━━━━━━
+🟢 <b>最好时段</b>：%s
+🔴 <b>最差时段</b>：%s
+━━━━━━━━━━━━━━━━━━
+📻 <b>驻留频段</b>：%s
+🔀 <b>频段跳变</b>：<code>%d</code> 次
+📍 <b>驻留小区</b>：%s
+📦 <b>覆盖</b>：<code>%d</code> 个整点 · 样本 <code>%d</code> 条 · 跨度 <code>%.1f</code> 天
+━━━━━━━━━━━━━━━━━━
+💡 <i>SINR 在固定时段规律性下滑，通常是该时段网络拥塞或干扰；
+若 RSRP 也同步下滑，更像覆盖/天线问题。缺行的小时表示当时模组不在线。
+小区不变而信号变差 = 同一个小区恶化；小区频繁更换 = 在重选，可考虑锁定。</i>]],
+        hours, spark_r, spark_s, hour_line(best_h), hour_line(worst_h),
+        table.concat(bp, " / "), band_changes, cell_line, total_hours, total_samples, days))
+    return 0
+end
+
 local cmd = arg[1] or "show"
 if cmd == "record" then
     os.exit(record())
+elseif cmd == "rollup" then
+    os.exit(rollup())
 elseif cmd == "show" then
     os.exit(show(arg[2]))
+elseif cmd == "show-long" then
+    os.exit(show_long(arg[2]))
 else
-    print("Usage: " .. (arg[0] or "tohsakawrt-signal-log") .. " {record | show [minutes]}")
+    print("Usage: " .. (arg[0] or "tohsakawrt-signal-log") ..
+        " {record | rollup | show [minutes] | show-long [hours]}")
     os.exit(1)
 end
