@@ -110,6 +110,18 @@ probe_uplink() {
 switch_to_wan() {
     local cur="$(get_active_uplink)"
     if [ "$cur" = "wan" ]; then
+        # 路由不用动，但"期望出口"必须照样落下去。
+        # 否则会出现僵局：实际在 wan、期望还停在另一条 → 对账每分钟认为"出口漂移"、
+        # 每次尝试切换都因预检不通过而失败、每 10 分钟给用户推一条"出口纠正失败"。
+        # 2026-10-13 真实发生：运营商云端故障致 5G 掉线、看门狗自动回落宽带后，
+        # 用户想把期望改成宽带却改不动（只能手工写状态文件）。
+        # 回落路径（KEEP_DESIRED=1）的语义是"临时借道、期望不变"，所以这里尊重该开关。
+        if [ "${TOHSAKA_UPLINK_KEEP_DESIRED:-0}" = "1" ]; then
+            mark_fallback
+        else
+            clear_fallback
+            write_desired wan
+        fi
         echo "ALREADY_WAN"
         return 0
     fi
@@ -163,6 +175,18 @@ switch_to_wan() {
 switch_to_5g() {
     local cur="$(get_active_uplink)"
     if [ "$cur" = "5g" ]; then
+        # 路由不用动，但"期望出口"必须照样落下去。
+        # 否则会出现僵局：实际在 5g、期望还停在另一条 → 对账每分钟认为"出口漂移"、
+        # 每次尝试切换都因预检不通过而失败、每 10 分钟给用户推一条"出口纠正失败"。
+        # 2026-10-13 真实发生：运营商云端故障致 5G 掉线、看门狗自动回落宽带后，
+        # 用户想把期望改成宽带却改不动（只能手工写状态文件）。
+        # 回落路径（KEEP_DESIRED=1）的语义是"临时借道、期望不变"，所以这里尊重该开关。
+        if [ "${TOHSAKA_UPLINK_KEEP_DESIRED:-0}" = "1" ]; then
+            mark_fallback
+        else
+            clear_fallback
+            write_desired 5g
+        fi
         echo "ALREADY_5G"
         return 0
     fi

@@ -224,5 +224,27 @@ TEST_ROUTE_GET_DEV=to5g TEST_USB_IP=1 TEST_USB_GW=1 "$SCRIPT" reconcile > "$TMP/
 check 'reconcile 冷却期内不再重试（避免每分钟抖动）' \
     "$(grep -q 'addr show' "$CALLS" && echo 0 || echo 1)"
 
+# ---------- ④ 已在目标线路上时，仍必须把"期望出口"落下去 ----------
+# 回归（2026-10-13 真实事故）：运营商云端故障致 5G 掉线、看门狗自动回落宽带后，
+# 期望出口还停在 5g，于是对账每分钟认为"出口漂移"、每次尝试切 5G 都预检失败、
+# 每 10 分钟给用户推一条"出口纠正失败"。根因就是 switch_to_wan 在 ALREADY_WAN
+# 早返回时从不写期望 —— 用户想把期望改成宽带却改不动。
+: > "$CALLS"
+printf '5g\n' > "$TOHSAKA_UPLINK_DESIRED"
+TEST_ROUTE_GET_DEV= TEST_USB_IP=1 TEST_USB_GW=1 "$SCRIPT" wan > "$TMP/already-wan.out" 2>&1
+check '已在宽带时执行 wan：返回 ALREADY_WAN' \
+    "$(grep -q 'ALREADY_WAN' "$TMP/already-wan.out" && echo 1 || echo 0)"
+check '已在宽带时执行 wan：期望出口照样写成 wan（修 ALREADY_* 早返回不写期望）' \
+    "$([ "$(cat "$TOHSAKA_UPLINK_DESIRED" 2>/dev/null)" = "wan" ] && echo 1 || echo 0)"
+check '已在宽带时执行 wan：仍然不动任何路由（ALREADY 语义不变）' \
+    "$(grep -Eq '^ip route (replace|del|add) ' "$CALLS" && echo 0 || echo 1)"
+
+# 回落模式必须保留原期望：否则"临时借道宽带"会变成"永久改期望"
+: > "$CALLS"
+printf '5g\n' > "$TOHSAKA_UPLINK_DESIRED"
+TEST_ROUTE_GET_DEV= TEST_USB_IP=1 TEST_USB_GW=1 TOHSAKA_UPLINK_KEEP_DESIRED=1 "$SCRIPT" wan >/dev/null 2>&1
+check '已在宽带时执行 wan（回落模式）：不覆盖期望出口' \
+    "$([ "$(cat "$TOHSAKA_UPLINK_DESIRED" 2>/dev/null)" = "5g" ] && echo 1 || echo 0)"
+
 printf 'PASS=%s FAIL=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
