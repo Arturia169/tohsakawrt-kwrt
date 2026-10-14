@@ -626,7 +626,14 @@ TRAFFIC_THRESHOLD_BYTES=10485760 # 10 MB/s
 MAX_PHYSICAL_BYTES=157286400     # 150 MB/s (~1200 Mbps) 千兆物理上限熔断；本机光猫口实测 1Gbps
 TRAFFIC_PROC_FILE="${TRAFFIC_PROC_FILE:-/proc/net/dev}"
 
-if [ -n "$WAN_DEV" ] && [ "$WAN_DEV" != "未知" ]; then
+# 开关：uci tohsakawrt-tgbot.main.traffic_alert
+#   默认 1（开启，保持原行为）；设为 0 则完全不采集、不推送。
+#   加这个开关的原因：原先只要网卡有流量就无条件监控，用户无法关闭，
+#   每次大流量下载都会收到两条通知（开始 + 结束汇总）。
+TRAFFIC_ALERT="$(uci -q get tohsakawrt-tgbot.main.traffic_alert 2>/dev/null)"
+case "$TRAFFIC_ALERT" in ''|*[!0-9]*) TRAFFIC_ALERT=1 ;; esac
+
+if [ "$TRAFFIC_ALERT" = "1" ] && [ -n "$WAN_DEV" ] && [ "$WAN_DEV" != "未知" ]; then
     CURR_RX="$(awk -v d="${WAN_DEV}:" '$1==d {print $2}' "$TRAFFIC_PROC_FILE" 2>/dev/null)"
     NOW_TS="$(date +%s)"
     case "$NOW_TS" in ''|*[!0-9]*) NOW_TS=0 ;; esac
