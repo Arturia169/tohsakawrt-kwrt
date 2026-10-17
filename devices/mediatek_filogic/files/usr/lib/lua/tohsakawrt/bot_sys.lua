@@ -113,6 +113,19 @@ function M.cmd_direct_list(msg_id, cb_id)
     return tg.send_msg(text, kb)
 end
 
+-- 域名归一：用户常把整条网址粘进来（https://host/path、host:443、结尾带点），
+-- 直接校验会被判成"格式不正确"并拒绝执行——这是最常踩的一次误判。
+-- 在入口先剥干净，序号（纯数字）会原样通过，不影响 direct_del 的序号删除。
+local function normalize_domain(d)
+    d = tostring(d or ""):gsub("%s", "")
+    d = d:gsub("^[%a][%w+.-]*://", "")  -- 协议头 http:// https:// ...
+    d = d:gsub("^[^/@]*@", "")          -- user@
+    d = d:gsub("[/?#].*$", "")          -- 路径 / 查询 / 锚点
+    d = d:gsub(":%d+$", "")             -- 端口
+    d = d:gsub("%.$", "")               -- 结尾的点
+    return (d:lower())
+end
+
 -- 域名白名单校验：与脚本侧同规则（双重防护，非法输入连脚本都不调）
 local function valid_domain(d)
     if type(d) ~= "string" or #d < 4 or #d > 253 then return false end
@@ -122,9 +135,9 @@ local function valid_domain(d)
 end
 
 function M.direct_add(domain, msg_id, cb_id)
-    domain = tostring(domain or ""):gsub("%s", "")
+    domain = normalize_domain(domain)
     if not valid_domain(domain) then
-        local t = "⚠️ <b>域名格式不正确</b>\n\n<i>示例：<code>/direct blog.example.com</code></i>"
+        local t = "⚠️ <b>域名格式不正确</b>\n\n<i>示例：<code>/direct blog.example.com</code>\n直接粘整条网址也行，会自动取域名。</i>"
         if msg_id and cb_id then return tg.answer_and_edit(cb_id, "格式不正确", msg_id, t) end
         return tg.send_msg(t)
     end
@@ -135,16 +148,23 @@ function M.direct_add(domain, msg_id, cb_id)
     local raw = tostring(core.exec("/usr/bin/tohsakawrt-clash-direct add " .. domain .. " 2>/dev/null") or "")
     local first = raw:match("^([^\r\n]+)") or ""
     local reload_failed = raw:find("RELOAD_FAILED:", 1, true) ~= nil
+    -- 热重载只影响新连接，脚本会顺手断掉该域名的旧连接并回报条数
+    local closed = tonumber(raw:match("CLOSED:(%d+)")) or 0
     local body
     if first == "ADDED" then
         body = string.format("✅ <b>已加入直连</b>\n\n🔗 <code>%s</code>\n%s\n\n<i>下次这条路径就走直连了。</i>",
             html_escape(domain),
             reload_failed and "⚠️ <b>已写入配置，但热重载失败</b>（重启 OpenClash 后生效）"
-                          or "⚡ <b>已热重载</b>（保留现有连接）")
+                          or (closed > 0 and string.format("⚡ <b>已热重载</b>，并断开 %d 条旧连接（客户端重连即走直连）", closed)
+                                          or "⚡ <b>已热重载</b>（新连接立即生效）"))
     elseif first == "ALREADY" then
-        body = string.format("ℹ️ <b>本来就在直连清单里</b>\n\n🔗 <code>%s</code>%s",
-            html_escape(domain),
-            reload_failed and "\n\n⚠️ <i>但热重载失败，重启 OpenClash 后才会生效。</i>" or "")
+        local extra = ""
+        if reload_failed then
+            extra = "\n\n⚠️ <i>但热重载失败，重启 OpenClash 后才会生效。</i>"
+        elseif closed > 0 then
+            extra = string.format("\n\n♻️ <i>已断开 %d 条旧连接，重连后即走直连。</i>", closed)
+        end
+        body = string.format("ℹ️ <b>本来就在直连清单里</b>\n\n🔗 <code>%s</code>%s", html_escape(domain), extra)
     else
         body = string.format("⚠️ <b>添加失败</b>\n\n<code>%s</code>", html_escape(first ~= "" and first or "无返回"))
     end
@@ -159,7 +179,7 @@ end
 
 -- 实测两条路并给建议：直连更快就提供"一键加入"
 function M.direct_smart(domain, msg_id, cb_id)
-    domain = tostring(domain or ""):gsub("%s", "")
+    domain = normalize_domain(domain)
     if not valid_domain(domain) then
         local t = "⚠️ <b>域名格式不正确</b>\n\n<i>示例：<code>/smart blog.example.com</code></i>"
         if msg_id and cb_id then return tg.answer_and_edit(cb_id, "格式不正确", msg_id, t) end
@@ -208,7 +228,7 @@ function M.direct_smart(domain, msg_id, cb_id)
 end
 
 function M.direct_del(domain, msg_id, cb_id)
-    domain = tostring(domain or ""):gsub("%s", "")
+    domain = normalize_domain(domain)
     -- 卡片（bot_direct.lua:99）教用户发 /undirect 序号，但 bot.lua:349 的分支先命中
     -- cmd == "/undirect" 并交给本函数，bot.lua:375 那个支持序号的 bot_direct.cmd_undirect
     -- 因此永远不可达（死代码）。序号落到这里会被 valid_domain 拦下，用户照卡片操作
@@ -262,9 +282,11 @@ function M.direct_del(domain, msg_id, cb_id)
     local raw = tostring(core.exec("/usr/bin/tohsakawrt-clash-direct del " .. domain .. " 2>/dev/null") or "")
     local first = raw:match("^([^\r\n]+)") or ""
     local reload_failed = raw:find("RELOAD_FAILED:", 1, true) ~= nil
+    local closed = tonumber(raw:match("CLOSED:(%d+)")) or 0
     local body = string.format("🗑 <b>已撤销直连</b>\n\n🔗 <code>%s</code>\n%s", html_escape(domain),
         reload_failed and "⚠️ <i>已从配置移除，但热重载失败（重启 OpenClash 后生效）。</i>"
-                      or "⚡ <i>已热重载</i>")
+                      or (closed > 0 and string.format("⚡ <i>已热重载，断开 %d 条旧连接</i>", closed)
+                                      or "⚡ <i>已热重载</i>"))
     if first ~= "DELETED" then
         body = string.format("⚠️ <b>撤销返回异常</b>：<code>%s</code>", html_escape(first ~= "" and first or "无返回"))
     end
