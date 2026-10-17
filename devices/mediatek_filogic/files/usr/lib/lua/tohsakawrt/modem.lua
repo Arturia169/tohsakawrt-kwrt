@@ -333,9 +333,13 @@ function M.sms_list(storage, limit)
         })
     end
 
+    -- 按存储索引倒序：索引由模组按"收到顺序"分配，跨时区/换卡都可靠。
+    -- 时间戳来自短信中心，格鲁吉亚 +04 的 19:25 和香港 +08 的 22:32 直接比较会倒序，
+    -- 导致最新收到的短信被排到旧短信后面（/sms 只取前 3 条时就看不到）。
     table.sort(assembled, function(a, b)
-        if a.sort_time ~= b.sort_time then return a.sort_time > b.sort_time end
-        return (a.index or 0) > (b.index or 0)
+        local ai, bi = tonumber(a.index) or -1, tonumber(b.index) or -1
+        if ai ~= bi then return ai > bi end
+        return (a.sort_time or 0) > (b.sort_time or 0)
     end)
 
     if limit and limit > 0 and #assembled > limit then
@@ -366,40 +370,68 @@ function M.sms_poll_new()
 
     local last_used = tonumber(core.get_state("sms_last_used", "-1")) or -1
     local last_ts = tonumber(core.get_state("sms_last_ts", "0")) or 0
+    local last_index = tonumber(core.get_state("sms_last_index", "-1")) or -1
+    local last_sig = core.get_state("sms_last_sig", "")
 
-    if last_used == -1 then
-        -- 首次启动记录当前最新短信，避免历史短信刷屏
-        local list = M.sms_list("ME", 1)
-        if not list then return {} end
-        local latest_ts = (list and list[1] and list[1].sort_time) or 0
-        core.set_state("sms_last_used", tostring(cur_used))
-        core.set_state("sms_last_ts", tostring(latest_ts))
-        return {}
-    end
-
-    if cur_used <= last_used then
-        if cur_used < last_used then
-            core.set_state("sms_last_used", tostring(cur_used))
-        end
-        return {}
-    end
-
-    local all_sms = M.sms_list("ME", 10)
+    -- 必须每轮都拿列表：只看 used 计数会漏掉
+    --   ① 数量没变但换了内容（删除一条又来一条）
+    --   ② 换卡/换 profile 后存储索引变化
+    --   ③ 跨时区的时间戳倒序（格鲁吉亚 +04 的 19:25 比香港 +08 的 22:32 "看起来"更早）
+    -- 列表本身是 sms_tool -j recv 的全量解析，多一次 AT 读换正确性，值得。
+    local all_sms = M.sms_list("ME", 20)
     if not all_sms then return {} end
-    local new_sms = {}
-    local max_ts = last_ts
 
-    for _, sms in ipairs(all_sms) do
-        if sms.sort_time > last_ts then
-            table.insert(new_sms, sms)
-            if sms.sort_time > max_ts then
-                max_ts = sms.sort_time
-            end
-        end
+    local function sms_sig(sms)
+        if not sms then return "" end
+        local body = tostring(sms.content or ""):gsub("[\r\n]", " "):sub(1, 80)
+        return string.format("%s|%s|%s", tostring(sms.sender), tostring(sms.timestamp), body)
     end
 
-    core.set_state("sms_last_used", tostring(cur_used))
-    core.set_state("sms_last_ts", tostring(max_ts))
+    local max_index, newest, max_ts = -1, nil, last_ts
+    for _, sms in ipairs(all_sms) do
+        local idx = tonumber(sms.index) or -1
+        if idx > max_index then max_index = idx; newest = sms end
+        if sms.sort_time and sms.sort_time > max_ts then max_ts = sms.sort_time end
+    end
+    local cur_sig = sms_sig(newest)
+
+    local function remember()
+        core.set_state("sms_last_used", tostring(cur_used))
+        core.set_state("sms_last_ts", tostring(max_ts))
+        core.set_state("sms_last_index", tostring(max_index))
+        core.set_state("sms_last_sig", cur_sig)
+    end
+
+    if last_index < 0 or last_used < 0 then
+        -- 首次启动/老版本升级/台账半写：只打台账，不补推历史短信，避免刷屏。
+        remember()
+        return {}
+    end
+
+    if max_index < last_index then
+        -- 换卡/清空/存储索引回退：重置台账，同样不补推。
+        remember()
+        return {}
+    end
+
+    local new_sms = {}
+    -- 主判据：存储索引比上次大。索引是模组分配的单调值，不受时区和换卡影响。
+    for _, sms in ipairs(all_sms) do
+        if (tonumber(sms.index) or -1) > last_index then
+            new_sms[#new_sms + 1] = sms
+        end
+    end
+    -- 兜底：索引没变但计数增加或最新一条的签名变了（多段短信的后续分段/索引复用）。
+    if #new_sms == 0 and (cur_used > last_used or cur_sig ~= last_sig) and newest then
+        new_sms[1] = newest
+    end
+
+    if #new_sms > 0 then
+        remember()
+    elseif cur_used ~= last_used then
+        -- 没有新短信但计数变化（删除/清空）：只同步计数，不动索引与签名。
+        core.set_state("sms_last_used", tostring(cur_used))
+    end
 
     return new_sms
 end
