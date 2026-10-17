@@ -101,6 +101,12 @@ if [ -f /etc/config/firewall ]; then
     fi
 fi
 
+# Argon 登录页使用本地壁纸，避免首个壁纸下载前等待外网
+if [ -f /etc/config/argon ] && uci -q get argon.@global[0] >/dev/null 2>&1; then
+    uci set argon.@global[0].online_wallpaper='none'
+    uci commit argon
+fi
+
 # 6. Ensure Permissions & Services
 chmod +x /usr/bin/tohsakawrt* /etc/init.d/tohsakawrt* 2>/dev/null
 [ -x /etc/init.d/tohsakawrt-tgbot ] && /etc/init.d/tohsakawrt-tgbot enable

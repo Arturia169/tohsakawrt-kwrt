@@ -1,0 +1,111 @@
+#!/bin/sh
+# TohsakaWrt 每日 Bing 登录页壁纸拉取脚本
+# 每天定时拉取 Bing 每日高清壁纸存入本地目录，供 LuCI Argon 主题本地加载，
+# 确保登录页加载零外网依赖，同时保持壁纸每日更新。
+
+BG_DIR="${BG_DIR:-/www/luci-static/argon/background}"
+IMG_NAME="${IMG_NAME:-bing-daily.jpg}"
+STATE_FILE="${STATE_FILE:-/var/run/tohsakawrt-wallpaper.url}"
+API_URL="${API_URL:-https://www.bing.com/HPImageArchive.aspx?format=js&n=1}"
+ARGON_CONFIG="${ARGON_CONFIG:-/etc/config/argon}"
+
+ensure_local_wallpaper() {
+    if [ -f "$ARGON_CONFIG" ] && command -v uci >/dev/null 2>&1; then
+        if uci -q get argon.@global[0] >/dev/null 2>&1; then
+            cur_mode="$(uci -q get argon.@global[0].online_wallpaper 2>/dev/null || true)"
+            if [ "$cur_mode" != "none" ]; then
+                uci set argon.@global[0].online_wallpaper='none'
+                uci commit argon
+            fi
+        fi
+    fi
+}
+
+force=0
+for arg in "$@"; do
+    case "$arg" in
+        -f|--force)
+            force=1
+            ;;
+    esac
+done
+
+# Step 1: 解析今日壁纸 URL
+raw_url="$(wget -T8 -qO- "$API_URL" 2>/dev/null | jsonfilter -qe '@.images[0].url' 2>/dev/null | sed 's/1920x1080/UHD/g')"
+
+url=""
+if [ -n "$raw_url" ]; then
+    case "$raw_url" in
+        /*) url="https://www.bing.com$raw_url" ;;
+        *)  url="$raw_url" ;;
+    esac
+fi
+
+# URL 解析失败：记录日志并退出，绝不破坏现有壁纸与状态文件
+if [ -z "$url" ]; then
+    logger -t tohsakawrt-wallpaper "failed: unable to resolve wallpaper url from api" 2>/dev/null || true
+    echo "failed: unable to resolve wallpaper url"
+    exit 1
+fi
+
+# 检查是否无需重新下载（非强制、状态文件记录一致且本地已有合格壁纸）
+if [ "$force" -eq 0 ] && [ -f "$STATE_FILE" ] && [ -f "$BG_DIR/$IMG_NAME" ]; then
+    saved_url="$(cat "$STATE_FILE" 2>/dev/null)"
+    if [ "$saved_url" = "$url" ]; then
+        img_sz=$(($(wc -c < "$BG_DIR/$IMG_NAME" 2>/dev/null || echo 0)))
+        if [ "$img_sz" -gt 100000 ]; then
+            mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
+            printf '%s\n' "$url" > "$STATE_FILE"
+            ensure_local_wallpaper
+            echo "unchanged"
+            exit 0
+        fi
+    fi
+fi
+
+# Step 2: 下载壁纸到临时文件并校验
+mkdir -p "$BG_DIR"
+tmp="$BG_DIR/.$IMG_NAME.tmp"
+rm -f "$tmp"
+
+if ! wget -T30 -q -O "$tmp" "$url" 2>/dev/null || [ ! -f "$tmp" ]; then
+    rm -f "$tmp"
+    logger -t tohsakawrt-wallpaper "failed: download error" 2>/dev/null || true
+    echo "failed: download error"
+    exit 1
+fi
+
+tmp_sz=$(($(wc -c < "$tmp" 2>/dev/null || echo 0)))
+
+# 校验大小（> 200000 字节）及 JPEG 幻数 (ff d8 ff)
+# 注意：本机 busybox 没有 od/xxd，只能用 cmp 对比前 3 字节
+magic_ref="/tmp/.tohsakawrt-jpgmagic"
+printf '\377\330\377' > "$magic_ref"
+if [ "$tmp_sz" -le 200000 ] || ! dd if="$tmp" bs=1 count=3 2>/dev/null | cmp -s - "$magic_ref"; then
+    rm -f "$tmp" "$magic_ref"
+    logger -t tohsakawrt-wallpaper "failed: invalid image (size=$tmp_sz)" 2>/dev/null || true
+    echo "failed: invalid image"
+    exit 1
+fi
+rm -f "$magic_ref"
+
+# 原子替换安装
+mv -f "$tmp" "$BG_DIR/$IMG_NAME"
+
+# 清理旧的 Bing 壁纸（文件名以 bing- 开头且不为 bing-daily.jpg 的文件）
+for f in "$BG_DIR"/bing-*; do
+    [ -e "$f" ] || continue
+    base="${f##*/}"
+    if [ "$base" != "$IMG_NAME" ]; then
+        rm -f "$f"
+    fi
+done
+
+# 记录当前壁纸 URL 到状态文件
+mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
+printf '%s\n' "$url" > "$STATE_FILE"
+
+ensure_local_wallpaper
+
+echo "updated: $url"
+exit 0

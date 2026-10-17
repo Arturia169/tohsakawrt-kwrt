@@ -169,6 +169,7 @@ jobs:
             usr/bin/tohsakawrt-tgbot \
             usr/bin/tohsakawrt-uplink \
             usr/bin/tohsakawrt-uptime \
+            usr/bin/tohsakawrt-wallpaper \
             usr/bin/tohsakawrt-watch \
             usr/lib/lua/luci/view/modem/modem_info.htm \
             usr/lib/lua/tohsakawrt/bot.lua \
