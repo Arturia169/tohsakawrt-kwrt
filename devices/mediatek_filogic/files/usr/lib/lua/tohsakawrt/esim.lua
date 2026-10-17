@@ -176,26 +176,57 @@ end
 
 local function sleep(seconds) os.execute("sleep " .. tostring(seconds)) end
 
+local function cpin_value(raw)
+    local v = tostring(raw or ""):match("%+CPIN:%s*([^\r\n]+)") or "未知"
+    return v:match("^%s*(.-)%s*$")
+end
+
+-- CFUN=1,1 后模组偶发不认卡（QSIMSTAT 报 1,0、CPIN 一直空）：
+-- 只死等 CPIN 会白等 120 秒，最后报"未知/未注册"，看起来像切换失败。
+-- 重新打开 SIM 检测并让射频重新初始化，通常几秒内恢复。
+local function nudge_sim()
+    modem.at("AT+QSIMSTAT=1", 5)
+    modem.at("AT+CFUN=1", 5)
+    sleep(5)
+end
+
 function M.reload_flow()
     local start = os.time()
     local old_p, old4 = iccid_parts(read_reply("AT+QCCID"))
     modem.at("AT+CFUN=1,1", 5)
     sleep(45)
     local ready, cpin = false, "未知"
-    local consecutive = 0
-    for _ = 1, 12 do
-        cpin = read_reply("AT+CPIN?"):match("%+CPIN:%s*([^\r\n]+)") or "未知"
-        cpin = cpin:match("^%s*(.-)%s*$")
+    local consecutive, nudged = 0, false
+    for i = 1, 12 do
+        cpin = cpin_value(read_reply("AT+CPIN?"))
         if cpin:find("READY", 1, true) then consecutive = consecutive + 1 else consecutive = 0 end
         if consecutive >= 2 then ready = true; break end
+        -- 前 3 次（约 30 秒）先让模组自己初始化；仍不认卡就主动重开 SIM 检测。
+        -- 只在异常路径触发；正常切换（CPIN 很快 READY）不产生额外 AT。
+        if not nudged and i >= 3 then
+            local qsim = read_reply("AT+QSIMSTAT?")
+            local inserted = qsim:match("%+QSIMSTAT:%s*%d+,%s*(%d+)")
+            if inserted == "0" or i >= 6 then
+                nudged = true
+                nudge_sim()
+            end
+        end
         sleep(10)
     end
     local new_p, new4 = iccid_parts(read_reply("AT+QCCID"))
+    if new_p == "" then
+        -- 读完 CPIN 仍读不到 ICCID：再补一次 SIM 重初始化后重读，避免把"模组没认卡"
+        -- 误报成"切换失败/未知"。
+        nudge_sim()
+        new_p, new4 = iccid_parts(read_reply("AT+QCCID"))
+    end
     local qnw = read_reply("AT+QNWINFO"):match("%+QNWINFO:%s*([^\r\n]+)") or "未知"
     local cereg_reply = read_reply("AT+CEREG?")
     local stat, label = registration(cereg_reply)
     local recovered = false
-    if stat ~= 1 and stat ~= 5 then
+    -- stat==3 是"注册被拒"（例如格鲁吉亚号在中国被 EMM attach failed 拒绝）：
+    -- 射频复位救不了这种网络侧拒绝，只会多花 60 秒；留给调用方回切。
+    if stat ~= 1 and stat ~= 5 and stat ~= 3 then
         recovered = true
         modem.at("AT+CFUN=0", 5); sleep(5); modem.at("AT+CFUN=1", 5)
         for _ = 1, 6 do
@@ -207,9 +238,15 @@ function M.reload_flow()
         qnw = read_reply("AT+QNWINFO"):match("%+QNWINFO:%s*([^\r\n]+)") or "未知"
         stat, label = registration(read_reply("AT+CEREG?"))
     end
+    local ceer = ""
+    if stat ~= 1 and stat ~= 5 then
+        ceer = read_reply("AT+CEER"):match("%+CEER:%s*([^\r\n]+)") or ""
+        ceer = ceer:match("^%s*(.-)%s*$")
+    end
     local changed = old_p ~= "" and new_p ~= "" and (old_p ~= new_p or old4 ~= new4)
     return { ready = ready, cpin = cpin, old_p = old_p, old4 = old4, prefix = new_p, last4 = new4,
         changed = changed, qnw = qnw, label = label, recovered = recovered,
+        stat = stat, ceer = ceer,
         elapsed = math.max(0, os.time() - start) }
 end
 
@@ -343,17 +380,75 @@ function M.worker(id)
             output = "🎉 <b>eSIM 写卡</b>\n━━━━━━━━━━━━━━━━━━\n✅ <b>结果</b>：Profile 已成功写入 eSTK 芯片\n💡 <i>点击「刷新」或发送 /cards 即可查看并启用新号码。</i>"
         end
     elseif kind == "switch" and target and target:match("^%d+$") and #target >= 18 and #target <= 22 then
+        -- 先记下当前生效的 profile：切换后若注册不上（例如该号码在当前地区没有漫游协议），
+        -- 自动回切，避免把用户留在"卡号切了但没服务"的状态。
+        local prev_iccid, prev_name = "", ""
+        local t0 = os.time()
+        local before = M.list()
+        if type(before) == "table" then
+            for _, p in ipairs(before) do
+                if p.profileState == "enabled" and p.iccid and tostring(p.iccid) ~= target then
+                    prev_iccid = tostring(p.iccid)
+                    prev_name = p.profileName or p.serviceProviderName or p.profileNickname or "原号码"
+                    break
+                end
+            end
+        end
+
         local raw = lpac("lpac profile enable " .. target)
         local payload = lpa_payload(raw)
-        if not payload then output = "⚠️ <b>号码切换</b>\n━━━━━━━━━━━━━━━━━━\n<b>切换结果</b>：启用失败，请刷新列表后重试。"
+        if not payload then
+            output = "⚠️ <b>号码切换</b>\n━━━━━━━━━━━━━━━━━━\n<b>切换结果</b>：启用失败，请刷新列表后重试。"
         else
             local r = M.reload_flow()
             local _, expected = target:sub(1, 6), target:sub(-4)
             local verified = r.prefix == target:sub(1, 6) and r.last4 == expected
-            output = "🔀 <b>号码切换</b>\n━━━━━━━━━━━━━━━━━━\n"
-                .. (verified and ("✅ <b>切换结果</b>：已切到 <code>" .. safe_text(display_name or "号码") .. "（" .. target:sub(1, 6) .. "…" .. target:sub(-4) .. "）</code>")
-                or ("⚠️ <b>切换结果</b>：复核未通过，模组实际读到 <code>" .. (r.prefix ~= "" and (r.prefix .. "…" .. r.last4) or "未知") .. "</code>"))
-                .. "\n📡 <b>网络注册</b>：" .. safe_text(r.label) .. "\n⏱️ <b>耗时</b>：约 <code>" .. safe_text(r.elapsed) .. "</code> 秒"
+            local registered = r.stat == 1 or r.stat == 5
+            if verified and registered then
+                output = "🔀 <b>号码切换</b>\n━━━━━━━━━━━━━━━━━━\n"
+                    .. "✅ <b>切换结果</b>：已切到 <code>" .. safe_text(display_name or "号码")
+                    .. "（" .. target:sub(1, 6) .. "…" .. target:sub(-4) .. "）</code>"
+                    .. "\n📡 <b>网络注册</b>：" .. safe_text(r.label)
+                    .. "\n⏱️ <b>耗时</b>：约 <code>" .. safe_text(os.time() - t0) .. "</code> 秒"
+            else
+                local reason
+                if not verified then
+                    reason = "模组实际读到 <code>" .. (r.prefix ~= "" and (r.prefix .. "…" .. r.last4) or "未知") .. "</code>"
+                else
+                    local ceer = tostring(r.ceer or "")
+                    if ceer:lower():find("no cause", 1, true) then ceer = "" end
+                    if r.stat == 3 then
+                        reason = "号码已启用，但网络拒绝注册（" .. safe_text(r.label)
+                        if ceer ~= "" then reason = reason .. "；" .. safe_text(ceer) end
+                        reason = reason .. "）"
+                    else
+                        reason = "号码已启用，但切换后一直未注册（" .. safe_text(r.label) .. "），当前地区可能没有该号码的服务"
+                        if ceer ~= "" then reason = reason .. "（" .. safe_text(ceer) .. "）" end
+                    end
+                end
+                local rollback = ""
+                if prev_iccid:match("^%d+$") and #prev_iccid >= 18 and #prev_iccid <= 22 then
+                    local rb_raw = lpac("lpac profile enable " .. prev_iccid)
+                    if lpa_payload(rb_raw) then
+                        local rb = M.reload_flow()
+                        if rb.stat == 1 or rb.stat == 5 then
+                            rollback = "\n↩️ <b>已自动切回</b> <code>" .. safe_text(prev_name)
+                                .. "（" .. prev_iccid:sub(1, 6) .. "…" .. prev_iccid:sub(-4) .. "）</code>"
+                        else
+                            rollback = "\n⚠️ <b>自动切回失败</b>：原号码也未能注册，请手动处理"
+                        end
+                    else
+                        rollback = "\n⚠️ <b>自动切回失败</b>：无法重新启用原号码"
+                    end
+                else
+                    rollback = "\n⚠️ <b>没有可回切的原号码</b>，请手动切换"
+                end
+                output = "🔀 <b>号码切换</b>\n━━━━━━━━━━━━━━━━━━\n"
+                    .. "⚠️ <b>切换未完成</b>：" .. reason
+                    .. "\n📡 <b>网络注册</b>：" .. safe_text(r.label)
+                    .. rollback
+                    .. "\n⏱️ <b>耗时</b>：约 <code>" .. safe_text(os.time() - t0) .. "</code> 秒"
+            end
             output = append_main_uplink_warning(output, main_uplink)
         end
     else

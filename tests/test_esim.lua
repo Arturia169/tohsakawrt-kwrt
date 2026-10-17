@@ -161,7 +161,7 @@ print("PASS: reload result omits the warning when main_uplink is 0")
 exec_calls = {}
 esim.reload_flow = function()
     return { ready = true, cpin = "READY", prefix = iccid2:sub(1, 6), last4 = iccid2:sub(-4),
-        qnw = '"FDD LTE","46011","LTE BAND 3",1650', label = "已注册（漫游）", elapsed = 55 }
+        qnw = '"FDD LTE","46011","LTE BAND 3",1650', label = "已注册（漫游）", stat = 5, ceer = "", elapsed = 55 }
 end
 worker_case("test-switch-heal", "", false, "switch", "0", iccid2)
 assert(tg_calls.sends == 1 and tg_calls.edits == 0, "switch worker must push exactly one result and never edit an empty message_id")
@@ -171,6 +171,44 @@ assert(tg_calls.sent_text:find(iccid2:sub(1, 6) .. "…" .. iccid2:sub(-4), 1, t
 assert(#exec_calls >= 1 and exec_calls[#exec_calls]:find("tohsakawrt-modem-heal", 1, true),
     "switch worker must trigger tohsakawrt-modem-heal after the job (ModemManager locked recovery)")
 print("PASS: switch worker verifies ICCID, pushes success and triggers modem-heal")
+
+-- 失败回切：目标号码能启用但注册被拒（格鲁吉亚号在国内就是 CEREG 3 / EMM attach failed），
+-- 必须回切到切换前生效的号码，否则用户会停在"有卡号但没服务"的状态。
+local saved_popen = io.popen
+io.popen = function(command)
+    local output
+    if command:find("profile list", 1, true) then
+        output = '{"type":"lpa","payload":{"code":0,"message":"success","data":['
+            .. '{"iccid":"' .. iccid1 .. '","profileState":"enabled","profileNickname":"Home","serviceProviderName":"Carrier A","profileName":"Home"},'
+            .. '{"iccid":"' .. iccid2 .. '","profileState":"disabled","profileNickname":"Travel","serviceProviderName":"Carrier B","profileName":"Travel"}]}}\n'
+    else
+        output = '{"type":"lpa","payload":{"code":0,"message":"success","data":null}}\n'
+    end
+    return { read = function() return output end, close = function() return true end }
+end
+local rb_calls = 0
+esim.reload_flow = function()
+    rb_calls = rb_calls + 1
+    if rb_calls == 1 then
+        return { ready = true, cpin = "READY", prefix = iccid2:sub(1, 6), last4 = iccid2:sub(-4),
+            qnw = '"FDD LTE","46011","LTE BAND 3",1650', label = "注册被拒", stat = 3,
+            ceer = "EMM attach failed", elapsed = 60 }
+    end
+    return { ready = true, cpin = "READY", prefix = iccid1:sub(1, 6), last4 = iccid1:sub(-4),
+        qnw = '"FDD LTE","46001","LTE BAND 3",1650', label = "已注册（漫游）", stat = 5,
+        ceer = "", elapsed = 55 }
+end
+exec_calls = {}
+worker_case("test-switch-rollback", "", false, "switch", "0", iccid2)
+assert(tg_calls.sent_text:find("切换未完成", 1, true), "denied registration must be reported as a failed switch")
+assert(tg_calls.sent_text:find("EMM attach failed", 1, true), "failure must include the CEER reason")
+assert(tg_calls.sent_text:find("已自动切回", 1, true) and tg_calls.sent_text:find("Home", 1, true),
+    "denied registration must roll back to the previously enabled profile")
+assert(rb_calls == 2, "rollback must verify the previous profile with a second reload_flow")
+assert(#exec_calls >= 1 and exec_calls[#exec_calls]:find("tohsakawrt-modem-heal", 1, true),
+    "rollback path must also trigger modem-heal")
+print("PASS: denied target (CEREG 3) rolls back to the previous profile and reports CEER")
 esim.reload_flow = original_reload_flow
+io.popen = saved_popen
 
 io.popen = original_popen

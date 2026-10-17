@@ -289,7 +289,11 @@ if [ -z "$INDEX" ]; then
     esac
     say "restart timestamp: ${LAST:-<absent>}; now: ${NOW:-<unknown>}; eligible: $RESTART"
     if [ "$RESTART" -eq 1 ]; then
-        if [ "$UPLINK_IS_MODEM" -eq 1 ]; then
+        if esim_job_active; then
+            # 切换任务正在 CFUN 复位：此刻重启 MM 会让模组重新枚举，
+            # 切换任务反而读不到卡（QSIMSTAT 1,0）。任务结束后的 heal 会接手。
+            say "skipping ModemManager restart: eSIM job is running"
+        elif [ "$UPLINK_IS_MODEM" -eq 1 ]; then
             logger -t tohsakawrt-modem-heal "skipped ModemManager restart: $MODEM_NET is the active uplink"
         else
             "$MM_INIT" restart >/dev/null 2>&1
