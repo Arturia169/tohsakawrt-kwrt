@@ -5,11 +5,14 @@ AT_PORT="${TWR_HEAL_AT_PORT:-$(uci -q get modem.modem0.at_port || echo '/dev/tty
 [ -e "$AT_PORT" ] || [ "${TWR_HEAL_AT_PORT_FAKE:-0}" = "1" ] || AT_PORT="/dev/ttyUSB2"
 AT_SCRIPT="${TWR_HEAL_AT_SCRIPT:-/usr/share/modem/modem_at.sh}"
 NET_CLASS_DIR="${TWR_HEAL_NET_CLASS_DIR:-/sys/class/net}"
-MM_INIT="/etc/init.d/modemmanager"
+MM_INIT="${TWR_MM_INIT:-/etc/init.d/modemmanager}"
 UCI_NS="sms_manager"
 UCI_SEC="sms_manager.@sms_manager[0]"
 STATE_DIR="${TWR_STATE_DIR:-/tmp}"
+# eSIM 后台任务的状态目录（与 esim.lua 的 STATE 保持一致；测试可覆盖）
+ESIM_STATE_DIR="${TWR_ESIM_STATE_DIR:-/tmp/tohsakawrt/state}"
 STATE_FILE="$STATE_DIR/tohsakawrt-modem-heal.restart"
+LOCKED_STATE_FILE="$STATE_DIR/tohsakawrt-modem-heal.locked-restart"
 LOCK_DIR="$STATE_DIR/tohsakawrt-modem-heal.lock"
 WAIT_STEPS=30
 WAIT_INTERVAL=1
@@ -175,6 +178,19 @@ get_index() {
     '
 }
 
+# eSIM 后台任务是否还在跑：有 .spec 但还没有 .txt 的，视为未完成。
+# 只认最近 10 分钟内的 .spec，避免 worker 崩溃留下的旧文件永久挡住自愈。
+esim_job_active() {
+    local spec txt
+    for spec in "$ESIM_STATE_DIR"/esim-job-*.spec; do
+        [ -e "$spec" ] || continue
+        txt="${spec%.spec}.txt"
+        [ -e "$txt" ] && continue
+        [ -n "$(find "$spec" -mmin -10 2>/dev/null)" ] && return 0
+    done
+    return 1
+}
+
 # AT 端口漂移纠正。
 # 根因（固件行为，已定位到代码）：USB 重新枚举时 hotplug 走 modem_util.sh 的 remove 分支，
 # 因 modem.@global[0].manual_configuration=0 而调用 m_del_modem_config 删除整个 modem0 段；
@@ -316,6 +332,54 @@ MODEM_INFO="$(twr_timeout 15 mmcli -m "$INDEX" 2>/dev/null)"
 reconcile_at_port
 MODEM_STATE="$(printf '%s\n' "$MODEM_INFO" | sed -n 's/.*state:[[:space:]]*\([[:alpha:]_][[:alpha:]_]*\)[[:space:]]*$/\1/p' | head -n 1)"
 say "mmcli -m $INDEX state: ${MODEM_STATE:-<unknown>}"
+
+# ModemManager 在 eSIM 切换 / CFUN=1,1 射频复位期间会把 modem 置为 locked。
+# 此时 mmcli --enable 直接报 "Cannot enable modem: device locked"，
+# 唯一的恢复办法是重启 ModemManager（2026-10-17 实机复现：切换后短信面板
+# 读不到短信、信号为空，mmcli 状态 locked；重启 + enable 后立即恢复）。
+#
+# 两种不能动的情况：
+#   ① eSIM 任务还在跑 —— 它正在做 CFUN 复位，此刻重启 MM 只会再锁一次；
+#      任务结束后下一轮巡检会恢复（esim.lua 也会在任务结束时触发一次 heal）。
+#   ② 模组正在承载主出口 —— 与下面 disabled 分支同样的策略，不在主链路上动 MM。
+if [ "$MODEM_STATE" = "locked" ]; then
+    if esim_job_active; then
+        say "locked: eSIM job is running, defer ModemManager recovery"
+    elif [ "$UPLINK_IS_MODEM" -eq 1 ]; then
+        say "locked: skipping ModemManager restart: $MODEM_NET is the active uplink"
+    else
+        NOW_LOCKED="$(date +%s 2>/dev/null)"
+        LAST_LOCKED="$(cat "$LOCKED_STATE_FILE" 2>/dev/null)"
+        RECOVER=0
+        case "$NOW_LOCKED:$LAST_LOCKED" in
+            *[!0-9:]*|:*|*:) RECOVER=1 ;;
+            *) [ "$((NOW_LOCKED - LAST_LOCKED))" -ge "$RESTART_MIN_INTERVAL" ] && RECOVER=1 ;;
+        esac
+        say "locked restart timestamp: ${LAST_LOCKED:-<absent>}; now: ${NOW_LOCKED:-<unknown>}; eligible: $RECOVER"
+        if [ "$RECOVER" -eq 1 ]; then
+            "$MM_INIT" restart >/dev/null 2>&1
+            printf '%s\n' "$NOW_LOCKED" > "$LOCKED_STATE_FILE" 2>/dev/null
+            ACTIONS="${ACTIONS:+$ACTIONS; }restarted ModemManager (state=locked)"
+            STEP=1
+            while [ "$STEP" -le "$WAIT_STEPS" ]; do
+                sleep "$WAIT_INTERVAL"
+                INDEX="$(get_index)"
+                [ -n "$INDEX" ] && break
+                STEP=$((STEP + 1))
+            done
+            if [ -n "$INDEX" ]; then
+                CANONICAL="/org/freedesktop/ModemManager1/Modem/$INDEX"
+                MODEM_INFO="$(twr_timeout 15 mmcli -m "$INDEX" 2>/dev/null)"
+                reconcile_at_port
+                MODEM_STATE="$(printf '%s\n' "$MODEM_INFO" | sed -n 's/.*state:[[:space:]]*\([[:alpha:]_][[:alpha:]_]*\)[[:space:]]*$/\1/p' | head -n 1)"
+                say "mmcli -m $INDEX state after restart: ${MODEM_STATE:-<unknown>}"
+            else
+                logger -t tohsakawrt-modem-heal "No modem index found after ModemManager restart (state=locked)"
+            fi
+        fi
+    fi
+fi
+
 if [ "$MODEM_STATE" = "disabled" ]; then
     if [ "$UPLINK_IS_MODEM" -eq 1 ]; then
         say "skipping enable: $MODEM_NET is the active uplink"

@@ -48,13 +48,22 @@ cat > "$BIN/ping" <<'EOF'
 printf 'ping %s\n' "$*" >> "$CALLS"
 exit 1
 EOF
+MM_STATE_FILE="$TMP/mm-state"
+export MM_STATE_FILE
 cat > "$BIN/mmcli" <<'EOF'
 #!/bin/sh
 printf 'mmcli %s\n' "$*" >> "$CALLS"
 case "$*" in
     -L) echo '/org/freedesktop/ModemManager1/Modem/0 [Quectel] RM500Q' ;;
-    '-m 0') echo 'state: connected' ;;
+    '-m 0') echo "state: $(cat "$MM_STATE_FILE" 2>/dev/null || echo connected)" ;;
+    '-m 0 --enable') echo success ;;
 esac
+EOF
+# ModemManager 重启桩：重启后状态从 locked 变成 disabled，再由脚本 enable。
+cat > "$BIN/mm-init" <<'EOF'
+#!/bin/sh
+printf 'mm-init %s\n' "$*" >> "$CALLS"
+[ "$1" = "restart" ] && printf 'disabled\n' > "$MM_STATE_FILE"
 EOF
 for cmd in ifup logger sleep send_tg; do
     cat > "$BIN/$cmd" <<EOF
@@ -107,9 +116,14 @@ chmod +x "$BIN"/*
 export PATH="$BIN:$PATH"
 
 run_once() {
+    # 每一轮先把 ModemManager 的初始状态写进桩文件（默认 connected）。
+    # TEST_ESIM_STATE_DIR 让脚本看到一个独立的 eSIM 任务目录，避免碰到真实任务。
+    printf '%s\n' "${TEST_MM_STATE:-connected}" > "$MM_STATE_FILE"
     TEST_ACTIVE_DEV="$1" TEST_NOW="$2" TWR_STATE_DIR="$3" \
     TEST_ICCID="${4-12345}" TEST_HEAL="${5-1}" \
     TEST_NODATA="${6-89852 89372}" TEST_AT_FAIL="${7-0}" TEST_CCID="${8-}" \
+    TWR_ESIM_STATE_DIR="${TEST_ESIM_STATE_DIR:-$TMP/esim-idle}" \
+    TWR_MM_INIT="$BIN/mm-init" \
     TWR_HEAL_NET_CLASS_DIR="$TMP/net" TWR_HEAL_AT_PORT="$AT_PORT" \
     TWR_HEAL_AT_SCRIPT="$AT_SCRIPT" TWR_HEAL_AT_PORT_FAKE=1 \
     "$SCRIPT" --verbose >> "$CALLS" 2>&1
@@ -202,6 +216,27 @@ run_once eth0 10600 "$ALERT_DIR" 12345
 check '热备 Stage 3 两次触发间隔小于 1800 秒只告警一次' "$( [ "$(grep -Fc 'send_tg ' "$CALLS")" -eq 1 ] && echo 1 || echo 0)"
 run_once eth0 11901 "$ALERT_DIR" 12345
 check '热备 Stage 3 超过 1800 秒后允许第二次告警' "$( [ "$(grep -Fc 'send_tg ' "$CALLS")" -eq 2 ] && echo 1 || echo 0)"
+
+: > "$CALLS"
+mkdir -p "$TMP/esim-idle" "$TMP/state-locked" "$TMP/state-locked-job" \
+         "$TMP/state-locked-uplink" "$TMP/state-locked-throttle" "$TMP/esim-active"
+: > "$TMP/esim-active/esim-job-1792000000000000.spec"
+
+TEST_MM_STATE=locked run_once eth0 12000 "$TMP/state-locked"
+check 'locked 状态会重启 ModemManager 并 enable' "$(grep -q '^mm-init restart$' "$CALLS" && grep -q -- '-m 0 --enable' "$CALLS" && echo 1 || echo 0)"
+
+: > "$CALLS"
+TEST_MM_STATE=locked TEST_ESIM_STATE_DIR="$TMP/esim-active" run_once eth0 12100 "$TMP/state-locked-job"
+check 'eSIM 任务进行中不重启 ModemManager（避免复位窗口里再锁一次）' "$( ! grep -q '^mm-init restart$' "$CALLS" && grep -q 'locked: eSIM job is running, defer ModemManager recovery' "$CALLS" && echo 1 || echo 0)"
+
+: > "$CALLS"
+TEST_MM_STATE=locked run_once usb0 12200 "$TMP/state-locked-uplink"
+check '模组承载主出口时 locked 不重启 ModemManager' "$( ! grep -q '^mm-init restart$' "$CALLS" && grep -q 'locked: skipping ModemManager restart' "$CALLS" && echo 1 || echo 0)"
+
+: > "$CALLS"
+TEST_MM_STATE=locked run_once eth0 13000 "$TMP/state-locked-throttle"
+TEST_MM_STATE=locked run_once eth0 13060 "$TMP/state-locked-throttle"
+check 'locked 重启在 120 秒节流窗口内只做一次' "$( [ "$(grep -c '^mm-init restart$' "$CALLS")" -eq 1 ] && echo 1 || echo 0)"
 
 if [ "${MUTATION_CHILD:-0}" != 1 ]; then
     mutate_source() {

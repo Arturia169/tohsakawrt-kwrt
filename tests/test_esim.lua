@@ -10,9 +10,14 @@ if not has_cjson then
     json = mod
 end
 package.preload["luci.jsonc"] = function() return { parse = json.decode or json.parse } end
+local exec_calls = {}
 package.preload["tohsakawrt.core"] = function()
     return {
         init = function() end,
+        -- esim.lua 的 lpac 走 core.bounded（硬超时）；缺这个桩在设备/CI 上会直接报
+        -- "attempt to call field 'bounded' (a nil value)"，整份用例跑不完。
+        bounded = function(cmd) return cmd end,
+        exec = function(cmd) exec_calls[#exec_calls + 1] = cmd end,
         get_uci = function(config, section, option, default)
             if config == "tohsakawrt-tgbot" and section == "numbers" and option == "n_89860012345678901234" then
                 return "+8613800138000"
@@ -113,10 +118,10 @@ io.popen = function()
         close = function() return true end
     }
 end
-local function worker_case(id, message_id, fail_send, kind, main_uplink)
+local function worker_case(id, message_id, fail_send, kind, main_uplink, target)
     tg_calls.sends, tg_calls.edits, tg_calls.fail_send = 0, 0, fail_send
     local base = "/tmp/tohsakawrt/state/esim-job-" .. id
-    write_file(base .. ".spec", (kind or "download") .. "\nAC\n测试号码\n" .. (main_uplink or "0") .. "\n\n" .. message_id .. "\n")
+    write_file(base .. ".spec", (kind or "download") .. "\n" .. (target or "AC") .. "\n测试号码\n" .. (main_uplink or "0") .. "\n\n" .. message_id .. "\n")
     esim.worker(id)
     return base .. ".txt"
 end
@@ -149,6 +154,23 @@ worker_case("test-reload-secondary-uplink", "", false, "reload", "0")
 assert(not tg_calls.sent_text:find("⚠️ 模组当前是主出口，期间会断网约 2 分钟", 1, true),
     "reload result card must not warn when the modem is not the main uplink")
 print("PASS: reload result omits the warning when main_uplink is 0")
+
+-- 切换分支此前完全没有用例覆盖：这里把"启用成功 + ICCID 复核通过 + 任务结束触发
+-- modem-heal"整条链路跑一遍。触发 heal 是为了修 ModemManager 在 CFUN 复位后
+-- 卡在 locked（短信面板读不到短信、信号为空）。
+exec_calls = {}
+esim.reload_flow = function()
+    return { ready = true, cpin = "READY", prefix = iccid2:sub(1, 6), last4 = iccid2:sub(-4),
+        qnw = '"FDD LTE","46011","LTE BAND 3",1650', label = "已注册（漫游）", elapsed = 55 }
+end
+worker_case("test-switch-heal", "", false, "switch", "0", iccid2)
+assert(tg_calls.sends == 1 and tg_calls.edits == 0, "switch worker must push exactly one result and never edit an empty message_id")
+assert(tg_calls.sent_text:find("已切到", 1, true), "switch result must report a verified success")
+assert(tg_calls.sent_text:find(iccid2:sub(1, 6) .. "…" .. iccid2:sub(-4), 1, true),
+    "switch result must show the verified ICCID mask")
+assert(#exec_calls >= 1 and exec_calls[#exec_calls]:find("tohsakawrt-modem-heal", 1, true),
+    "switch worker must trigger tohsakawrt-modem-heal after the job (ModemManager locked recovery)")
+print("PASS: switch worker verifies ICCID, pushes success and triggers modem-heal")
 esim.reload_flow = original_reload_flow
 
 io.popen = original_popen

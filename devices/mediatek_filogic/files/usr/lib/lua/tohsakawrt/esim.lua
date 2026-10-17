@@ -362,6 +362,14 @@ function M.worker(id)
     end
     write(STATE .. "/esim-job-" .. id .. ".txt", output)
     pcall(push_result, output, message_id, kind)
+
+    -- 切换/重载会做 AT+CFUN=1,1 射频复位，ModemManager 常在复位窗口里进入 locked；
+    -- 之后 LuCI 短信面板读不到短信、信号显示为空（2026-10-17 实机复现）。
+    -- 自愈实现只有 tohsakawrt-modem-heal，这里只负责在任务结束后触发一次它
+    --（脚本自带锁与幂等；此时 .txt 已落盘，不会被它判成"任务仍在跑"）。
+    if kind == "switch" or kind == "reload" then
+        pcall(core.exec, "/usr/bin/tohsakawrt-modem-heal >/dev/null 2>&1 &")
+    end
 end
 
 function M.reload_text(r) return reload_card(r) end
