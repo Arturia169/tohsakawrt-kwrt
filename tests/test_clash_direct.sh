@@ -55,7 +55,9 @@ check() {
 # ---------- add ----------
 reset_files
 OUT="$("$SCRIPT" add blog.example.com 2>&1)"
-check 'add 返回 ADDED' "$([ "$OUT" = "ADDED" ] && echo 1 || echo 0)"
+# close_conns 会在 ADDED/ALREADY/DELETED 之后追加一行 CLOSED:<n>；
+# 返回标记看第一行，不能再用整段输出做等值比较。
+check 'add 返回 ADDED' "$([ "$(printf '%s\n' "$OUT" | head -n1)" = "ADDED" ] && echo 1 || echo 0)"
 check '模块文件写进了标记段内' \
     "$(awk '/TG_DIRECT_RULES_START/{f=1} f&&/blog\.example\.com/{found=1} /TG_DIRECT_RULES_END/{f=0} END{print (found?"1":"0")}' "$TWR_CLASH_MODULE" | grep -q 1 && echo 1 || echo 0)"
 check '运行配置插在 rules: 之后（优先级最高）' \
@@ -66,7 +68,7 @@ check '触发了热重载（PUT /configs 且指向运行配置）' \
 # ---------- 幂等 ----------
 : > "$CALLS"
 OUT2="$("$SCRIPT" add blog.example.com 2>&1)"
-check '重复添加返回 ALREADY' "$([ "$OUT2" = "ALREADY" ] && echo 1 || echo 0)"
+check '重复添加返回 ALREADY' "$([ "$(printf '%s\n' "$OUT2" | head -n1)" = "ALREADY" ] && echo 1 || echo 0)"
 CNT="$(grep -c 'DOMAIN-SUFFIX,blog.example.com' "$TWR_CLASH_MODULE")"
 check '重复添加不产生重复条目' "$([ "$CNT" -eq 1 ] && echo 1 || echo 0)"
 
@@ -86,7 +88,7 @@ check 'list 列出现有直连域名' \
 # ---------- del ----------
 : > "$CALLS"
 OUT5="$("$SCRIPT" del blog.example.com 2>&1)"
-check 'del 返回 DELETED' "$([ "$OUT5" = "DELETED" ] && echo 1 || echo 0)"
+check 'del 返回 DELETED' "$([ "$(printf '%s\n' "$OUT5" | head -n1)" = "DELETED" ] && echo 1 || echo 0)"
 check 'del 从两个文件里都移除' \
     "$(grep -q 'blog.example.com' "$TWR_CLASH_MODULE" && echo 0 || (grep -q 'blog.example.com' "$TWR_CLASH_RUNTIME" && echo 0 || echo 1))"
 check 'del 也触发了热重载' "$(grep -q 'X PUT' "$CALLS" && echo 1 || echo 0)"
