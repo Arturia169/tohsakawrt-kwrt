@@ -383,8 +383,17 @@ function M.sms_poll_new()
 
     local function sms_sig(sms)
         if not sms then return "" end
-        local body = tostring(sms.content or ""):gsub("[\r\n]", " "):sub(1, 80)
-        return string.format("%s|%s|%s", tostring(sms.sender), tostring(sms.timestamp), body)
+        local content = tostring(sms.content or "")
+        -- 不要直接用正文做签名：core.get_state 会 trim 首尾空白，而短信正文可能以
+        -- 空格/换行结尾（#SIMWorld 实测结尾两个空格）。那样写进 state 的签名会被
+        -- 截短，读回来永远不等于新算的签名，兜底分支就会每 12 秒把同一条短信重推。
+        -- 改成"长度 + 滚动哈希"，末尾是数字，trim 不会改变它。
+        local h = 0
+        for i = 1, #content do
+            h = (h * 131 + content:byte(i)) % 2147483647
+        end
+        return string.format("S:%s|T:%s|L:%d|H:%d",
+            tostring(sms.sender), tostring(sms.timestamp), #content, h)
     end
 
     local max_index, newest, max_ts = -1, nil, last_ts

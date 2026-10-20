@@ -6,7 +6,13 @@ local state_writes
 package.preload["tohsakawrt.core"] = function()
     return {
         get_uci = function(_, _, _, default) return default end,
-        get_state = function(key, default) return states[key] or default end,
+        -- 必须和 core.get_state 一样 trim：签名/正文以空格结尾时，写进去的签名
+        -- 读回来会被截短，这正是"每 12 秒重复推送同一条短信"的根因。
+        get_state = function(key, default)
+            local v = states[key]
+            if not v or v == "" then return default end
+            return v:match("^%s*(.-)%s*$")
+        end,
         set_state = function(key, value)
             states[key] = value
             state_writes[#state_writes + 1] = { key = key, value = value }
@@ -31,6 +37,11 @@ package.preload["luci.jsonc"] = function()
                 return { msg = {
                     { index = 6, sender = "TBC SMS", timestamp = "10/17/26 19:25:47",
                         content = "Sms Code: 3954" }
+                } }
+            elseif raw == "SPACE_SMS" then
+                return { msg = {
+                    { index = 7, sender = "SPACE", timestamp = "10/17/26 20:00:00",
+                        content = "hello  " }
                 } }
             end
             error("invalid JSON")
@@ -103,5 +114,25 @@ reset_case("TBC_SMS", {
 local again = modem.sms_poll_new()
 assert(#again == 0, "an already seen SMS must not be pushed twice")
 assert(#state_writes == 0, "a no-op poll must not rewrite cursors")
+
+-- 关键回归：短信正文以空格结尾（#SIMWorld 实测结尾两个空格）。core.get_state 会 trim
+-- 首尾空白，如果签名直接包含正文，写进去的签名会被截短，读回来永远不等于新签名，
+-- 兜底分支就会每 12 秒把同一条短信重推一次。签名改成"长度+哈希"后必须只推一次。
+reset_case("SPACE_SMS", {
+    sms_last_used = "5",
+    sms_last_ts = "20261017223211",
+    sms_last_index = "6",
+    sms_last_sig = "old"
+})
+local spaced = modem.sms_poll_new()
+assert(#spaced == 1, "a trailing-space SMS must be delivered once")
+reset_case("SPACE_SMS", {
+    sms_last_used = "5",
+    sms_last_ts = "20261017223211",
+    sms_last_index = "7",
+    sms_last_sig = states.sms_last_sig
+})
+local repeated = modem.sms_poll_new()
+assert(#repeated == 0, "a trailing-space SMS must not be pushed again every poll")
 
 print("PASS: SMS poll detects new storage indexes across timezone/count changes, preserves cursors on failure, and never re-pushes")
