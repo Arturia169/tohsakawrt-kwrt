@@ -1,0 +1,160 @@
+name: Pack Mihomo Core
+
+# 上游 mihomo alpha 内核（linux-arm64）→ UPX 压缩 → 发布到 core-latest
+# 路由端用 tohsakawrt-core-update 拉取，省 overlay 空间（57MB → ~17MB）
+
+on:
+  schedule:
+    # 每天 04:17（Asia/Shanghai）
+    - cron: '17 20 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略上游提交是否变化，强制重新压缩'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pack-mihomo-core
+  cancel-in-progress: true
+
+env:
+  TZ: Asia/Shanghai
+  UPX_VERSION: '5.2.1'
+  CORE_ASSET: clash_meta-linux-arm64-upx
+  RELEASE_TAG: core-latest
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 解析上游最新 alpha 内核
+        id: upstream
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/release.json \
+            https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/Prerelease-Alpha
+          asset=$(jq -r '[.assets[].name | select(test("^mihomo-linux-arm64-alpha-[0-9a-f]{7,40}\\.gz$"))][0] // ""' /tmp/release.json)
+          if [ -z "$asset" ]; then
+            echo "::error::上游没有找到 linux-arm64 alpha 内核"
+            exit 1
+          fi
+          url=$(jq -r --arg n "$asset" '.assets[] | select(.name == $n) | .browser_download_url' /tmp/release.json)
+          digest=$(jq -r --arg n "$asset" '.assets[] | select(.name == $n) | (.digest // "")' /tmp/release.json)
+          commit=$(printf '%s' "$asset" | sed -E 's/^mihomo-linux-arm64-alpha-([0-9a-f]+)\.gz$/\1/')
+          {
+            echo "asset=$asset"
+            echo "url=$url"
+            echo "digest=$digest"
+            echo "commit=$commit"
+          } >> "$GITHUB_OUTPUT"
+          echo "上游内核: $asset"
+
+      - name: 读取已发布版本
+        id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/cur && mkdir -p /tmp/cur
+          commit=""
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern version.txt --dir /tmp/cur --clobber >/dev/null 2>&1 || true
+            if [ -f /tmp/cur/version.txt ]; then
+              commit=$(sed -n 's/^mihomo_commit=//p' /tmp/cur/version.txt | head -n1)
+            fi
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "已发布: ${commit:-无}"
+
+      - name: 判断是否需要重建
+        id: gate
+        run: |
+          build=yes
+          if [ "${{ inputs.force }}" != "true" ] \
+             && [ -n "${{ steps.current.outputs.commit }}" ] \
+             && [ "${{ steps.current.outputs.commit }}" = "${{ steps.upstream.outputs.commit }}" ]; then
+            build=no
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "build=$build"
+
+      - name: 下载并校验上游内核
+        if: steps.gate.outputs.build == 'yes'
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 -o /tmp/core.gz "${{ steps.upstream.outputs.url }}"
+          digest="${{ steps.upstream.outputs.digest }}"
+          if [ -n "$digest" ]; then
+            printf '%s  %s\n' "${digest#sha256:}" /tmp/core.gz | sha256sum -c -
+          else
+            echo "::warning::上游未提供 digest，跳过校验"
+          fi
+          gzip -dc /tmp/core.gz > "$CORE_ASSET"
+          chmod +x "$CORE_ASSET"
+          file "$CORE_ASSET" | grep -q "aarch64" || { echo "::error::不是 arm64 内核"; exit 1; }
+          ls -l "$CORE_ASSET"
+
+      - name: 安装 UPX
+        if: steps.gate.outputs.build == 'yes'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/upx.tar.xz \
+            "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz"
+          mkdir -p /tmp/upx
+          tar -xJf /tmp/upx.tar.xz -C /tmp/upx --strip-components=1
+          /tmp/upx/upx --version | head -n1
+
+      - name: UPX 压缩并自检
+        if: steps.gate.outputs.build == 'yes'
+        run: |
+          set -euo pipefail
+          before=$(stat -c%s "$CORE_ASSET")
+          /tmp/upx/upx -9 -q "$CORE_ASSET"
+          after=$(stat -c%s "$CORE_ASSET")
+          /tmp/upx/upx -t "$CORE_ASSET" >/dev/null
+          echo "压缩: $before 字节 -> $after 字节"
+          test "$after" -lt "$before"
+
+      - name: 准备 qemu（arm64 冒烟测试）
+        if: steps.gate.outputs.build == 'yes'
+        continue-on-error: true
+        uses: docker/setup-qemu-action@v3
+
+      - name: 内核版本自检（qemu，失败不阻断）
+        if: steps.gate.outputs.build == 'yes'
+        continue-on-error: true
+        run: ./"$CORE_ASSET" -v
+
+      - name: 生成版本与校验文件
+        if: steps.gate.outputs.build == 'yes'
+        run: |
+          set -euo pipefail
+          sha256sum "$CORE_ASSET" > sha256sums.txt
+          {
+            echo "mihomo_commit=${{ steps.upstream.outputs.commit }}"
+            echo "upstream_asset=${{ steps.upstream.outputs.asset }}"
+            echo "upx_version=${UPX_VERSION}"
+            echo "packed_size=$(stat -c%s "$CORE_ASSET")"
+            echo "built_at=$(date -Iseconds)"
+          } > version.txt
+          cat version.txt sha256sums.txt
+
+      - name: 发布到 ${{ env.RELEASE_TAG }}
+        if: steps.gate.outputs.build == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "Mihomo 内核（UPX 压缩）" \
+              --notes "自动压缩的 mihomo linux-arm64 内核，供 TR3000 直接下载使用。"
+          fi
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$CORE_ASSET" sha256sums.txt version.txt

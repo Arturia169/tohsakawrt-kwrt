@@ -1,0 +1,123 @@
+#!/bin/sh
+# TohsakaWrt 内核更新：从 GitHub Release 拉取 UPX 压缩的 mihomo 内核并安装
+# 用法: tohsakawrt-core-update [-c|--check] [-f|--force]
+#   -c  只检查是否有新版本（有更新时退出码 1）
+#   -f  版本相同也强制重装
+# 环境变量: CORE_BASE_URL / CORE_ASSET / CORE_PATH / OPENCLASH_INIT
+
+BASE="${CORE_BASE_URL:-https://github.com/Arturia169/tohsakawrt-kwrt/releases/download/core-latest}"
+ASSET="${CORE_ASSET:-clash_meta-linux-arm64-upx}"
+CORE="${CORE_PATH:-/etc/openclash/core/clash_meta}"
+INIT="${OPENCLASH_INIT:-/etc/init.d/openclash}"
+TMP="${TMPDIR:-/tmp}/tohsakawrt-core"
+
+FORCE=0
+CHECK=0
+for a in "$@"; do
+    case "$a" in
+        -f|--force) FORCE=1 ;;
+        -c|--check) CHECK=1 ;;
+        *) echo "用法: $0 [-c|--check] [-f|--force]" >&2; exit 2 ;;
+    esac
+done
+
+LOCK="/tmp/tohsakawrt-core-update.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "另一个更新正在进行，跳过"
+    exit 0
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT INT TERM
+
+if [ "$CHECK" -eq 0 ] && command -v uci >/dev/null 2>&1; then
+    if [ "$(uci -q get openclash.@openclash[0].enable 2>/dev/null)" != "1" ]; then
+        echo "OpenClash 未启用，跳过"
+        exit 0
+    fi
+fi
+
+mkdir -p "$TMP" || exit 1
+
+cur_ver=$("$CORE" -v 2>/dev/null | sed -n 's/.*alpha-\([0-9a-f]\{7,\}\).*/\1/p' | head -n1)
+
+if ! curl -fsSL -m 20 -o "$TMP/version.txt" "$BASE/version.txt"; then
+    echo "拉取 version.txt 失败" >&2
+    exit 1
+fi
+new_ver=$(sed -n 's/^mihomo_commit=//p' "$TMP/version.txt" | head -n1)
+if [ -z "$new_ver" ]; then
+    echo "version.txt 缺少 mihomo_commit" >&2
+    exit 1
+fi
+
+if [ "$cur_ver" = "$new_ver" ] && [ "$FORCE" -eq 0 ]; then
+    echo "已是最新: alpha-$cur_ver"
+    exit 0
+fi
+
+if [ "$CHECK" -eq 1 ]; then
+    echo "可更新: ${cur_ver:-未知} -> $new_ver"
+    exit 1
+fi
+
+echo "更新: ${cur_ver:-未知} -> $new_ver"
+if ! curl -fsSL -m 180 -o "$TMP/$ASSET" "$BASE/$ASSET"; then
+    echo "下载内核失败" >&2
+    exit 1
+fi
+if ! curl -fsSL -m 20 -o "$TMP/sha256sums.txt" "$BASE/sha256sums.txt"; then
+    echo "下载校验文件失败" >&2
+    exit 1
+fi
+if ! ( cd "$TMP" && sha256sum -c sha256sums.txt >/dev/null 2>&1 ); then
+    echo "sha256 校验失败" >&2
+    exit 1
+fi
+
+chmod 755 "$TMP/$ASSET"
+ver_line=$("$TMP/$ASSET" -v 2>/dev/null | head -n1)
+case "$ver_line" in
+    *"alpha-$new_ver"*) : ;;
+    *) echo "新内核自检失败: ${ver_line:-无法执行}" >&2; exit 1 ;;
+esac
+
+bak="$TMP/clash_meta.bak-$(date +%Y%m%d-%H%M%S)"
+if ! cp -a "$CORE" "$bak" 2>/dev/null; then
+    echo "备份当前内核失败" >&2
+    exit 1
+fi
+
+"$INIT" stop >/dev/null 2>&1
+sleep 2
+
+if ! cp "$TMP/$ASSET" "$CORE"; then
+    echo "写入内核失败，回滚" >&2
+    cp -f "$bak" "$CORE"
+    chmod 755 "$CORE"
+    "$INIT" start >/dev/null 2>&1
+    exit 1
+fi
+chmod 755 "$CORE"
+sync
+
+"$INIT" start >/dev/null 2>&1
+
+got=""
+i=0
+while [ "$i" -lt 30 ]; do
+    sleep 2
+    got=$(curl -s -m 3 http://127.0.0.1:9090/version 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+    [ "$got" = "alpha-$new_ver" ] && break
+    i=$((i + 1))
+done
+
+if [ "$got" != "alpha-$new_ver" ]; then
+    echo "启动校验失败（${got:-无响应}），回滚" >&2
+    "$INIT" stop >/dev/null 2>&1
+    cp -f "$bak" "$CORE"
+    chmod 755 "$CORE"
+    sync
+    "$INIT" start >/dev/null 2>&1
+    exit 1
+fi
+
+echo "完成: alpha-$new_ver"

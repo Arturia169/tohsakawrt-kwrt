@@ -1,6 +1,6 @@
 #!/bin/sh
 # TohsakaWrt 每日 Bing 登录页壁纸拉取脚本
-# 每天定时拉取 Bing 每日高清壁纸存入本地目录，供 LuCI Argon 主题本地加载，
+# 每天定时拉取 Bing 每日 1080p 壁纸存入本地目录，供 LuCI Argon 主题本地加载，
 # 确保登录页加载零外网依赖，同时保持壁纸每日更新。
 
 BG_DIR="${BG_DIR:-/www/luci-static/argon/background}"
@@ -31,7 +31,7 @@ for arg in "$@"; do
 done
 
 # Step 1: 解析今日壁纸 URL
-raw_url="$(wget -T8 -qO- "$API_URL" 2>/dev/null | jsonfilter -qe '@.images[0].url' 2>/dev/null | sed 's/1920x1080/UHD/g')"
+raw_url="$(wget -T8 -qO- "$API_URL" 2>/dev/null | jsonfilter -qe '@.images[0].url' 2>/dev/null)"
 
 url=""
 if [ -n "$raw_url" ]; then
@@ -53,7 +53,7 @@ if [ "$force" -eq 0 ] && [ -f "$STATE_FILE" ] && [ -f "$BG_DIR/$IMG_NAME" ]; the
     saved_url="$(cat "$STATE_FILE" 2>/dev/null)"
     if [ "$saved_url" = "$url" ]; then
         img_sz=$(($(wc -c < "$BG_DIR/$IMG_NAME" 2>/dev/null || echo 0)))
-        if [ "$img_sz" -gt 100000 ]; then
+        if [ "$img_sz" -gt 50000 ]; then
             mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
             printf '%s\n' "$url" > "$STATE_FILE"
             ensure_local_wallpaper
@@ -77,11 +77,11 @@ fi
 
 tmp_sz=$(($(wc -c < "$tmp" 2>/dev/null || echo 0)))
 
-# 校验大小（> 200000 字节）及 JPEG 幻数 (ff d8 ff)
+# 校验大小（> 50000 字节）及 JPEG 幻数 (ff d8 ff)
 # 注意：本机 busybox 没有 od/xxd，只能用 cmp 对比前 3 字节
 magic_ref="/tmp/.tohsakawrt-jpgmagic"
 printf '\377\330\377' > "$magic_ref"
-if [ "$tmp_sz" -le 200000 ] || ! dd if="$tmp" bs=1 count=3 2>/dev/null | cmp -s - "$magic_ref"; then
+if [ "$tmp_sz" -le 50000 ] || ! dd if="$tmp" bs=1 count=3 2>/dev/null | cmp -s - "$magic_ref"; then
     rm -f "$tmp" "$magic_ref"
     logger -t tohsakawrt-wallpaper "failed: invalid image (size=$tmp_sz)" 2>/dev/null || true
     echo "failed: invalid image"

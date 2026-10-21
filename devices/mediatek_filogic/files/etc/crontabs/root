@@ -2,3 +2,4 @@
 * * * * * /usr/bin/tohsakawrt-watch >/dev/null 2>&1
 0 0 * * * /usr/bin/tohsakawrt-flowcard-daily >/dev/null 2>&1
 5 7 * * * /usr/bin/tohsakawrt-wallpaper >/dev/null 2>&1
+10 5 * * 0 /usr/bin/tohsakawrt-core-update >>/tmp/tohsakawrt-core-update.log 2>&1
