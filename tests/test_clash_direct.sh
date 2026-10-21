@@ -19,13 +19,27 @@ CALLS="$TMP/curl.log"; export CALLS
 export TWR_CLASH_MODULE="$TMP/module.yaml"
 export TWR_CLASH_RUNTIME="$TMP/runtime.yaml"
 export TWR_CLASH_API="http://127.0.0.1:9090"
+# 热重载已委托给 tohsakawrt-clash-reload：指向仓库里的脚本，并桩掉 init 防止真重启
+export TWR_CLASH_RELOAD_BIN="$(dirname "$SCRIPT")/tohsakawrt-clash-reload"
+export TWR_CLASH_INIT="$BIN/fake-init"
+export TWR_CLASH_RELOAD_LOG="$TMP/reload.log"
+export TWR_CLASH_RELOAD_LOCK="$TMP/reload.lock"
+export TWR_CLASH_RELOAD_TRIES=1
 
 # 桩件 curl：记录调用并回 204（模拟 Mihomo 热重载成功）
 cat > "$BIN/curl" <<'EOF'
 #!/bin/sh
 printf 'curl %s\n' "$*" >> "$CALLS"
-echo 204
+case "$*" in
+    */version*) echo '{"version":"test"}' ;;
+    *) echo 204 ;;
+esac
 EOF
+cat > "$BIN/fake-init" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+
 chmod +x "$BIN"/*
 export PATH="$BIN:$PATH"
 

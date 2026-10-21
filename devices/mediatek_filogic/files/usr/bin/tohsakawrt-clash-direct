@@ -21,6 +21,7 @@ set -u
 MODULE="${TWR_CLASH_MODULE:-/etc/openclash/config/config.yaml}"
 RUNTIME="${TWR_CLASH_RUNTIME:-/etc/openclash/config.yaml}"
 API="${TWR_CLASH_API:-http://127.0.0.1:9090}"
+RELOAD_BIN="${TWR_CLASH_RELOAD_BIN:-/usr/bin/tohsakawrt-clash-reload}"
 START="# === TG_DIRECT_RULES_START ==="
 END="# === TG_DIRECT_RULES_END ==="
 
@@ -69,13 +70,13 @@ del_runtime() {
 }
 
 reload() {
-    code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 -X PUT "$API/configs?force=false" \
-        -H 'Content-Type: application/json' \
-        --data "{\"path\":\"$RUNTIME\"}" 2>/dev/null)"
-    case "$code" in
-        200|204) return 0 ;;
-        *) echo "RELOAD_FAILED:$code"; return 1 ;;
-    esac
+    # 热重载只有一份实现：tohsakawrt-clash-reload（内核不退出，坏配置由它拦下）
+    # 这里只做「调用 + 把退出码翻成机器人认识的 RELOAD_FAILED:<code>」。
+    "$RELOAD_BIN" -q -c "$RUNTIME" >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    echo "RELOAD_FAILED:$rc"
+    return 1
 }
 
 # 断掉该域名现存的连接（热重载不会动它们）。只匹配 host 完全一致的连接，
