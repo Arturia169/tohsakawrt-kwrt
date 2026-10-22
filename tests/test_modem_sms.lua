@@ -43,6 +43,22 @@ package.preload["luci.jsonc"] = function()
                     { index = 7, sender = "SPACE", timestamp = "10/17/26 20:00:00",
                         content = "hello  " }
                 } }
+            elseif raw == "EMPTY_SMS" then
+                return { msg = {
+                    { index = 8, sender = "", timestamp = "", content = "" }
+                } }
+            elseif raw == "MULTI_PART1" then
+                return { msg = {
+                    { index = 9, sender = "Multi", timestamp = "10/23/26 03:00:00",
+                        reference = 1, part = 1, total = 2, content = "A" }
+                } }
+            elseif raw == "MULTI_BOTH" then
+                return { msg = {
+                    { index = 9, sender = "Multi", timestamp = "10/23/26 03:00:00",
+                        reference = 1, part = 1, total = 2, content = "A" },
+                    { index = 10, sender = "Multi", timestamp = "10/23/26 03:00:00",
+                        reference = 1, part = 2, total = 2, content = "B" }
+                } }
             end
             error("invalid JSON")
         end
@@ -135,4 +151,39 @@ reset_case("SPACE_SMS", {
 local repeated = modem.sms_poll_new()
 assert(#repeated == 0, "a trailing-space SMS must not be pushed again every poll")
 
-print("PASS: SMS poll detects new storage indexes across timezone/count changes, preserves cursors on failure, and never re-pushes")
+-- 空短信（状态报告/静默短信/空 PDU）：不推送，但索引必须推进，否则每轮都会重查。
+reset_case("EMPTY_SMS", {
+    sms_last_used = "5",
+    sms_last_ts = "20261017223211",
+    sms_last_index = "7",
+    sms_last_sig = "old"
+})
+local empty = modem.sms_poll_new()
+assert(#empty == 0, "an empty SMS must not be pushed")
+assert(states.sms_last_index == "8", "an empty SMS must still advance the index cursor")
+
+-- 多段短信只到第一段：不推半截，但原始索引要推进到 9。
+reset_case("MULTI_PART1", {
+    sms_last_used = "5",
+    sms_last_ts = "20261017223211",
+    sms_last_index = "8",
+    sms_last_sig = "old"
+})
+local part1 = modem.sms_poll_new()
+assert(#part1 == 0, "an incomplete multipart SMS must not be pushed")
+assert(states.sms_last_index == "9", "an incomplete multipart SMS must advance the raw index")
+
+-- 第二段到齐：只推一次完整内容，索引用最后一段的 10。
+reset_case("MULTI_BOTH", {
+    sms_last_used = "5",
+    sms_last_ts = "20261017223211",
+    sms_last_index = "9",
+    sms_last_sig = "old"
+})
+local full = modem.sms_poll_new()
+assert(#full == 1 and full[1].content == "AB",
+    "a complete multipart SMS must be pushed once with the full content")
+assert(full[1].index == 10, "a complete multipart SMS must use the last part index")
+assert(states.sms_last_index == "10", "a complete multipart SMS must advance to the last part index")
+
+print("PASS: SMS poll detects new storage indexes across timezone/count changes, preserves cursors on failure, skips empty/incomplete SMS, and never re-pushes")
