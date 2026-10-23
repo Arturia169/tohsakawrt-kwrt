@@ -33,6 +33,11 @@ package.preload["luci.jsonc"] = function()
                     { index = 5, sender = "+8613800000000", timestamp = "06/20/26 12:00:00",
                         content = "验证码 123456" }
                 } }
+            elseif raw == "DUP_SMS" then
+                return { msg = {
+                    { index = 6, sender = "+8613800000000", timestamp = "06/20/26 12:00:00",
+                        content = "验证码 123456" }
+                } }
             elseif raw == "TBC_SMS" then
                 return { msg = {
                     { index = 6, sender = "TBC SMS", timestamp = "10/17/26 19:25:47",
@@ -105,6 +110,18 @@ reset_case("VALID_SMS", {
 local none = modem.sms_poll_new()
 assert(#none == 0, "an unchanged inbox must not be pushed twice")
 assert(#state_writes == 0, "a no-op poll must not rewrite cursors")
+
+-- 重复存储/网络重发：内容、发件人、时间与上一条完全相同，只是索引变成 6。
+-- 只推进游标，不能再次推送（实机 #SIMWorld 同一条旧短信被重存成新 index）。
+reset_case("DUP_SMS", {
+    sms_last_used = "5",
+    sms_last_ts = "20260620120000",
+    sms_last_index = "5",
+    sms_last_sig = valid_sig
+})
+local dup = modem.sms_poll_new()
+assert(#dup == 0, "a duplicate copy with a new index must not be pushed")
+assert(states.sms_last_index == "6", "a duplicate copy must still advance the index cursor")
 
 -- 关键回归：used 计数不变（5→5）、时间戳比上一轮更早（格鲁吉亚 +04 的 19:25
 -- 看起来比香港 +08 的 22:32 早），但存储索引从 5 涨到 6 —— 必须仍判定为新短信。

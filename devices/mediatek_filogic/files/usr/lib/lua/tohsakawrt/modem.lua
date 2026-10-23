@@ -480,15 +480,18 @@ function M.sms_poll_new()
 
     local new_sms = {}
     -- 主判据：存储索引比上次大。索引是模组分配的单调值，不受时区和换卡影响。
-    -- 空短信（状态报告/静默短信/空 PDU）没有可展示内容，不推送，但索引照样推进。
+    -- 但还要用签名去重：网络重发/模组重复存储时，同一条短信会拿到新的存储索引，
+    -- 发件人/时间/正文却完全一样（实机 #SIMWorld 就是同一条旧短信被重存成新 index）。
+    -- 这种只推进游标，不再推送，否则用户会隔几天又收到同一条旧通知。
     for _, sms in ipairs(all_sms) do
-        if (tonumber(sms.index) or -1) > last_index and has_content(sms) then
+        if (tonumber(sms.index) or -1) > last_index and has_content(sms)
+            and sms_sig(sms) ~= last_sig then
             new_sms[#new_sms + 1] = sms
         end
     end
-    -- 兜底：索引没变但计数增加或最新一条的签名变了（多段短信的后续分段/索引复用）。
-    if #new_sms == 0 and (cur_used > last_used or cur_sig ~= last_sig)
-        and newest and has_content(newest) then
+    -- 兜底：索引没变但最新一条的签名变了（多段短信后续分段/内容被更新）。
+    -- 签名相同说明只是重复计数/重复存储，不推送。
+    if #new_sms == 0 and cur_sig ~= last_sig and newest and has_content(newest) then
         new_sms[1] = newest
     end
 
