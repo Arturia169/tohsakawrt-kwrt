@@ -68,6 +68,16 @@ package.preload["luci.jsonc"] = function()
                     { index = 10, sender = "Multi", timestamp = "10/23/26 03:00:00",
                         reference = 1, part = 2, total = 2, content = "B" }
                 } }
+            elseif raw == "DUP_TS_SMS" then
+                return { msg = {
+                    { index = 6, sender = "+8613800000000", timestamp = "10/23/26 09:00:00",
+                        content = "验证码 123456" }
+                } }
+            elseif raw == "STALE_SMS" then
+                return { msg = {
+                    { index = 35, sender = "Old", timestamp = "10/17/26 12:00:00",
+                        content = "old message" }
+                } }
             elseif raw == "RENUMBER_SMS" then
                 return { msg = {
                     { index = 35, sender = "Old", timestamp = "10/21/26 01:24:55",
@@ -139,6 +149,28 @@ reset_case("DUP_SMS", {
 local dup = modem.sms_poll_new()
 assert(#dup == 0, "a duplicate copy with a new index must not be pushed")
 assert(states.sms_last_index == "6", "a duplicate copy must still advance the index cursor")
+
+-- 同内容、不同时间戳（网络重发欢迎短信）：签名不含时间戳，也不能重复推。
+reset_case("DUP_TS_SMS", {
+    sms_last_used = "5",
+    sms_last_ts = "20260620120000",
+    sms_last_index = "5",
+    sms_last_sig = valid_sig
+}, 6)
+local dup_ts = modem.sms_poll_new()
+assert(#dup_ts == 0, "the same body with a new timestamp must not be pushed again")
+assert(states.sms_last_index == "6", "a duplicate body must still advance the index cursor")
+
+-- 三天前的旧短信重放（索引变大但时间戳很旧）：不推，只推进游标。
+reset_case("STALE_SMS", {
+    sms_last_used = "5",
+    sms_last_ts = "20261021012455",
+    sms_last_index = "34",
+    sms_last_sig = "old"
+}, 6)
+local stale = modem.sms_poll_new()
+assert(#stale == 0, "a historical SMS older than 12h must not be replayed")
+assert(states.sms_last_index == "35", "a stale SMS must still advance the cursor")
 
 -- 关键回归：used 计数不变（5→5）、时间戳比上一轮更早（格鲁吉亚 +04 的 19:25
 -- 看起来比香港 +08 的 22:32 早），但存储索引从 5 涨到 6 —— 必须仍判定为新短信。

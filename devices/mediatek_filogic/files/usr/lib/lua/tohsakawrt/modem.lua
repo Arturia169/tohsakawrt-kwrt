@@ -391,8 +391,9 @@ function M.sms_list(storage, limit)
         end
         result = sliced
     end
-    -- 带外字段：原始最大索引（ipairs 不会遍历到它）
+    -- 带外字段：原始最大索引/原始条数（ipairs 不会遍历到它们）
     result.max_index = raw_max_index
+    result.raw_count = #msgs
     return result
 end
 
@@ -435,8 +436,10 @@ function M.sms_poll_new()
         for i = 1, #content do
             h = (h * 131 + content:byte(i)) % 2147483647
         end
-        return string.format("S:%s|T:%s|L:%d|H:%d",
-            tostring(sms.sender), tostring(sms.timestamp), #content, h)
+        -- 不把时间戳放进签名：网络重发/欢迎短信重发时，正文和发件人完全一样，
+        -- 只有时间戳变了；这种不应再通知一次。同一发件人+同一正文视为同一条。
+        return string.format("S:%s|L:%d|H:%d",
+            tostring(sms.sender), #content, h)
     end
 
     local newest, max_ts = nil, last_ts
@@ -475,14 +478,23 @@ function M.sms_poll_new()
         return {}
     end
 
-    if max_index < last_index then
-        -- 索引变低但存储条数没减少：更像部分读取/重编号，先不动游标。
-        -- 若在这里直接重置，下一轮完整列表会把所有旧短信当成新短信全部重推。
-        if cur_used >= last_used then
-            return {}
-        end
-        -- 条数确实减少（换卡/清空）：重置台账，不补推。
+    if cur_used < last_used then
+        -- 存储条数变少：可能是部分读取/状态抖动，也可能是真删除/换卡。
+        -- 不立即重置（之前正是这里把游标清零，下一轮完整列表全量重推）；
+        -- 连续 3 轮都少才认定为真的存储变化，重置游标但不补推。
+        local low = (tonumber(core.get_state("sms_low_reads", "0")) or 0) + 1
+        core.set_state("sms_low_reads", tostring(low))
+        if low < 3 then return {} end
+        core.set_state("sms_low_reads", "0")
         remember()
+        return {}
+    end
+    if (tonumber(core.get_state("sms_low_reads", "0")) or 0) ~= 0 then
+        core.set_state("sms_low_reads", "0")
+    end
+
+    if max_index < last_index then
+        -- 索引变低但条数没减少：部分读取/重编号，不动游标。
         return {}
     end
 
@@ -493,8 +505,22 @@ function M.sms_poll_new()
         return {}
     end
 
+    -- 旧版签名带 |T:（时间戳）：内容没变时只升级签名格式，不补推。
+    if last_sig:find("|T:", 1, true) and max_index == last_index and cur_used == last_used then
+        remember()
+        return {}
+    end
+
     local function has_content(sms)
         return tostring(sms and sms.content or ""):gsub("%s+", "") ~= ""
+    end
+
+    -- 时间戳比上一轮最新短信还早 12 小时以上：视为历史重放（YYYYMMDDHHMMSS
+    -- 数值里 1 天=1000000，12 小时=500000）。格鲁吉亚 +04 与香港 +08 的
+    -- 几小时时差不会被误杀；三天前的旧短信会被挡住。
+    local function is_stale(sms)
+        return last_ts > 0 and sms and sms.sort_time and sms.sort_time > 0
+            and (last_ts - sms.sort_time) > 500000
     end
 
     local new_sms = {}
@@ -504,13 +530,14 @@ function M.sms_poll_new()
     -- 这种只推进游标，不再推送，否则用户会隔几天又收到同一条旧通知。
     for _, sms in ipairs(all_sms) do
         if (tonumber(sms.index) or -1) > last_index and has_content(sms)
-            and sms_sig(sms) ~= last_sig then
+            and not is_stale(sms) and sms_sig(sms) ~= last_sig then
             new_sms[#new_sms + 1] = sms
         end
     end
     -- 兜底：索引没变但最新一条的签名变了（多段短信后续分段/内容被更新）。
     -- 签名相同说明只是重复计数/重复存储，不推送。
-    if #new_sms == 0 and cur_sig ~= last_sig and newest and has_content(newest) then
+    if #new_sms == 0 and cur_sig ~= last_sig and newest and has_content(newest)
+        and not is_stale(newest) then
         new_sms[1] = newest
     end
 
