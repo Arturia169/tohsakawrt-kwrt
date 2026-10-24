@@ -468,8 +468,27 @@ function M.sms_poll_new()
         return {}
     end
 
+    -- 游标异常接近 0、但存储里已经有大量短信：多半是状态文件被半写/读到 0，
+    -- 不是真的首次安装；直接建台账，不能把历史短信全部当新短信重推。
+    if last_index <= 1 and max_index > 5 and cur_used > 5 then
+        remember()
+        return {}
+    end
+
     if max_index < last_index then
-        -- 换卡/清空/存储索引回退：重置台账，同样不补推。
+        -- 索引变低但存储条数没减少：更像部分读取/重编号，先不动游标。
+        -- 若在这里直接重置，下一轮完整列表会把所有旧短信当成新短信全部重推。
+        if cur_used >= last_used then
+            return {}
+        end
+        -- 条数确实减少（换卡/清空）：重置台账，不补推。
+        remember()
+        return {}
+    end
+
+    -- 索引变大但存储条数没增加：重复存储/重编号/游标回退。
+    -- 只推进游标，不推送，避免把历史短信全部重发。
+    if max_index > last_index and cur_used <= last_used then
         remember()
         return {}
     end
@@ -493,6 +512,27 @@ function M.sms_poll_new()
     -- 签名相同说明只是重复计数/重复存储，不推送。
     if #new_sms == 0 and cur_sig ~= last_sig and newest and has_content(newest) then
         new_sms[1] = newest
+    end
+
+    -- 最后一层防刷屏：存储条数只增加 1 条，却冒出十几/几十条"新"短信，
+    -- 说明索引被整体重编号（实机 07:34 把 35 条旧短信全推了一遍）。
+    -- 只推最新的 growth 条（至少 1 条），其余只推进游标。
+    local growth = cur_used - last_used
+    local candidate_count = #new_sms
+    if candidate_count > math.max(5, growth + 2) then
+        table.sort(new_sms, function(a, b)
+            return (tonumber(a.index) or -1) > (tonumber(b.index) or -1)
+        end)
+        local keep = math.max(1, math.min(growth, 3))
+        -- 候选超过 20 条时只推 1 条：正常短信不会一次来 20+ 条，
+        -- 这基本是索引整体重编号/游标异常，先保住"不刷屏"。
+        if candidate_count > 20 then keep = 1 end
+        for i = candidate_count, keep + 1, -1 do
+            table.remove(new_sms, i)
+        end
+        core.log("Tohsaka-Sms", string.format(
+            "短信索引异常跳变：候选 %d 条、存储增量 %d，只推送最新 %d 条",
+            candidate_count, growth, keep))
     end
 
     if #new_sms > 0 or saw_new_index then

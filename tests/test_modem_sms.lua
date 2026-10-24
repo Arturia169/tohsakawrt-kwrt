@@ -3,6 +3,7 @@ package.path = "devices/mediatek_filogic/files/usr/lib/lua/?.lua;devices/mediate
 local current_recv
 local states
 local state_writes
+local current_used = 5
 package.preload["tohsakawrt.core"] = function()
     return {
         get_uci = function(_, _, _, default) return default end,
@@ -17,8 +18,11 @@ package.preload["tohsakawrt.core"] = function()
             states[key] = value
             state_writes[#state_writes + 1] = { key = key, value = value }
         end,
+        log = function() end,
         exec = function(command)
-            if command:find(" status ", 1, true) then return "total: 5, unread: 1, used: 5\n" end
+            if command:find(" status ", 1, true) then
+                return string.format("total: %d, unread: 1, used: %d\n", current_used, current_used)
+            end
             if command:find(" recv ", 1, true) then return current_recv end
             error("unexpected modem command: " .. command)
         end
@@ -64,6 +68,18 @@ package.preload["luci.jsonc"] = function()
                     { index = 10, sender = "Multi", timestamp = "10/23/26 03:00:00",
                         reference = 1, part = 2, total = 2, content = "B" }
                 } }
+            elseif raw == "RENUMBER_SMS" then
+                return { msg = {
+                    { index = 35, sender = "Old", timestamp = "10/21/26 01:24:55",
+                        content = "old message" }
+                } }
+            elseif raw == "MASS_SMS" then
+                local msgs = {}
+                for i = 35, 44 do
+                    msgs[#msgs + 1] = { index = i, sender = "Bulk",
+                        timestamp = "10/24/26 07:00:00", content = "bulk " .. i }
+                end
+                return { msg = msgs }
             end
             error("invalid JSON")
         end
@@ -71,8 +87,9 @@ package.preload["luci.jsonc"] = function()
 end
 
 local modem = require("tohsakawrt.modem")
-local function reset_case(recv, overrides)
+local function reset_case(recv, overrides, used)
     current_recv = recv
+    current_used = used or 5
     states = {
         sms_last_used = "4",
         sms_last_ts = "0",
@@ -118,7 +135,7 @@ reset_case("DUP_SMS", {
     sms_last_ts = "20260620120000",
     sms_last_index = "5",
     sms_last_sig = valid_sig
-})
+}, 6)
 local dup = modem.sms_poll_new()
 assert(#dup == 0, "a duplicate copy with a new index must not be pushed")
 assert(states.sms_last_index == "6", "a duplicate copy must still advance the index cursor")
@@ -130,7 +147,7 @@ reset_case("TBC_SMS", {
     sms_last_ts = "20261017223211",
     sms_last_index = "5",
     sms_last_sig = "old"
-})
+}, 6)
 local tbc = modem.sms_poll_new()
 assert(#tbc == 1 and tbc[1].sender == "TBC SMS",
     "new storage index must be detected even when used count and timestamp look older")
@@ -139,11 +156,11 @@ assert(states.sms_last_ts == "20261017223211", "legacy timestamp cursor must not
 
 -- 同一条 TBC 短信再轮询一次，不能重复推送。
 reset_case("TBC_SMS", {
-    sms_last_used = "5",
+    sms_last_used = "6",
     sms_last_ts = "20261017223211",
     sms_last_index = "6",
     sms_last_sig = states.sms_last_sig
-})
+}, 6)
 local again = modem.sms_poll_new()
 assert(#again == 0, "an already seen SMS must not be pushed twice")
 assert(#state_writes == 0, "a no-op poll must not rewrite cursors")
@@ -156,15 +173,15 @@ reset_case("SPACE_SMS", {
     sms_last_ts = "20261017223211",
     sms_last_index = "6",
     sms_last_sig = "old"
-})
+}, 6)
 local spaced = modem.sms_poll_new()
 assert(#spaced == 1, "a trailing-space SMS must be delivered once")
 reset_case("SPACE_SMS", {
-    sms_last_used = "5",
+    sms_last_used = "6",
     sms_last_ts = "20261017223211",
     sms_last_index = "7",
     sms_last_sig = states.sms_last_sig
-})
+}, 6)
 local repeated = modem.sms_poll_new()
 assert(#repeated == 0, "a trailing-space SMS must not be pushed again every poll")
 
@@ -174,7 +191,7 @@ reset_case("EMPTY_SMS", {
     sms_last_ts = "20261017223211",
     sms_last_index = "7",
     sms_last_sig = "old"
-})
+}, 6)
 local empty = modem.sms_poll_new()
 assert(#empty == 0, "an empty SMS must not be pushed")
 assert(states.sms_last_index == "8", "an empty SMS must still advance the index cursor")
@@ -185,7 +202,7 @@ reset_case("MULTI_PART1", {
     sms_last_ts = "20261017223211",
     sms_last_index = "8",
     sms_last_sig = "old"
-})
+}, 6)
 local part1 = modem.sms_poll_new()
 assert(#part1 == 0, "an incomplete multipart SMS must not be pushed")
 assert(states.sms_last_index == "9", "an incomplete multipart SMS must advance the raw index")
@@ -196,11 +213,45 @@ reset_case("MULTI_BOTH", {
     sms_last_ts = "20261017223211",
     sms_last_index = "9",
     sms_last_sig = "old"
-})
+}, 6)
 local full = modem.sms_poll_new()
 assert(#full == 1 and full[1].content == "AB",
     "a complete multipart SMS must be pushed once with the full content")
 assert(full[1].index == 10, "a complete multipart SMS must use the last part index")
 assert(states.sms_last_index == "10", "a complete multipart SMS must advance to the last part index")
 
-print("PASS: SMS poll detects new storage indexes across timezone/count changes, preserves cursors on failure, skips empty/incomplete SMS, and never re-pushes")
+-- 索引整体重编号但存储条数没变：只推进游标，不能把历史短信全量重推。
+reset_case("RENUMBER_SMS", {
+    sms_last_used = "5",
+    sms_last_ts = "20261021012455",
+    sms_last_index = "34",
+    sms_last_sig = "old"
+}, 5)
+local renum = modem.sms_poll_new()
+assert(#renum == 0, "index renumbering without storage growth must not push old SMS")
+assert(states.sms_last_index == "35", "index renumbering must still advance the cursor")
+
+-- 存储只多 1 条却冒出 10 条新索引：只推最新 1 条，避免刷屏。
+reset_case("MASS_SMS", {
+    sms_last_used = "5",
+    sms_last_ts = "20261021012455",
+    sms_last_index = "34",
+    sms_last_sig = "old"
+}, 6)
+local mass = modem.sms_poll_new()
+assert(#mass == 1 and mass[1].index == 44,
+    "a mass index jump must only push the newest message")
+assert(states.sms_last_index == "44", "a mass index jump must advance to the max index")
+
+-- 游标异常接近 0 但收件箱有大量历史短信：不能全量重推。
+reset_case("MASS_SMS", {
+    sms_last_used = "5",
+    sms_last_ts = "20261021012455",
+    sms_last_index = "0",
+    sms_last_sig = "old"
+}, 6)
+local reset = modem.sms_poll_new()
+assert(#reset == 0, "a near-zero cursor with a full inbox must not replay history")
+assert(states.sms_last_index == "44", "a near-zero cursor must be rebuilt to the max index")
+
+print("PASS: SMS poll detects new storage indexes across timezone/count changes, preserves cursors on failure, skips empty/incomplete SMS, caps mass renumbering, and never re-pushes")
