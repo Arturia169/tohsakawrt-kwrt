@@ -56,6 +56,9 @@ trap 'watch_lock_cleanup; exit 143' TERM
 [ -x /usr/bin/tohsakawrt-service-watch ] && /usr/bin/tohsakawrt-service-watch >/dev/null 2>&1
 
 # 3. 模组脱网自愈检测 (内置 120s 速率限制保护)
-[ -x /usr/bin/tohsakawrt-modem-heal ] && /usr/bin/tohsakawrt-modem-heal >/dev/null 2>&1
+#    受 mobile_probe 总开关控制：置 0 时整段跳过（5G 不作备份就不必每分钟探测）
+MOBILE_PROBE="$(uci -q get tohsakawrt-tgbot.main.mobile_probe 2>/dev/null)"
+[ -n "$MOBILE_PROBE" ] || MOBILE_PROBE=1
+[ "$MOBILE_PROBE" = "1" ] && [ -x /usr/bin/tohsakawrt-modem-heal ] && /usr/bin/tohsakawrt-modem-heal >/dev/null 2>&1
 
 exit 0

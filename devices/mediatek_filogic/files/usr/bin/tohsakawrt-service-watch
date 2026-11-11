@@ -19,6 +19,12 @@ BOOT_SENT="$STATE_DIR/boot_sent"
 
 mkdir -p "$STATE_DIR"
 
+# 5G 线路探测总开关（uci: tohsakawrt-tgbot.main.mobile_probe，缺省 1 保持原行为）
+# 置 0 后：不再每分钟读 AT 制式、不记信号趋势、不做锁定观察期校验，
+# 也收不到"5G 降级/恢复"通知；手动 /modem /sms /trend /band 等命令照旧可用。
+MOBILE_PROBE="$(uci -q get tohsakawrt-tgbot.main.mobile_probe 2>/dev/null)"
+[ -n "$MOBILE_PROBE" ] || MOBILE_PROBE=1
+
 acquire_lock() {
     if mkdir "$LOCK_DIR" 2>/dev/null; then
         : > "$LOCK_DIR/.new"
@@ -195,19 +201,19 @@ availability_record "$(date +%s)" "$WAN_UP"
 # ==========================================================
 # 频段锁定观察期校验：到期仍探测不通就自动恢复原设置
 # ==========================================================
-[ -x /usr/bin/tohsakawrt-band ] && /usr/bin/tohsakawrt-band verify >/dev/null 2>&1 || true
+[ "$MOBILE_PROBE" = "1" ] && [ -x /usr/bin/tohsakawrt-band ] && /usr/bin/tohsakawrt-band verify >/dev/null 2>&1 || true
 
 # ==========================================================
 # 5G 信号趋势：每分钟记一条样本（落在 /tmp，不写 flash）
 # ==========================================================
-[ -x /usr/bin/tohsakawrt-signal-log ] && /usr/bin/tohsakawrt-signal-log record >/dev/null 2>&1 || true
+[ "$MOBILE_PROBE" = "1" ] && [ -x /usr/bin/tohsakawrt-signal-log ] && /usr/bin/tohsakawrt-signal-log record >/dev/null 2>&1 || true
 
 # ==========================================================
 # 信号长趋势：把上一个【完整小时】聚合成一行写入 flash（每小时一次）
 # ==========================================================
 # 幂等：已聚合过的小时就立刻返回，所以常态下每分钟只是一次比较、零磁盘写入。
 # 这样长趋势能看到多天规律，又不像"每分钟写一行"那样一天写 1440 次。
-[ -x /usr/bin/tohsakawrt-signal-log ] && /usr/bin/tohsakawrt-signal-log rollup >/dev/null 2>&1 || true
+[ "$MOBILE_PROBE" = "1" ] && [ -x /usr/bin/tohsakawrt-signal-log ] && /usr/bin/tohsakawrt-signal-log rollup >/dev/null 2>&1 || true
 
 # ==========================================================
 # 网络黑匣子：把系统日志里的相关行翻译成统一事件（每分钟一次）
@@ -443,7 +449,7 @@ mkdir -p /root/tohsakawrt-logs
 # 所以删掉这一行不会改变重启后的行为，只是不再误吞真实切换。
 # （对比两种失败：漏报是静默的、用户无从察觉；万一多报一条也只是可见的噪声，故取前者。）
 
-if [ -e "$AT_PORT" ] && [ -x "$MODEM_AT" ]; then
+if [ "$MOBILE_PROBE" = "1" ] && [ -e "$AT_PORT" ] && [ -x "$MODEM_AT" ]; then
 
     if command -v timeout >/dev/null 2>&1; then
         QNWINFO="$(
