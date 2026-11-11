@@ -38,6 +38,94 @@ end
 
 -- ==================== COMMAND HANDLERS ====================
 
+
+-- ==================== 主菜单（收口：6 个入口，命令全部保留）====================
+-- 目的：把 32 条命令的入口收敛成 6 个分区；命令本身一条不删，仍可直接手输。
+
+local MAIN_MENU_TEXT = [[🤖 <b>TohsakaWrt 控制台</b>
+
+点按钮进入分区；<b>所有命令照旧可用</b>，完整清单见「⋯ 全部命令」。
+<i>💡 直接输入 /status /proxy /modem 等一样生效。</i>]]
+
+local M_BACK_ONLY = { { { text = "⬅️ 返回", callback_data = "menu_home" } } }
+
+local function main_menu_kb()
+    return {
+        { { text = "📊 状态", callback_data = "refresh_status" },
+          { text = "🌐 网络", callback_data = "menu_net" } },
+        { { text = "🧩 代理", callback_data = "proxy_menu" },
+          { text = "📡 模组", callback_data = "refresh_modem" } },
+        { { text = "📇 卡与流量", callback_data = "menu_sim" },
+          { text = "🗃️ 台账诊断", callback_data = "menu_log" } },
+        { { text = "⋯ 全部命令", callback_data = "menu_all" },
+          { text = "🔧 系统操作", callback_data = "menu_sys" } },
+    }
+end
+
+local function menu_reply(msg_id, text, kb)
+    if msg_id then
+        tg.edit_msg(msg_id, text, kb)
+    else
+        tg.send_msg(text, kb)
+    end
+end
+
+local function show_main_menu(msg_id)
+    menu_reply(msg_id, MAIN_MENU_TEXT, main_menu_kb())
+end
+
+local function build_menu_net(msg_id)
+    menu_reply(msg_id, [[🌐 <b>网络</b>
+
+出口切换 · 外网详情 · 在线设备 · 双向体检
+<i>命令：/uplink /wan /clients /ping /alias</i>]], {
+        { { text = "🔀 出口切换", callback_data = "open_uplink_menu" },
+          { text = "🌍 外网详情", callback_data = "wan_show" } },
+        { { text = "👥 在线设备", callback_data = "clients_show" },
+          { text = "🩺 双向体检", callback_data = "re_ping" } },
+        { { text = "🏷️ 设备备注", callback_data = "alias_help" },
+          { text = "⬅️ 返回", callback_data = "menu_home" } },
+    })
+end
+
+local function build_menu_sim(msg_id)
+    menu_reply(msg_id, [[📇 <b>卡与流量</b>
+
+卡内号码 · 流量卡用量 · 切换号码 · 下载写卡
+<i>命令：/cards /flow /switch /download</i>]], {
+        { { text = "📇 卡内号码", callback_data = "refresh_cards" },
+          { text = "📊 流量卡", callback_data = "flowcard_now" } },
+        { { text = "🔀 切换号码", callback_data = "switch_help" },
+          { text = "📥 下载写卡", callback_data = "download_help" } },
+        { { text = "⬅️ 返回", callback_data = "menu_home" } },
+    })
+end
+
+local function build_menu_log(msg_id)
+    menu_reply(msg_id, [[🗃️ <b>台账与诊断</b>
+
+可用性 · 黑匣子 · 找原因 · 温度 · 存储 · USB
+<i>命令：/uptime /log /why /temp /storage /usb</i>]], {
+        { { text = "📡 可用性", callback_data = "uptime" },
+          { text = "🗃️ 黑匣子", callback_data = "event_log:24" } },
+        { { text = "🔍 找原因", callback_data = "event_why:24" },
+          { text = "🌡️ 温度", callback_data = "temp_show" } },
+        { { text = "💾 存储", callback_data = "storage_show" },
+          { text = "🔌 USB", callback_data = "usb_show" } },
+        { { text = "⬅️ 返回", callback_data = "menu_home" } },
+    })
+end
+
+local function build_menu_sys(msg_id)
+    menu_reply(msg_id, [[🔧 <b>系统操作</b>
+
+<i>下面两个操作都会先弹确认框，确认后才执行。</i>]], {
+        { { text = "⚡ 重启", callback_data = "req_reboot" },
+          { text = "🔌 关机", callback_data = "req_poweroff" } },
+        { { text = "⬅️ 返回", callback_data = "menu_home" } },
+    })
+end
+
 local function cmd_help()
     local text = [[🤖 <b>Telegram 机器人使用说明</b>
 
@@ -100,7 +188,45 @@ end
 local function handle_callback(cb_id, msg_id, data_str)
     local t0 = now_ms()
     note_usage("cb", data_str)
-    if data_str == "cancel_action" then
+    if data_str == "menu_home" then
+        show_main_menu(msg_id)
+    elseif data_str == "menu_net" then
+        build_menu_net(msg_id)
+    elseif data_str == "menu_sim" then
+        build_menu_sim(msg_id)
+    elseif data_str == "menu_log" then
+        build_menu_log(msg_id)
+    elseif data_str == "menu_sys" then
+        build_menu_sys(msg_id)
+    elseif data_str == "menu_all" then
+        cmd_help()
+    elseif data_str == "wan_show" then
+        net.cmd_wan()
+    elseif data_str == "clients_show" then
+        sysm.cmd_clients()
+    elseif data_str == "temp_show" then
+        sysm.cmd_temp()
+    elseif data_str == "storage_show" then
+        sysm.cmd_storage()
+    elseif data_str == "usb_show" then
+        sysm.cmd_usb()
+    elseif data_str == "alias_help" then
+        menu_reply(msg_id, [[🏷️ <b>设备备注</b>
+用法：<code>/alias 192.168.100.123 客厅电视</code>
+<i>备注写进 DHCP 主机名，之后看板显示中文名。</i>]], M_BACK_ONLY)
+    elseif data_str == "switch_help" then
+        menu_reply(msg_id, [[🔀 <b>切换 eSIM 号码</b>
+用法：<code>/switch 2</code> 或 <code>/switch 香港</code>
+<i>先用「卡内号码」看序号。</i>]], M_BACK_ONLY)
+    elseif data_str == "download_help" then
+        menu_reply(msg_id, [[📥 <b>下载写卡</b>
+用法：<code>/download &lt;激活码&gt;</code>，需要确认码时追加在后面
+<i>写入约 1~2 分钟，期间蜂窝会断开。</i>]], M_BACK_ONLY)
+    elseif data_str == "req_reboot" then
+        ask_confirm("重启路由器系统", "TohsakaWrt 宿主机", "全家网络将中断约 1~2 分钟，直到路由器重新启动完成", "do_sys_reboot")
+    elseif data_str == "req_poweroff" then
+        ask_confirm("关闭路由器电源", "TohsakaWrt 宿主机", "路由器将完全关机并停止所有网络服务，再次开启需手动拔插电源", "do_sys_poweroff")
+    elseif data_str == "cancel_action" then
         tg.answer_callback(cb_id, "操作已取消")
         -- 必须传第三个参数 false：editMessageText 省略 reply_markup 时旧键盘会保留，
         -- 只改文字的话那条"🔴 确认执行"按钮还留在原地可点，用户以为取消了、再点一下
@@ -418,7 +544,7 @@ local function handle_command(text)
         if cmd ~= "/switch" then selector = full:gsub("^.-切换号码", "") end
         esimm.switch_profile(selector)
     elseif cmd == "/start" or cmd == "/help" or cmd == "/menu" or full:find("帮助") then
-        cmd_help()
+        show_main_menu(nil)
     elseif cmd == "/status" or (full:find("状态") and not full:find("模组") and not full:find("5G") and not full:find("5g")) or full:find("看板") then
         sysm.cmd_status()
     elseif cmd == "/uplink" or cmd == "/switch_wan" or full:find("出口") or full:find("切网") or full:find("换网") or full:find("切5G") or full:find("切5g") then
