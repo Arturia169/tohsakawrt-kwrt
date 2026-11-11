@@ -7,10 +7,3 @@ config global
 	option delay_root '5'
 	option check_fs '0'
 
-config mount
-	option target '/opt'
-	option uuid 'e9fb929f-e660-460f-8a90-eaf135201487'
-	option fstype 'ext4'
-	option options 'rw,noatime,barrier=1'
-	option enabled '1'
-

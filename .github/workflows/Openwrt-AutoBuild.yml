@@ -144,7 +144,6 @@ jobs:
             etc/hotplug.d/tty/40-modem-heal \
             etc/init.d/tohsakawrt-tgbot \
             etc/opkg.conf \
-            etc/profile.d/20-opt.sh \
             etc/sysctl.conf \
             etc/tohsakawrt-aliases \
             etc/tohsakawrt-known-macs \
