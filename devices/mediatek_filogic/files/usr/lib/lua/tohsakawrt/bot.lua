@@ -16,6 +16,26 @@ local core, tg, sys, modem, clash, esim, nixio =
 local html_escape, ask_confirm, now_ms, esim_enabled =
     bc.html_escape, bc.ask_confirm, bc.now_ms, bc.esim_enabled
 
+-- 命令使用统计：每次分发只追加一行，用于将来按真实使用裁剪命令。
+-- 放 /tmp（重启即清空，不占闪存）；超过 200KB 自动清空重来，避免长期膨胀。
+local USAGE_FILE = "/tmp/tohsakawrt-bot-usage"
+local USAGE_MAX = 200 * 1024
+
+local function note_usage(kind, name)
+    if not name or name == "" then return end
+    name = tostring(name):gsub("%s+", "_"):sub(1, 64)
+    local f = io.open(USAGE_FILE, "a+")
+    if not f then return end
+    local size = f:seek("end")
+    if size and size > USAGE_MAX then
+        f:close()
+        f = io.open(USAGE_FILE, "w")
+        if not f then return end
+    end
+    f:write(string.format("%d %s %s\n", os.time(), kind, name))
+    f:close()
+end
+
 -- ==================== COMMAND HANDLERS ====================
 
 local function cmd_help()
@@ -79,6 +99,7 @@ end
 
 local function handle_callback(cb_id, msg_id, data_str)
     local t0 = now_ms()
+    note_usage("cb", data_str)
     if data_str == "cancel_action" then
         tg.answer_callback(cb_id, "操作已取消")
         -- 必须传第三个参数 false：editMessageText 省略 reply_markup 时旧键盘会保留，
@@ -365,6 +386,12 @@ local function handle_command(text)
     else
         cmd = text
         arg = ""
+    end
+
+    if cmd:sub(1, 1) == "/" then
+        note_usage("cmd", cmd)
+    else
+        note_usage("text", "plain")
     end
 
     local full = text
