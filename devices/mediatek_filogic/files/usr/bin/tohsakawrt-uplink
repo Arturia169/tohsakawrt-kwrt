@@ -263,6 +263,19 @@ do_reconcile() {
     local actual="$(get_active_uplink)"
     [ "$actual" = "$desired" ] && return 0
 
+    # 期望线路自己还没上线时不纠偏。
+    # 2026-11-16 实况：一次正常重启里 WAN 接口先 down，而期望出口是 wan，
+    # 于是每分钟巡检都判到 actual=unknown != desired=wan，走 switch_to_wan，
+    # 每次都因 "no default gateway on eth0" 失败 —— 每次失败被台账记成一对
+    # uplink 事件（drift detected + route validation failed），攒够 4 条就把
+    # EventWatch 的 uplink_flap 顶过阈值，报一轮"出口反复切换"假警。
+    # 期望线路连默认网关都没有，说明它不是"被改走了"而是"还没起来"：
+    # 这不是漂移，等它起来自然就一致了。5G 侧同理，掉线由 modem-heal 负责报。
+    case "$desired" in
+        wan|eth0) [ -n "$(get_gateway eth0)" ] || return 0 ;;
+        5g|usb0)  [ -n "$(get_gateway usb0)" ] || return 0 ;;
+    esac
+
     logger -t TohsakaWrt-Uplink "Uplink drift detected (want ${desired}, actual ${actual}), re-applying"
     local result
     case "$desired" in

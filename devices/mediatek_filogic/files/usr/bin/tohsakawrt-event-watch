@@ -114,6 +114,26 @@ SILENCE_HOURS="${TWR_EVENT_SILENCE_HOURS:-0}"
 CD_SILENCE="${TWR_EVENT_CD_SILENCE:-21600}"
 CAP_SILENCE="${TWR_EVENT_CAP_SILENCE:-1}"
 
+# ---- 第 5 类：5G 弱信号驻留（数据源是信号趋势文件，不是事件台账）----
+# 为什么要加这条（2026-10-13 实况）：模组在 n1 小区 171ACA40A 上连续驻留
+# 7 小时 19 分，SINR 只有 0–4 dB，但制式自始至终是 5G —— 上面四条规则全都
+# 看不见它（它们只盯"制式有没有跳变"），用户是自己上 LuCI 瞄了一眼才发现。
+# 这种"连着但没法用"的状态必须能报出来。
+#
+# 判据刻意用 SINR 而不是 RSRP：n1 那次 RSRP −89 看着还行，烂的是 SINR。
+#
+# 静默窗（04:30–07:30）内默认【完全不报】：每天凌晨 5 点基站关站期间信号
+# 本来就差，报出来纯属刷屏。但要注意——窗内那段仍然计入"连续弱信号"，
+# 所以如果出了窗还没恢复，出窗后很快就会报（今天的 n1 就是 07:02 开始、
+# 07:32 出窗后才该报）。
+WEAK_SINR="${TWR_EVENT_WEAK_SINR:-5}"              # SINR ≤ 此值算"弱"（可填负数）
+WEAK_MIN="${TWR_EVENT_WEAK_MIN:-30}"               # 连续多少分钟才报
+WEAK_TAIL="${TWR_EVENT_WEAK_TAIL:-240}"            # 回看多少条采样（240 条 ≈ 4 小时）
+WEAK_QUIET_SKIP="${TWR_EVENT_WEAK_QUIET_SKIP:-1}"  # 静默窗内是否完全不报
+WEAK_FILE="${TWR_EVENT_WEAK_FILE:-/tmp/tohsakawrt/state/signal-trend.log}"
+CD_WEAK="${TWR_EVENT_CD_WEAK:-10800}"              # 冷却 3 小时
+CAP_WEAK="${TWR_EVENT_CAP_WEAK:-2}"                # 每日上限 2 条
+
 # 数值参数统一校验：非法值一律回落到默认值。
 # 为什么需要：这些值直接参与 $(( )) 算术，一个手滑的 env（例如 "30m"）会算出荒唐的窗口。
 # 用 eval 是因为 POSIX sh 没有引用传参，而这里的变量名都是脚本里写死的字面量，安全。
@@ -150,6 +170,16 @@ fixnum CD_SILENCE 21600
 fixnum CAP_SILENCE 1
 fixnum TAIL_LINES 2000
 fixnum MAX_EV 6000
+
+# 弱信号参数。WEAK_SINR 允许负数（SINR 本身可以是负的），所以不走 fixnum
+# —— fixnum 会把任何带 '-' 的值当成非法值打回默认值。
+fixnum WEAK_MIN 30
+fixnum WEAK_TAIL 240
+fixnum CD_WEAK 10800
+fixnum CAP_WEAK 2
+case "$WEAK_SINR" in
+    ''|*[!0-9-]*) WEAK_SINR=5 ;;
+esac
 
 # ------------------------------------------------------------------
 # 公共库与兜底实现
@@ -363,9 +393,12 @@ analyze() {
     # 剔掉它不损失检测能力：同一个故障必然还会产生 warn 级的
     # "AT 口 X 连续 N 次读取失败"（那个计入统计）。
     function is_modem(ix)  { return (skd[ix] == "modem" && smsg[ix] !~ /ICCID 实时读取失败/) }
-    # 出口抖动：剔除"临时回退生效中，暂不校正出口"（回退期间每分钟一条），
+    # 出口抖动：剔除两类"没有新信息"的重复事件，只留真的切换/失败：
+    #   ① 临时回退生效中，暂不校正出口（回退期间每分钟一条）
+    #   ② 上次出口切换失败，冷却中，暂不重试（失败后 10 分钟冷却里每分钟一条；
+    #      真正的失败本身已由 drift + route validation failed 两条计入）
     # 以及紧跟用户操作（bot）之后 120 秒内的连带事件。
-    function is_uplink(ix) { return (skd[ix] == "uplink" && smsg[ix] !~ /暂不校正/ && !nearbot[ix]) }
+    function is_uplink(ix) { return (skd[ix] == "uplink" && smsg[ix] !~ /暂不校正|暂不重试/ && !nearbot[ix]) }
     # 断网：up -> down（实时采集）或"网络中断"（台账导入）
     function is_down(ix)   { return (skd[ix] == "avail" && (smsg[ix] ~ /-> down/ || smsg[ix] ~ /网络中断/)) }
     function is_cause(ix)  { return (skd[ix] == "rat" || skd[ix] == "uplink" || skd[ix] == "modem" || skd[ix] == "bot") }
@@ -627,6 +660,10 @@ do_run() {
         return 0
     fi
 
+    # 弱信号驻留：数据源是信号趋势文件，跟事件台账无关，所以放在
+    # `[ -r "$LOG" ]` 这道门之前 —— 事件文件读不到时它照样要能工作。
+    do_weak_signal
+
     [ -r "$LOG" ] || return 0
 
     FINDINGS="$(tail -n "$TAIL_LINES" "$LOG" 2>/dev/null | analyze run "$(calc_range)")"
@@ -664,10 +701,20 @@ process_rule() {
     alert_slot "$rule" "$RM_CD" "$RM_CAP"
     _slot_rc=$?
     if [ "$_slot_rc" != "0" ]; then
-        if [ "$_slot_rc" = "2" ]; then
-            logger -t TohsakaWrt-EventWatch "$RM_TITLE：${cnt}${RM_UNIT}（阈值 ≥${th}）但今日已达上限 ${RM_CAP} 条，只记日志不发通知" 2>/dev/null || true
-        else
-            logger -t TohsakaWrt-EventWatch "$RM_TITLE：${cnt}${RM_UNIT}（阈值 ≥${th}）但仍在冷却期（$(cd_text "$RM_CD")），只记日志不发通知" 2>/dev/null || true
+        # 同一轮的抑制日志只写一次。
+        # 冷却窗（默认 30 分钟）内每分钟都会重新判到"仍超阈值"，原实现每分钟写
+        # 一条同样的日志：2026-11-16 一次重启就刷了 14 行，把真线索埋掉了。
+        # 指纹 = 抑制原因 + 冷却时间戳 + 当日计数；指纹没变就不重复写。
+        _logmark="$STATE/logged.$rule"
+        _logkey="${_slot_rc}:$(cat "$STATE/cooldown.$rule" 2>/dev/null):$(cat "$STATE/day.$TODAY.$rule" 2>/dev/null)"
+        if [ "$(cat "$_logmark" 2>/dev/null)" != "$_logkey" ]; then
+            if [ "$_slot_rc" = "2" ]; then
+                logger -t TohsakaWrt-EventWatch "$RM_TITLE：${cnt}${RM_UNIT}（阈值 ≥${th}）但今日已达上限 ${RM_CAP} 条，只记日志不发通知" 2>/dev/null || true
+            else
+                logger -t TohsakaWrt-EventWatch "$RM_TITLE：${cnt}${RM_UNIT}（阈值 ≥${th}）但仍在冷却期（$(cd_text "$RM_CD")），只记日志不发通知" 2>/dev/null || true
+            fi
+            mkdir -p "$STATE" 2>/dev/null
+            printf '%s' "$_logkey" > "$_logmark" 2>/dev/null || true
         fi
         return 0
     fi
@@ -830,10 +877,12 @@ do_check() {
         check_rule "$r"
     done
 
+    check_weak
+
     if [ "$SILENCE_HOURS" -gt 0 ]; then
-        printf '[5] 长时间无事件   已启用（阈值 %s 小时，且要求旁证文件仍在更新）\n' "$SILENCE_HOURS"
+        printf '[6] 长时间无事件   已启用（阈值 %s 小时，且要求旁证文件仍在更新）\n' "$SILENCE_HOURS"
     else
-        printf '[5] 长时间无事件   已关闭（事件文件是事件驱动的，稳定期本来就长时间没有事件）\n'
+        printf '[6] 长时间无事件   已关闭（事件文件是事件驱动的，稳定期本来就长时间没有事件）\n'
     fi
     return 0
 }
@@ -903,6 +952,7 @@ do_status() {
     for r in rat_flap modem_storm uplink_flap unknown_down; do
         status_rule "$r"
     done
+    status_weak
     if [ "$SILENCE_HOURS" -gt 0 ]; then
         printf '长时间无事件   已启用（%s 小时阈值）\n' "$SILENCE_HOURS"
     else
@@ -926,6 +976,172 @@ status_rule() {
     fi
     printf '%-12s 今日 %s/%s · 冷却 %s · 阈值 %s 分钟内 ≥%s（静默窗 ≥%s）\n' \
         "$RM_TITLE" "$_dc" "$RM_CAP" "$_cd" "$((RM_WIN / 60))" "$RM_MIN" "$RM_MINQ"
+    return 0
+}
+
+# ------------------------------------------------------------------
+# 第 5 类：5G 弱信号驻留
+# ------------------------------------------------------------------
+# 数据源是【信号趋势文件】（每分钟一条采样），不是事件台账 —— 因为
+# "一直连着但一直很差"本身不产生任何事件，事件台账里根本看不到它。
+#
+# analyze_weak 输出一行：
+#   <起始ts> <样本数> <频段> <小区> <最低SINR> <最低RSRP> <平均SINR> <跨度秒>
+# 只统计【从最后一条往前，连续满足 SINR ≤ 阈值】的那一段。
+analyze_weak() {
+    awk -v now="$NOW" -v thr="$1" '
+    {
+        if (NF < 4) next
+        _t = $1 + 0
+        if (_t <= 0) next
+        n++
+        wts[n] = _t; wband[n] = $2; wrsrp[n] = $3 + 0; wsinr[n] = $4 + 0; wcell[n] = $7
+    }
+    END {
+        if (n == 0) exit 0
+        last = wts[n]
+        # 数据太旧（采样器可能已经停了）→ 不判定。
+        # 否则会拿着几小时前的旧数据报警，比不报更糟。
+        if (now - last > 600) exit 0
+        i = n; c = 0; s = last; mn = 999; mr = 999; sum = 0
+        while (i >= 1 && wsinr[i] <= thr) {
+            c++
+            s = wts[i]
+            if (wsinr[i] < mn) mn = wsinr[i]
+            if (wrsrp[i] < mr) mr = wrsrp[i]
+            sum += wsinr[i]
+            i--
+        }
+        if (c == 0) exit 0
+        span = last - s
+        # 采样密度兜底：跨度内应当基本是每分钟一条。中间有断档（例如巡检被
+        # 卡住）时不能拿"两端时间差"当"持续时长"，否则会凭空多报一段。
+        if (c * 60 < span) exit 0
+        printf "%d %d %s %s %d %d %.1f %d\n", s, c, wband[n], wcell[n], mn, mr, sum / c, span
+    }
+    ' 2>/dev/null
+}
+
+span_text() {
+    _s="$1"
+    case "$_s" in ''|*[!0-9]*) _s=0 ;; esac
+    if [ "$_s" -ge 3600 ]; then
+        printf '%s 小时 %s 分钟' "$((_s / 3600))" "$(((_s % 3600) / 60))"
+    elif [ "$_s" -ge 60 ]; then
+        printf '%s 分钟' "$((_s / 60))"
+    else
+        printf '%s 秒' "$_s"
+    fi
+}
+
+do_weak_signal() {
+    [ -r "$WEAK_FILE" ] || return 0
+
+    # 静默窗内直接跳过。注意这里只是"不报"，窗内的样本仍然参与
+    # 连续段计算，所以出窗时若还没恢复，很快就会被报出来。
+    if [ "$WEAK_QUIET_SKIP" = "1" ] && [ "$QUIET" = "1" ]; then
+        return 0
+    fi
+
+    _res="$(tail -n "$WEAK_TAIL" "$WEAK_FILE" 2>/dev/null | analyze_weak "$WEAK_SINR")"
+    [ -n "$_res" ] || return 0
+    set -- $_res
+    _start="$1"; _band="$3"; _cell="$4"
+    _mn="$5"; _mr="$6"; _avg="$7"; _span="$8"
+    case "$_span" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$_span" -ge "$((WEAK_MIN * 60))" ] || return 0
+
+    # 同一段弱信号只报一次：段的起点时间戳就是这段的"身份证"。
+    # 信号恢复后起点会变，下一段自然能重新报 —— 这样既不会在一段
+    # 持续几小时的低质量里反复刷屏，也不会因为冷却期把新的一段吃掉。
+    _epfile="$STATE/weak.episode"
+    _lastep="$(cat "$_epfile" 2>/dev/null)"
+    case "$_lastep" in ''|*[!0-9]*) _lastep=0 ;; esac
+    [ "$_lastep" = "$_start" ] && return 0
+
+    # 总开关：默认开，uci 设 0 则彻底不报。
+    # 刻意放在"确实要报"之后 —— 常态下这一分钟连一次 uci 都不用 fork。
+    [ "$(uci -q get tohsakawrt-tgbot.main.signal_alert 2>/dev/null)" = "0" ] && return 0
+
+    alert_slot weak_signal "$CD_WEAK" "$CAP_WEAK"
+    _slot_rc=$?
+    if [ "$_slot_rc" != "0" ]; then
+        logger -t TohsakaWrt-EventWatch "5G 弱信号驻留 $(span_text "$_span")（SINR 最低 ${_mn}）但被冷却/日限压制" 2>/dev/null || true
+        return 0
+    fi
+    printf '%s\n' "$_start" > "$_epfile" 2>/dev/null
+
+    _startstr="$(awk -v t="$_start" 'BEGIN { print strftime("%m-%d %H:%M", t) }' 2>/dev/null)"
+    [ -n "$_startstr" ] || _startstr="?"
+
+    MID="📶 <b>已持续 $(span_text "$_span")</b> 驻留在弱信号小区\n📍 <b>频段</b> <code>${_band}</code> · <b>小区</b> <code>${_cell}</code>\n📊 <b>SINR</b> 最低 <code>${_mn}</code> / 平均 <code>${_avg}</code> dB（判据 ≤${WEAK_SINR}）\n📉 <b>RSRP</b> 最低 <code>${_mr}</code> dBm\n🕐 <b>起始</b>：<code>${_startstr}</code>"
+    BODY="⚠️ <b>网络黑匣子 · 5G 弱信号驻留</b>\n━━━━━━━━━━━━━━━━━━\n$MID\n━━━━━━━━━━━━━━━━━━\n💡 <i>5G 还连着，但 SINR 长期低于 ${WEAK_SINR} dB，实际网速和稳定性都会很差。常见原因是模组停在了一个「重选优先级高、但质量差」的邻区上——这是网络侧的配置决定的，模组不会主动换走，只会一直待着。可考虑锁定频段或小区。</i>\n🛡️ <i>本类告警：冷却 $(cd_text "$CD_WEAK") · 今日第 ${SLOT_COUNT}/${CAP_WEAK} 条 · 同一段只报一次</i>\n🕰️ <i>${NOW_STR}</i>"
+
+    if [ "$DRY" = "1" ]; then
+        printf '%s\n' "----- DRY weak_signal -----"
+        printf '%b\n' "$BODY"
+        printf '%s\n' '--------------------------'
+    else
+        if [ -x "$EVENT_BIN" ]; then
+            "$EVENT_BIN" warn signal eventwatch "5G 弱信号驻留：${_band} ${_cell} 持续 $(span_text "$_span")，SINR 最低 ${_mn} dB" >/dev/null 2>&1
+        fi
+        send_tg_bg "$BODY" HTML
+        if [ -z "${BARK_KEY:-}" ]; then
+            BARK_KEY="$(uci -q get tohsakawrt-tgbot.main.bark_key 2>/dev/null)"
+        fi
+        if [ -n "${BARK_KEY:-}" ]; then
+            push_bark_bg "网络黑匣子 · 5G 弱信号驻留" "$BODY" active bell
+        fi
+        logger -t TohsakaWrt-EventWatch "5G 弱信号驻留告警：${_band} ${_cell} $(span_text "$_span")（今日第 ${SLOT_COUNT}/${CAP_WEAK} 条）" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# check 用：只报告当前状态，不告警
+check_weak() {
+    printf '[5] 5G 弱信号驻留   '
+    if [ ! -r "$WEAK_FILE" ]; then
+        printf '无法判定（信号趋势文件不可读）\n'
+        return 0
+    fi
+    _res="$(tail -n "$WEAK_TAIL" "$WEAK_FILE" 2>/dev/null | analyze_weak "$WEAK_SINR")"
+    if [ -z "$_res" ]; then
+        printf '未触发（当前没有连续弱信号）\n'
+        printf '    判据 SINR ≤%s dB 连续 ≥%s 分钟 · 静默窗内%s · 数据源 %s\n' \
+            "$WEAK_SINR" "$WEAK_MIN" \
+            "$(if [ "$WEAK_QUIET_SKIP" = "1" ]; then echo 跳过; else echo 照常判定; fi)" "$WEAK_FILE"
+        return 0
+    fi
+    set -- $_res
+    printf '⚠️ 触发\n'
+    printf '    已持续 %s · 频段 %s · 小区 %s · SINR 最低 %s / 平均 %s · RSRP 最低 %s\n' \
+        "$(span_text "$8")" "$3" "$4" "$5" "$7" "$6"
+    printf '    判据 SINR ≤%s dB 连续 ≥%s 分钟 · 静默窗内%s\n' \
+        "$WEAK_SINR" "$WEAK_MIN" \
+        "$(if [ "$WEAK_QUIET_SKIP" = "1" ]; then echo 跳过; else echo 照常判定; fi)"
+    return 0
+}
+
+status_weak() {
+    _dc="$(cat "$STATE/day.$TODAY.weak_signal" 2>/dev/null)"
+    case "$_dc" in ''|*[!0-9]*) _dc=0 ;; esac
+    _last="$(cat "$STATE/cooldown.weak_signal" 2>/dev/null)"
+    case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+    if [ "$_last" -gt 0 ] && [ "$((NOW - _last))" -lt "$CD_WEAK" ]; then
+        _cd="剩 $(cd_text "$((CD_WEAK - (NOW - _last)))")"
+    else
+        _cd="无"
+    fi
+    _lastep="$(cat "$STATE/weak.episode" 2>/dev/null)"
+    case "$_lastep" in ''|*[!0-9]*) _lastep=0 ;; esac
+    if [ "$_lastep" -gt 0 ]; then
+        _ep="$(awk -v t="$_lastep" 'BEGIN { print strftime("%m-%d %H:%M", t) }' 2>/dev/null)"
+        [ -n "$_ep" ] || _ep="$_lastep"
+    else
+        _ep="无"
+    fi
+    printf '%-12s 今日 %s/%s · 冷却 %s · 判据 SINR ≤%s 连续 ≥%s 分钟 · 已报段起点 %s\n' \
+        "5G 弱信号驻留" "$_dc" "$CAP_WEAK" "$_cd" "$WEAK_SINR" "$WEAK_MIN" "$_ep"
     return 0
 }
 

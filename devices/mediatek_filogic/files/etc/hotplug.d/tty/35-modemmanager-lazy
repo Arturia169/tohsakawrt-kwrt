@@ -1,0 +1,28 @@
+#!/bin/sh
+# TohsakaWrt: ModemManager 懒启动
+#
+# 为什么要有这个：ModemManager + ModemManager-monitor 常驻约 23MB，而这台
+# 路由器只有 490MB 内存、还经常被直接拔电。模组没插的时候它们纯属空转
+# （mncli -L 永远是 "No modems were found"），所以把开机自启关掉，
+# 改由「模组串口出现」这一个事实来拉起。
+#
+# 时序：hotplug 按文件名排序执行，25-modemmanager-tty 先把端口事件写进
+# 缓存目录；ModemManager 启动时会重放这些缓存，所以即使我们晚一秒启动，
+# 它照样能认出模组。40-modem-heal 在 ttyUSB2 出现 2 秒后才跑，那时 MM
+# 已经起来了。
+#
+# 兜底：tohsakawrt-watch 每分钟也会查一次，hotplug 万一漏了会补上。
+
+[ "$ACTION" = "add" ] || exit 0
+case "$DEVNAME" in
+    ttyUSB*|ttyACM*) ;;
+    *) exit 0 ;;
+esac
+
+# 已经在跑就什么都不做（同一次插入会产生多个 ttyUSB，别重复 start）
+pidof ModemManager >/dev/null 2>&1 && exit 0
+
+# 不阻塞 hotplug 链：后台等一下再起，给 25-modemmanager-tty 留出写缓存的时间
+( sleep 1; /etc/init.d/modemmanager start ) >/dev/null 2>&1 &
+
+exit 0

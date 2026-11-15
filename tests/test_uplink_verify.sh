@@ -246,5 +246,27 @@ TEST_ROUTE_GET_DEV= TEST_USB_IP=1 TEST_USB_GW=1 TOHSAKA_UPLINK_KEEP_DESIRED=1 "$
 check '已在宽带时执行 wan（回落模式）：不覆盖期望出口' \
     "$([ "$(cat "$TOHSAKA_UPLINK_DESIRED" 2>/dev/null)" = "5g" ] && echo 1 || echo 0)"
 
+# ---------- ⑤ 期望线路自己还没上线时不纠偏 ----------
+# 回归（2026-11-16 真实事故）：一次正常重启里 WAN 接口先 down，而期望出口是 wan。
+# 巡检每分钟判到 actual != desired 就去 switch_to_wan，每次都在 "no default gateway"
+# 上失败，台账里留下成对的 drift + route validation failed 事件 —— 攒够 4 条就把
+# EventWatch 的 uplink_flap 顶过阈值，重启后推一条"出口反复切换"假警。
+: > "$CALLS"
+printf 'wan\n' > "$TOHSAKA_UPLINK_DESIRED"
+rm -f "$TOHSAKA_UPLINK_RECONCILE_FAIL"
+TEST_ROUTE_GET_DEV=usb0 TEST_ETH_GW=0 TEST_USB_IP=1 TEST_USB_GW=1 "$SCRIPT" reconcile >/dev/null 2>&1
+check '期望 wan 但 eth0 无默认网关：reconcile 直接跳过，不碰任何路由' \
+    "$(grep -Eq '^ip route (replace|del|add) ' "$CALLS" && echo 0 || echo 1)"
+check '期望 wan 但 eth0 无默认网关：不写失败事件、也不记冷却（关机噪声不刷台账）' \
+    "$(grep -q 'route validation failed' "$CALLS" && echo 0 || ([ ! -f "$TOHSAKA_UPLINK_RECONCILE_FAIL" ] && echo 1 || echo 0))"
+
+# 对照：网关在、只是出口真的被改走了 —— 必须照常纠正（跳过条件不能误伤正常对账）
+: > "$CALLS"
+printf 'wan\n' > "$TOHSAKA_UPLINK_DESIRED"
+rm -f "$TOHSAKA_UPLINK_RECONCILE_FAIL" "$TOHSAKA_UPLINK_FALLBACK"
+TEST_ROUTE_GET_DEV=usb0 TEST_ETH_GW=1 TEST_ETH_IP=1 TEST_USB_IP=1 TEST_USB_GW=1 "$SCRIPT" reconcile >/dev/null 2>&1
+check '对照：eth0 网关正常时，真漂移照常纠正（检测能力未被削掉）' \
+    "$(grep -q 'Uplink drift detected' "$CALLS" && echo 1 || echo 0)"
+
 printf 'PASS=%s FAIL=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

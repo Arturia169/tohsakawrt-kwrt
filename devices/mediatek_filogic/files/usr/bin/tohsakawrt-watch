@@ -61,4 +61,14 @@ MOBILE_PROBE="$(uci -q get tohsakawrt-tgbot.main.mobile_probe 2>/dev/null)"
 [ -n "$MOBILE_PROBE" ] || MOBILE_PROBE=1
 [ "$MOBILE_PROBE" = "1" ] && [ -x /usr/bin/tohsakawrt-modem-heal ] && /usr/bin/tohsakawrt-modem-heal >/dev/null 2>&1
 
+# 4. ModemManager 懒加载兜底
+#    正常路径是 /etc/hotplug.d/tty/35-modemmanager-lazy（插入瞬间就起），
+#    这一段只在 hotplug 漏触发时补一次：模组在就确保 MM 在跑，
+#    模组不在就停掉 —— ModemManager + monitor 常驻约 23MB，空转没有意义。
+if ls /dev/ttyUSB* >/dev/null 2>&1; then
+    pidof ModemManager >/dev/null 2>&1 || /etc/init.d/modemmanager start >/dev/null 2>&1
+else
+    pidof ModemManager >/dev/null 2>&1 && /etc/init.d/modemmanager stop >/dev/null 2>&1
+fi
+
 exit 0

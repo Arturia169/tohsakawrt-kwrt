@@ -79,5 +79,35 @@ check 'check 子命令只检测、不投递' "$([ ! -s "$DELIVERY_LOG" ] && echo
 TWR_EVENT_WATCH_NOW="$NOW" "$SCRIPT" status >/dev/null 2>&1
 check 'status 子命令可正常执行' "$([ "$?" -eq 0 ] && echo 1 || echo 0)"
 
+# ---------- ⑥ 重启噪声不该被算成"出口反复切换" ----------
+# 2026-11-16 真事故：正常重启时 WAN 先 down，出口守护每分钟重试并失败，台账里
+# 留下 1 条 drift + 1 条 route validation failed + 2 条"冷却中，暂不重试"。
+# 旧实现把这 4 条全算进 uplink_flap，于是一次重启就推一条"出口反复切换"假警。
+: > "$LOG"
+rm -rf "$STATE"; mkdir -p "$STATE"
+: > "$DELIVERY_LOG"
+{
+    printf '%s info uplink uplink 出口漂移，已重新应用期望出口\n' "$NOW"
+    printf '%s warn uplink uplink WAN route validation failed: no default gateway on eth0\n' "$((NOW + 2))"
+    printf '%s warn uplink uplink 上次出口切换失败，冷却中，暂不重试\n' "$((NOW + 60))"
+    printf '%s warn uplink uplink 上次出口切换失败，冷却中，暂不重试\n' "$((NOW + 120))"
+} >> "$LOG"
+TWR_EVENT_WATCH_ALLOW_REAL=1 TWR_EVENT_WATCH_NOW="$NOW" "$SCRIPT" run >/dev/null 2>&1
+check '重启噪声（漂移+失败+冷却重试）不再判成出口抖动' \
+    "$([ ! -s "$DELIVERY_LOG" ] && echo 1 || echo 0)"
+
+# 对照：4 次真正的出口切换仍然要报（剔除噪声 ≠ 关掉检测）
+: > "$LOG"
+rm -rf "$STATE"; mkdir -p "$STATE"
+: > "$DELIVERY_LOG"
+i=0
+while [ "$i" -lt 4 ]; do
+    printf '%s info uplink uplink 出口漂移，已重新应用期望出口\n' "$((NOW + i * 60))" >> "$LOG"
+    i=$((i + 1))
+done
+TWR_EVENT_WATCH_ALLOW_REAL=1 TWR_EVENT_WATCH_NOW="$NOW" "$SCRIPT" run >/dev/null 2>&1
+check '对照：4 次真出口切换仍然告警（检测能力未被削掉）' \
+    "$([ -s "$DELIVERY_LOG" ] && echo 1 || echo 0)"
+
 printf '\nPASS=%d FAIL=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
