@@ -1,0 +1,30 @@
+#!/bin/sh /etc/rc.common
+# 让 Turbo ACC 的 tcpcca 成为唯一权威来源。
+# 背景：turboacc(START=90) 设完拥塞控制后会自己 restart firewall(START=19)，
+# 而 firewall 按 firewall.@defaults[0].tcpcca 又设一次；两者不一致时最后执行的赢，
+# 用户在 LuCI 里改 Turbo ACC 看起来「不生效」。
+# 本脚本 START=91（晚于 turboacc），在启动末尾把 kernel 值强制对齐到 ACC 的配置。
+
+START=91
+
+start() {
+	local v
+	v="$(uci -q get turboacc.config.tcpcca)"
+	case "$v" in
+		bbr|cubic|reno)
+			sysctl -w net.ipv4.tcp_congestion_control="$v" >/dev/null 2>&1
+			;;
+	esac
+
+	# 同时把 firewall 的副本对齐，避免下次 firewall 单独 reload 时又改回去
+	local fw
+	fw="$(uci -q get firewall.@defaults[0].tcpcca)"
+	if [ -n "$v" ] && [ "$fw" != "$v" ]; then
+		uci -q set "firewall.@defaults[0].tcpcca=$v"
+		uci -q commit firewall
+	fi
+}
+
+reload() {
+	start
+}
