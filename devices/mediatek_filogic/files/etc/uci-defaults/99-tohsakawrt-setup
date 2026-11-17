@@ -112,10 +112,12 @@ chmod +x /usr/bin/tohsakawrt* /etc/init.d/tohsakawrt* 2>/dev/null
 [ -x /etc/init.d/tohsakawrt-tgbot ] && /etc/init.d/tohsakawrt-tgbot enable
 
 # 7. Crontab for Watchdogs
+# 只调度顶层 tohsakawrt-watch：它内部按序调用 temp-watch / service-watch / modem-heal。
+# 早期这里还额外写入 temp-watch 与 service-watch 的独立 cron，导致每分钟两套实例
+# 争抢同一把锁，日志里刷 "Previous run still active, skip"。
 mkdir -p /etc/crontabs
 if [ -f /etc/crontabs/root ]; then
-    grep -q "tohsakawrt-temp-watch" /etc/crontabs/root || echo "* * * * * /usr/bin/tohsakawrt-temp-watch >/dev/null 2>&1" >> /etc/crontabs/root
-    grep -q "tohsakawrt-service-watch" /etc/crontabs/root || echo "* * * * * /usr/bin/tohsakawrt-service-watch >/dev/null 2>&1" >> /etc/crontabs/root
+    grep -q "tohsakawrt-watch" /etc/crontabs/root || echo "* * * * * /usr/bin/tohsakawrt-watch >/dev/null 2>&1" >> /etc/crontabs/root
 fi
 /etc/init.d/cron enable
 /etc/init.d/cron restart >/dev/null 2>&1
@@ -129,5 +131,16 @@ uci -q get tohsakawrt-tgbot.main.nodata_cards >/dev/null 2>&1 || {
     uci add_list tohsakawrt-tgbot.main.nodata_cards='89995'
 }
 uci commit tohsakawrt-tgbot
+
+# 9. UPnP / NAT-PMP 保持关闭（与历史配置一致：不让内网设备自动开端口）
+# 兼容 upnpd v1（config）与 v2（settings）两种节名
+if uci -q get upnpd.settings >/dev/null 2>&1; then
+    uci set upnpd.settings.enabled='0'
+    uci commit upnpd
+fi
+if uci -q get upnpd.config >/dev/null 2>&1; then
+    uci set upnpd.config.enabled='0'
+    uci commit upnpd
+fi
 
 exit 0
