@@ -334,10 +334,55 @@ function M.cmd_sms(limit, msg_id, cb_id)
     if limit > 10 then limit = 10 end
     if limit < 1 then limit = 1 end
 
-    local list = modem.sms_list and modem.sms_list("ME", limit) or {}
     local now = os.date("%Y-%m-%d %H:%M:%S")
+    local sms_kb = {
+        {
+            { text = "🔄 刷新短信", callback_data = "refresh_sms" },
+            { text = "📡 模组状态", callback_data = "refresh_modem" }
+        }
+    }
+    local function reply(text)
+        if msg_id and cb_id then
+            return tg.answer_and_edit(cb_id, "正在读取最新短信...", msg_id, text, sms_kb)
+        end
+        if msg_id then return tg.edit_msg(msg_id, text, sms_kb) end
+        return tg.send_msg(text, sms_kb)
+    end
 
-    if not list or #list == 0 then
+    -- 先判串口节点：模组不在位时给明确结论，不要伪装成"收件箱为空"
+    local port = modem.get_port and modem.get_port() or "/dev/ttyUSB3"
+    local port_missing = false
+    if modem.port_present and modem.port_present(port) == false then
+        port_missing = true
+    end
+
+    local list = nil
+    if not port_missing and modem.sms_list then
+        list = modem.sms_list("ME", limit)
+    end
+
+    if port_missing then
+        return reply(string.format([[✉️ <b>5G 模组短信收件箱</b>
+
+━━━━━━━━━━━━━━━━━━
+🔌 <b>未检测到模组</b>
+<i>AT 串口 %s 不存在，请检查模组是否插好、供电是否正常。</i>
+━━━━━━━━━━━━━━━━━━
+🕰️ <i>%s</i>]], html_escape(port), html_escape(now)))
+    end
+
+    -- 串口在但读不到：AT 口忙/超时/解析失败，和"真的没有短信"必须分开说
+    if not list then
+        return reply(string.format([[✉️ <b>5G 模组短信收件箱</b>
+
+━━━━━━━━━━━━━━━━━━
+⚠️ <b>短消息读取失败</b>
+<i>模组 AT 串口无响应或正忙，请稍后重试或先看模组状态。</i>
+━━━━━━━━━━━━━━━━━━
+🕰️ <i>%s</i>]], html_escape(now)))
+    end
+
+    if #list == 0 then
         local text = string.format([[✉️ <b>5G 模组短信收件箱</b>
 
 ━━━━━━━━━━━━━━━━━━
@@ -346,17 +391,7 @@ function M.cmd_sms(limit, msg_id, cb_id)
 ━━━━━━━━━━━━━━━━━━
 🕰️ <i>%s</i>]], html_escape(now))
 
-        local inline_kb = {
-            {
-                { text = "🔄 刷新短信", callback_data = "refresh_sms" },
-                { text = "📡 模组状态", callback_data = "refresh_modem" }
-            }
-        }
-        if msg_id and cb_id then
-            return tg.answer_and_edit(cb_id, "正在读取最新短信...", msg_id, text, inline_kb)
-        end
-        if msg_id then return tg.edit_msg(msg_id, text, inline_kb) end
-        return tg.send_msg(text, inline_kb)
+        return reply(text)
     end
 
     local items = {}

@@ -43,6 +43,16 @@ function M.get_port()
     return port
 end
 
+-- AT 串口节点是否存在。拿不到 nixio 或 stat 本身出错时按"存在"处理，
+-- 交给 AT 层自己的硬超时兜底，避免误判把短信功能整体关掉。
+function M.port_present(port)
+    if not (nixio and nixio.fs and nixio.fs.stat) then return true end
+    port = port or M.get_port()
+    local ok, stat = pcall(nixio.fs.stat, port)
+    if not ok then return true end
+    return stat ~= nil
+end
+
 function M.at(cmd, timeout)
     timeout = math.max(1, math.floor(tonumber(timeout) or 3))
     local port = M.get_port()
@@ -280,6 +290,7 @@ function M.sms_list(storage, limit)
     storage = storage or "ME"
     limit = limit or 5
     local port = M.get_port()
+    if not M.port_present(port) then return nil end
 
     -- 纳入 AT 全局互斥锁：原先是三个写者之一，无锁直连串口
     local cmd = at_locked(string.format("sms_tool -d %s -s %s -j recv 2>/dev/null", port, storage))
@@ -399,6 +410,8 @@ end
 
 function M.sms_poll_new()
     local port = M.get_port()
+    -- 模组不在位：直接返回，不 spawn sms_tool、不抢 AT 锁，也不动三个游标。
+    if not M.port_present(port) then return {} end
     -- 这条由机器人主循环每 12 秒无条件调用，是全局风险最高的一处 AT 访问：
     -- 原先是无锁 + 无超时，一旦挂住整个机器人事件循环永久停止（pcall 拦不住 C 层 read）。
     local st_raw = core.exec(at_locked(string.format("sms_tool -d %s -s ME status 2>/dev/null", port), 2))

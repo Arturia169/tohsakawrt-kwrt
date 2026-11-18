@@ -17,7 +17,7 @@ env:
   KWRT_REL: 25.12
   IB_NAME: kwrt-imagebuilder-mediatek-filogic.Linux-x86_64
   IB_URL: https://dl.openwrt.ai/releases/25.12/targets/mediatek/filogic/kwrt-imagebuilder-mediatek-filogic.Linux-x86_64.tar.zst
-  IB_SHA256: 65bb2db7073ef9af6dac282f4934bdfe14d3182f26a6b6a12bd5d3a46aeaac82
+  IB_SHA256: d7011488694eefb9232bbef44627c35f1b15953631bd430a9b19b4a7a72af18f
   PROFILE: cudy_tr3000-mod
   UPLOAD_FIRMWARE_FOR_ARTIFACT: 'true'
   UPLOAD_FIRMWARE_FOR_RELEASE: 'true'

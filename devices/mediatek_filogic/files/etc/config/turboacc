@@ -1,0 +1,20 @@
+# Turbo ACC 27.x 配置 —— 以实机为准（2026-11-18 对齐）
+#
+# fastpath 合法值: none | flow_offloading | mediatek_hnat | fast_classifier | shortcut_fe_cm
+#
+# 为什么不是 mediatek_hnat：
+# 当前镜像（25.12-SNAPSHOT 11.16.2026 / 内核 6.12.116）没有 kmod-mediatek_hnat ——
+# 设备上 `modprobe mtkhnat` 无模块、`/sys/kernel/debug/hnat` 不存在。而 turboacc 的
+# mediatek_hnat 分支会直接往 /sys/kernel/debug/hnat/hook_toggle 写值，节点不存在 ⇒
+# 写失败、软件卸载也没开，等于把卸载整个丢掉。本镜像必须用
+# flow_offloading + fastpath_fo_hw=1（nft flowtable 硬件卸载）+ WED。
+# 将来把 kmod-mediatek_hnat 打进镜像、确认 `lsmod | grep mtkhnat` 有输出后才可切过去。
+config turboacc 'global'
+	option set '1'
+
+config turboacc 'config'
+	option fastpath 'flow_offloading'
+	option fastpath_mh_eth_hnat_wed '1'
+	option tcpcca 'bbr'
+	option fullcone '1'
+	option fastpath_fo_hw '1'

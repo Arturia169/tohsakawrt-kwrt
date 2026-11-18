@@ -407,3 +407,25 @@ zram-swap
 luci-app-sms-manager
 luci-i18n-sms-manager-zh-cn
 coreutils-timeout
+lpac
+nlbwmon
+luci-app-nlbwmon
+luci-lib-chartjs
+socat
+ethtool
+iperf3
+tcpdump
+luci-i18n-base-zh-cn
+luci-i18n-firewall-zh-cn
+luci-i18n-nlbwmon-zh-cn
+luci-i18n-ttyd-zh-cn
+luci-app-argon-config
+luci-app-socat
+kmod-nft-fullcone
+# 2026-11-18 设备上有、清单里没有（不补刷机即丢）
+lsof
+mtr-nojson
+diffutils
+strace
+luci-app-sqm
+sqm-scripts
